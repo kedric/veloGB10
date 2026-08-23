@@ -54,17 +54,18 @@ Single-stream decode, greedy, NVFP4 with DFlash 2. Figures are representative; r
 with content type. **Highest performance is on code generation.** "Average" is a representative
 blend across content types (see the note below — a code-heavy run averages much higher).
 
-| Mode | Average | Bottoms | Peaks |
-|---|---:|---:|---:|
-| Single node | **> 40 tok/s** | ~11 tok/s | ~100 tok/s |
-| TP=2 | **~56 tok/s** | ~18 tok/s | ~105 tok/s |
-| TP=4 | **~85 tok/s** | ~32 tok/s | ~150 tok/s |
+| Mode | Average | Bottoms | Peaks | Max sustained (code) |
+|---|---:|---:|---:|---:|
+| Single node | **> 40 tok/s** | ~11 tok/s | ~100 tok/s | **~70 tok/s** |
+| TP=2 | **~56 tok/s** | ~18 tok/s | ~105 tok/s | **~85 tok/s** |
+| TP=4 | **~85 tok/s** | ~32 tok/s | ~150 tok/s | **~125 tok/s** |
 
 > **Averages span a wide range by content type.** On a mixed-content run (the `min_max` traces
 > below) the session average is ~25 / ~38 / ~51 tok/s for single / TP=2 / TP=4, whereas on a
 > code-heavy sustained run (the `max` traces) it is ~70 / ~85 / ~125 tok/s. The "Average" column
 > above is a representative figure across that spread; **Peaks** are the top reached on
-> code-generation content.
+> code-generation content; **Max sustained (code)** is the steady-state rate held during a
+> code-heavy run (read from the `max` traces).
 
 > Peak rates are typically reached on **code content generation**; prose and mixed content sit lower
 > in the ranges above.
