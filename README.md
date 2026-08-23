@@ -102,6 +102,18 @@ required files, launch commands, and expected output) are in
 **[QWEN_27B_SETUP.md](QWEN_27B_SETUP.md)**. Managing the engine's TP model cache is documented in
 **[MANAGING_CACHE.md](MANAGING_CACHE.md)**.
 
+### Notes
+
+- **TP=4 does not eat the whole cluster.** Running the Qwen3.8 27B NVFP4 model across 4× DGX Spark
+  does **not** mean you can't run anything else on those boxes. The model occupies roughly **45 GB on
+  the head** and about **20 GB on each node**, so each GB10 still has plenty of headroom to run other
+  processes. On a fully idle DGX Spark (~113 GB available) the steady-state estimate for the model is
+  far under the machine's total memory.
+- **Vision is NOT supported yet on any model.** Image/video input is in the pipeline and will be
+  released as soon as it is ready, but current artifacts are text-only. The Qwen3.8 27B checkpoint
+  ships a vision tower, but it is not yet validated end-to-end — see the model card for the exact
+  status.
+
 ---
 
 ## Building from source
