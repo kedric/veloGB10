@@ -50,14 +50,21 @@ launched via `--spec-source dflash2-auto --draft-dir <dflash2 dir>` — and runs
 
 ### Qwen 3.8 27B NVFP4 performance
 
-Single-stream decode, greedy, NVFP4 with DFlash 2. Figures are representative sustained
-average/peak; real numbers vary with content type. **Highest performance is on code generation.**
+Single-stream decode, greedy, NVFP4 with DFlash 2. Figures are representative; real numbers vary
+with content type. **Highest performance is on code generation.** "Average" is a representative
+blend across content types (see the note below — a code-heavy run averages much higher).
 
 | Mode | Average | Bottoms | Peaks |
 |---|---:|---:|---:|
-| Single node | **> 30 tok/s** | ~18 tok/s (some content types) | 45–50 tok/s |
-| TP=2 | **56 tok/s** | ~30 tok/s | 75 tok/s |
-| TP=4 | **75 tok/s** | ~45 tok/s | 125 tok/s |
+| Single node | **> 40 tok/s** | ~11 tok/s | ~100 tok/s |
+| TP=2 | **~56 tok/s** | ~18 tok/s | ~105 tok/s |
+| TP=4 | **~85 tok/s** | ~32 tok/s | ~150 tok/s |
+
+> **Averages span a wide range by content type.** On a mixed-content run (the `min_max` traces
+> below) the session average is ~25 / ~38 / ~51 tok/s for single / TP=2 / TP=4, whereas on a
+> code-heavy sustained run (the `max` traces) it is ~70 / ~85 / ~125 tok/s. The "Average" column
+> above is a representative figure across that spread; **Peaks** are the top reached on
+> code-generation content.
 
 > Peak rates are typically reached on **code content generation**; prose and mixed content sit lower
 > in the ranges above.
@@ -69,30 +76,31 @@ the Qwen3.8 27B NVFP4 + DFlash 2 config. For each deployment mode there's a **pe
 trace (the full spread of a session — where throughput bottoms out and where it tops out) and a
 **sustained peak** trace (a segment holding its best rate). Download the images to see them full-size.
 
-**Single node** — average >30 tok/s, peaks 45–50, some content types ~18 tok/s. The peak-vs-lowest
-trace shows the swing between content types; the sustained-peak trace is a clean stretch running
-near the 45–50 tok/s ceiling.
+**Single node** — mixed-content average ~26 tok/s, code-heavy sustained ~70 tok/s, some content
+types dip as low as ~11, and peaks reach ~100 on code. The peak-vs-lowest trace shows the swing
+between content types; the sustained-peak trace is a stretch running near the ~70–100 tok/s band.
 
 | Peak vs lowest | Sustained peak |
 |---|---|
 | ![Single node — peak vs lowest](assets/single_min_max.png) | ![Single node — sustained peak](assets/single_max.png) |
 
-**TP=2** — the two-node setup lifts the ceiling: average 56 tok/s, bottoms ~30, peaks 75. Even the
-lowest points sit comfortably above the single-node average.
+**TP=2** — the two-node setup lifts the ceiling: mixed average ~38, sustained ~85, bottoms ~18,
+peaks ~105. Even the lowest points sit above the single-node average.
 
 | Peak vs lowest | Sustained peak |
 |---|---|
 | ![TP=2 — peak vs lowest](assets/tp2_min_max.png) | ![TP=2 — sustained peak](assets/tp2_max.png) |
 
-**TP=4** — four-node serving pushes heads well past 100 tok/s on the best content: average 75,
-bottoms ~45, peaks up to 125. The sustained-peak trace holds a ~120 tok/s plateau.
+**TP=4** — four-node serving pushes well past 100 tok/s on the best content: mixed average ~51,
+sustained ~125, bottoms ~32, peaks up to ~150. The sustained-peak trace holds a ~125 tok/s plateau
+with spikes near 150.
 
 | Peak vs lowest | Sustained peak |
 |---|---|
 | ![TP=4 — peak vs lowest](assets/tp4_min_max.png) | ![TP=4 — sustained peak](assets/tp4_max.png) |
 
-Scaling up from one to four nodes roughly **doubles the ceiling** and more than doubles the average
-on code-heavy content.
+Scaling up from one to four nodes roughly **doubles the ceiling** (single ~100 → TP=4 ~150) and
+more than doubles the sustained average on code-heavy content (single ~70 → TP=4 ~125).
 
 #### Comparison with other Qwen3.8 27B recipes
 
