@@ -8,7 +8,7 @@
 compatible OEM machines built around the NVIDIA GB10 chipset.**
 
 veloGB10 (`gb10_inference`) is a from-scratch Rust + CUDA inference engine for a hand-selected
-set of large language models — currently including the Qwen3.5/3.6 family and Tencent Hy3 — with
+set of large language models — currently including the Qwen3.5/3.6/3.8 family and Tencent Hy3 — with
 support for hybrid GatedDeltaNet + GQA architectures, dense models, and MoE models. More model
 families are added deliberately rather than generically; each one is ported, measured, and gated
 on real GB10 hardware before it ships.
@@ -16,8 +16,8 @@ on real GB10 hardware before it ships.
 The implementation is intentionally specialized for GB10 systems:
 
 - **One GB10 machine** — single-node inference
-- **Two GB10 machines** — tensor-parallel inference (TP=2) **for performance**, not just
-  capacity: two machines decode a single request measurably faster than one can
+- **Two or four GB10 machines** — tensor-parallel inference (TP=2 / TP=4) **for performance**, not
+  just capacity: multiple machines decode a single request measurably faster than one can
 - NVIDIA DGX Spark and compatible GB10 OEM systems (Grace Blackwell, sm_121)
 - 128 GB unified LPDDR5x memory, ~255 GB/s measured sustained bandwidth
 - ConnectX-7 networking for two-node inference
@@ -541,3 +541,13 @@ This software is developed with strong assistance from open source LLM models (G
 ## Acknowledgements to the general community
 
 This project does not link extensively against any other project (other than the obvious and documented usages). However, due to the fact that LLM code generation does not occur in a vacuum, this project exists thanks to the path opened by the many other projects and the kernels, quantization formats, open source AI/LLM ecosystem, and hard-won engineering knowledge developed there. We are thankful and indebted to everyone who contributed to this area of computing and its contributors. Their implementations, experiments, code, ideas, kernels, tests, and design choices were, even if implicit through the weight encoded memory of the models we use, an essential reference while building this specific inference source code.
+
+## Roadmap / pending items
+
+Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
+
+- **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
+- **Vision support for all Qwen models.** Image/video input is not supported yet on any model. It's in the pipeline and will ship once it's validated end-to-end.
+- **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.
+- **DeepSeek V4 Flash DSpark.** Work has started but it's far from complete or optimized. The goal is to beat all competition on decode speed across 2× and 4× GB10.
+- **Other Qwen 3.8 variants.** If a 122B or other Qwen 3.8-size model fits on 1×, 2×, or 4× Spark, it's likely to be picked up next.
