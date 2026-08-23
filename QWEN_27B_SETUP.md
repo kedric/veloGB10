@@ -180,6 +180,36 @@ model directories before launching.
   --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
 ```
 
+### Enabling concurrency with `--max-batch`
+
+All three examples above use `--max-batch 1` (one request handled at a time — maximum per-request
+speed). To serve **multiple concurrent clients** instead, raise `--max-batch` to the number of
+simultaneous requests you want to handle, e.g.:
+
+```bash
+./gb10_inference --server \
+  --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
+  --tp 4 \
+  --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
+  --port 9000 \
+  --max-seq-len 262144 \
+  --max-batch 4 \
+  --max-tokens 65536 \
+  --prefix-cache on \
+  --default-presence-penalty 1.5 \
+  --mtp=auto \
+  --spec-source dflash2-auto \
+  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+```
+
+- `--max-batch N` is the max concurrent sequences (lanes) the server will run. With `N > 1` the
+  scheduler batches the concurrent greedy lanes into a single verify forward, so you trade a little
+  per-request latency for much higher aggregate throughput across clients.
+- With DFlash 2 the drafter runs per request; a larger batch packs those lanes together rather than
+  running them one at a time.
+- Memory scales with the batch: the KV cache is allocated per-lane, so `--max-batch 8` costs roughly
+  8× the KV memory of `--max-batch 1` at the same `--max-seq-len`.
+
 ### What you should see
 
 During the head bring-up you should see lines like:
