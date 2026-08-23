@@ -132,6 +132,26 @@ single-node SGLang serving.
 |---|---|
 | ![sglang_hasso single — peak vs lowest](assets/sglang_hasso_single_min_max.png) | ![sglang_hasso single — sustained peak](assets/sglang_hasso_single_max.png) |
 
+### Recipe comparison (single-node scale)
+
+Side-by-side figures for all the recipes shown above. veloGB10's own rows are included for
+reference. **Peaks** are the top reached; **Max sustained (code)** is the steady-state rate held on
+code-heavy content (read from the `max` traces). Averages are a representative blend across content
+types;
+
+| Recipe | Config | Average | Bottoms | Peaks | Max sustained (code) |
+|---|---|---:|---:|---:|---:|
+| **veloGB10** | Single node | **> 40 tok/s** | ~11 | ~100 | **~70** |
+| **veloGB10** | TP=2 | **~56 tok/s** | ~18 | ~105 | **~85** |
+| **veloGB10** | TP=4 | **~85 tok/s** | ~32 | ~150 | **~125** |
+| Mia AI Lab | Single node | ~27–42 tok/s | ~15 | ~58 | ~42 |
+| Mia AI Lab | TP=2 | ~21–37 tok/s | ~10–12 | ~45 | ~37 |
+| Hasso | Single node | ~27–35 tok/s | ~19 | ~66 | ~35 |
+
+> veloGB10's peaks are higher than either SGLang recipe even at **single node**, and the gap widens
+> with TP=2/TP=4. These are different kernels, quantization, and serving stacks — informational
+> comparison only, not a controlled benchmark.
+
 ### Getting started with Qwen 3.8 27B
 
 Full, step-by-step setup instructions for single-node, TP=2, and TP=4 deployments (node layout,
