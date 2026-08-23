@@ -62,13 +62,12 @@ average/peak; real numbers vary with content type. **Highest performance is on c
 > Peak rates are typically reached on **code content generation**; prose and mixed content sit lower
 > in the ranges above.
 
-#### Live throughput traces
+#### Live throughput traces (veloGB10)
 
 These are `TOKENS/SECOND` traces pulled straight from the engine's live stats panel while serving
-the Qwen3.8 27B NVFP4 + DFlash 2 config. For each deployment mode you get one **peak-vs-lowest**
-trace (the full spread of a session — where the throughput bottoms out and where it tops out) and
-one **sustained peak** trace (a segment holding its best rate). Download the images to see them at
-full size.
+the Qwen3.8 27B NVFP4 + DFlash 2 config. For each deployment mode there's a **peak-vs-lowest**
+trace (the full spread of a session — where throughput bottoms out and where it tops out) and a
+**sustained peak** trace (a segment holding its best rate). Download the images to see them full-size.
 
 **Single node** — average >30 tok/s, peaks 45–50, some content types ~18 tok/s. The peak-vs-lowest
 trace shows the swing between content types; the sustained-peak trace is a clean stretch running
@@ -94,6 +93,35 @@ bottoms ~45, peaks up to 125. The sustained-peak trace holds a ~120 tok/s platea
 
 Scaling up from one to four nodes roughly **doubles the ceiling** and more than doubles the average
 on code-heavy content.
+
+#### Comparison with other Qwen3.8 27B recipes
+
+Same `TOKENS/SECOND` scale and format, but these are **community SGLang recipes** running the
+Qwen3.8 27B on a single DGX Spark (not veloGB10). They are shown for side-by-side comparison only —
+different kernels, quantization, and serving stacks, so treat the differences as informational, not
+apples-to-apples. Each pair is the same **peak-vs-lowest** / **sustained peak** split as above.
+
+**Mia AI Lab — Qwen3.8-27B-SGLang-DGX-Spark** ([repo](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark)):
+single-node and two-node (TP=2) SGLang serving.
+
+Single node:
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![sglang_mia single — peak vs lowest](assets/sglang_mia_single_min_max.png) | ![sglang_mia single — sustained peak](assets/sglang_mia_single_max.png) |
+
+TP=2:
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![sglang_mia TP=2 — peak vs lowest](assets/sglang_mia_tp2_min_max.png) | ![sglang_mia TP=2 — sustained peak](assets/sglang_mia_tp2_max.png) |
+
+**Hasso — dgx-spark-qwen38** ([repo](https://github.com/hasso5703/dgx-spark-qwen38)):
+single-node SGLang serving.
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![sglang_hasso single — peak vs lowest](assets/sglang_hasso_single_min_max.png) | ![sglang_hasso single — sustained peak](assets/sglang_hasso_single_max.png) |
 
 ### Getting started with Qwen 3.8 27B
 
