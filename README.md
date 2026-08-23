@@ -28,7 +28,8 @@ same binary supports all supported models through `--model-dir`; no Python runti
 serving stack is required.
 
 **Headline** (greedy, MTP-speculative, bitwise-lossless — full tables in
-[Benchmarks](#benchmarks)): Qwen3.6 27B at **~42 tok/s** on one GB10 and **~53 tok/s on two** ·
+[Benchmarks](#benchmarks)): Qwen3.8 27B at **~40 tok/s on one GB10 and ~56 tok/s on two** (and
+**~85 tok/s on four** with DFlash 2) · Qwen3.6 27B at **~42 tok/s** on one GB10 and **~53 tok/s on two** ·
 Qwen3.6 35B MoE at **~111 tok/s** on one GB10 and **~130 tok/s on two** · Qwen3.5 122B MoE at **~39 tok/s** on one GB10 and **~57
 tok/s on two**.
 
