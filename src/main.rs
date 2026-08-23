@@ -1226,6 +1226,31 @@ fn required_dir_arg(args: &[String], flag: &str, what: &str) -> String {
     d
 }
 
+/// SERVE-path --draft-dir resolution (owner refinement 2026-08-23): the artifact is MANDATORY
+/// only when `--spec-source` EXPLICITLY names a DFlash2 source (dflash2 | dflash2-rq |
+/// dflash2-auto) — the user asked for that drafter, so a missing/bad dir stops the app. With
+/// any other source (or none given — the default dflash2-auto resolves to the MTP fallback
+/// when no artifact is supplied) the flag is OPTIONAL: None = serve via MTP, no hard failure.
+/// A flag that IS provided but points nowhere is always a hard stop, whatever the source.
+fn resolve_df2_draft_dir(args: &[String]) -> Option<String> {
+    let explicit_df2 = parse_arg(args, "--spec-source")
+        .map(|sv| gb10_inference::batch::SpecSource::from_cli(&sv.to_lowercase())
+             .map(gb10_inference::batch::is_df2_src).unwrap_or(false))
+        .unwrap_or(false);
+    if explicit_df2 {
+        Some(required_dir_arg(args, "--draft-dir",
+                              "the DFlash2 draft artifact (--spec-source names a DFlash2 source)"))
+    } else {
+        parse_arg(args, "--draft-dir").map(|d| {
+            if !std::path::Path::new(d).is_dir() {
+                eprintln!("FATAL: --draft-dir directory does not exist: {d}");
+                std::process::exit(2);
+            }
+            d.to_string()
+        })
+    }
+}
+
 /// Parse the `--tp [N]` flag — the single authority for the TP rank count on a TP run.
 /// `--tp N` → N, bare `--tp` → 2, `--tp=N` → N, no `--tp` → None (no TP run). A non-numeric
 /// value rejects loudly. `N` is expected to be a power of two (the dynamic-TP ladder).
@@ -11383,6 +11408,11 @@ fn resolve_spec_source(args: &[String]) -> gb10_inference::batch::SpecSource {
 }
 
 fn run_server(args: &[String]) {
+    // Validate the DF2 draft-dir rule FIRST — an explicit DFlash2 --spec-source without a valid
+    // --draft-dir must stop HERE, before any model load or GPU work (resolve_df2_draft_dir is
+    // pure: exits 2 on the violation, returns the dir otherwise; every downstream consumer
+    // re-resolves the identical value).
+    let _ = resolve_df2_draft_dir(args);
     // Support both --model-dir <DIR> and legacy --model <FILE> + --tokenizer <FILE>
     let (model_path, tokenizer_path) = if let Some(dir) = parse_arg(args, "--model-dir") {
         (dir.to_string(), format!("{}/tokenizer.json", dir.trim_end_matches('/')))
@@ -11513,9 +11543,7 @@ fn run_server(args: &[String]) {
             // MANDATORY user-supplied path (owner rule: no default, no fallback constant; a bad
             // path stops the app). The head's resolved dir ships on the config AND the artifact
             // bytes ride the sync (cluster.rs DraftManifest) into the node's blob cache.
-            tpc.df2_draft_dir = if gb10_inference::batch::is_df2_src(resolve_spec_source(args)) {
-                required_dir_arg(args, "--draft-dir", "the DFlash2 draft artifact (spec-source is a DFlash2 source)")
-            } else { String::new() };
+            tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
             // P2: the round-sharding toggle (CLI flag per AGENTS §7; rides TpConfig — no env
             // side channel). DEFAULT OFF until the Phase D quad truth flips it.
             tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
@@ -11713,9 +11741,7 @@ fn run_server(args: &[String]) {
                     // draft dir so the node's policy and round load match the head's.
                     tpc.spec_source = resolve_spec_source(args).cli_name().to_string();
                     // MANDATORY user-supplied path (same rule as the pre-TP fill above).
-                    tpc.df2_draft_dir = if gb10_inference::batch::is_df2_src(resolve_spec_source(args)) {
-                        required_dir_arg(args, "--draft-dir", "the DFlash2 draft artifact (spec-source is a DFlash2 source)")
-                    } else { String::new() };
+                    tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
                     // P2: the round-sharding toggle (same resolution as the pre-TP fill above).
                     tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
                                                    "on" | "true" | "1" | "yes");
@@ -11786,7 +11812,12 @@ fn run_server(args: &[String]) {
         // S8F: the DFlash2 round (the selectable/default speculation source). Loaded ONLY when
         // requested; an absent/failed artifact degrades to the MTP fallback (never a hard failure).
         let df2 = if gb10_inference::batch::is_df2_src(spec_source) {
-            load_df2_round(&mut gpu, max_seq_len)
+            // Mandatory only for an EXPLICIT DF2 --spec-source; the resolved default falls back
+            // to MTP when no --draft-dir was supplied (resolve_df2_draft_dir -> None).
+            match resolve_df2_draft_dir(&std::env::args().collect::<Vec<_>>()) {
+                Some(d) => load_df2_round_dir(&mut gpu, max_seq_len, &d),
+                None => None,
+            }
         } else { None };
         if df2.is_some() {
             println!("[df2] DFlash2 round RESIDENT (spec-source={}) — serving via the S4F \
