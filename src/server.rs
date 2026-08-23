@@ -15,6 +15,7 @@ use chrono;
 
 use crate::batch::{BatchRequest, TokEvent};
 use crate::tokenizer::{QwenTokenizer, ChatMessage, ToolCall};
+use crate::{Usage, Timings, make_timings};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,12 +26,19 @@ pub struct AppState {
     pub default_rep_penalty: f32,
     pub default_presence_penalty: f32,
     pub default_frequency_penalty: f32,
-    /// Default hy_v3 reasoning effort for the chat template ('no_think'|'low'|'high'), from
-    /// --reasoning-effort; a request's `reasoning_effort` field overrides per request.
-    pub reasoning_effort: String,
+    /// Server-wide reasoning-effort default from --reasoning-effort. `None` means "unspecified":
+    /// the model's OWN chat template picks its baked-in default (Qwen -> `xhigh`, hy_v3 -> `low`),
+    /// which is the only value guaranteed to be valid for that family. A request's
+    /// `reasoning_effort` field overrides per request.
+    pub reasoning_effort: Option<String>,
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
+    /// Scheduler prefix-cache flag (mirror of TpConfig.prefix_cache). The message-boundary
+    /// checkpoint (`ckpt_at`) is only ever USED when the scheduler's prefix cache is on
+    /// (batch.rs filters it again); gating its render+tokenize here saves the double
+    /// template work on every request when the cache is off (TTFT fix (e)).
+    pub prefix_cache: bool,
 }
 
 #[derive(Serialize)]
@@ -212,48 +220,6 @@ struct ChatChoice {
     finish_reason: String,
 }
 
-#[derive(Serialize)]
-struct Usage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-}
-
-/// llama.cpp-compatible timing block, emitted as a top-level extension next to `usage`.
-/// `prompt_*` spans request-submit -> first token (i.e. TTFT including queueing); `predicted_*`
-/// spans first-token -> end. This is what lets a client show TTFT and tok/s without timing the
-/// stream itself. All inputs are already on the CPU in the handler — no GPU sync, no extra reads.
-#[derive(Serialize)]
-struct Timings {
-    prompt_ms: f64,
-    predicted_ms: f64,
-    prompt_per_second: f64,
-    predicted_per_second: f64,
-}
-
-fn make_timings(
-    t0: std::time::Instant,
-    first_tok: Option<std::time::Instant>,
-    prompt_len: usize,
-    n: usize,
-) -> Timings {
-    let end = std::time::Instant::now();
-    let (prompt_ms, predicted_ms) = match first_tok {
-        Some(ft) => (
-            ft.duration_since(t0).as_secs_f64() * 1e3,
-            end.duration_since(ft).as_secs_f64() * 1e3,
-        ),
-        // No token ever arrived (rejected prompt, immediate stop): everything was "prompt".
-        None => (end.duration_since(t0).as_secs_f64() * 1e3, 0.0),
-    };
-    Timings {
-        prompt_ms,
-        predicted_ms,
-        prompt_per_second: if prompt_ms > 0.0 { prompt_len as f64 * 1e3 / prompt_ms } else { 0.0 },
-        predicted_per_second: if predicted_ms > 0.0 { n as f64 * 1e3 / predicted_ms } else { 0.0 },
-    }
-}
-
 /// The scheduler's internal backstop reason (batch.rs) is not an OpenAI value — the spec is
 /// stop|length|tool_calls|content_filter. Map it to what it means: generation ran out of room.
 fn spec_finish_reason(reason: &str) -> &str {
@@ -276,25 +242,35 @@ async fn chat_completions(
             .filter_map(|x| x.pointer("/function/name").and_then(|v| v.as_str())).collect();
         eprintln!("[req] tools   {} offered: {:?} tool_choice={:?}", t.len(), names, req.tool_choice);
     }
-    // hy_v3's template accepts only no_think|low|high and RAISES on anything else, but clients
-    // send the OpenAI convention (minimal|low|medium|high) — normalize instead of forwarding
-    // blindly: medium maps onto Hy3's nearest level (high), minimal/off/none onto no_think,
-    // anything unknown falls back to no_think (a silent 500 is never the right answer).
-    let effort = req.reasoning_effort.as_deref().map(|e| {
-        let n = match e {
-            "high" | "medium" => "high",
-            "low" => "low",
-            _ => "no_think",
-        };
-        if n != e && !matches!(e, "minimal" | "no_think" | "none" | "off" | "") {
-            eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' (hy_v3 accepts no_think|low|high)");
-        }
-        n
-    }).unwrap_or(state.reasoning_effort.as_str());
-    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), Some(effort)) {
+    // Resolve the effective reasoning effort. Two families, two vocabularies:
+    //   - hy_v3's template accepts `no_think|low|high` (default low), and its Rust dsv4 path treats
+    //     None/"" as low.
+    //   - Qwen3.5's template accepts `xhigh|medium|low` (default xhigh) and RAISES on anything else.
+    // Forward the client's value verbatim when it is one of the Qwen values; normalize the OpenAI
+    // convention (minimal|low|medium|high) onto a family-agnostic low/high only when a value is
+    // given. When NEITHER the request nor --reasoning-effort specifies one, pass None so the model's
+    // own template default wins (xhigh for Qwen, low for hy_v3) — never a hardcoded guess.
+    let effort: Option<&str> = req.reasoning_effort.as_deref()
+        .or(state.reasoning_effort.as_deref())
+        .map(|e| {
+            let n = match e {
+                // Qwen3.5 native values pass through verbatim.
+                "xhigh" | "medium" | "low" => e,
+                // OpenAI convention -> nearest native level.
+                "high" | "no_think" | "minimal" | "none" | "off" | "" => "no_think",
+                other => other,
+            };
+            if !matches!(n, "xhigh" | "medium" | "low" | "no_think" | "high") {
+                eprintln!("[req] reasoning_effort '{e}' not a known level (passing through verbatim)");
+            }
+            n
+        });
+    let t_render = std::time::Instant::now();
+    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), effort) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
 
     // Optional diagnostic: dump the exact rendered prompt string so the bytes a model
     // actually sees can be inspected/diffed across models or turns. Enable with
@@ -308,21 +284,31 @@ async fn chat_completions(
         }
     }
 
+    let t_encode = std::time::Instant::now();
     let prompt_tokens = match state.tokenizer.encode(&prompt, true) {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+    // TTFT fix 0 attribution (GB10_PREFILL_TRACE): the request-path pre-model costs.
+    if crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some() {
+        eprintln!("[pf] server render={render_ms:.3}ms encode={encode_ms:.3}ms");
+    }
 
     let prompt_len = prompt_tokens.len();
 
     // Where to snapshot the GDN state: the message boundary, i.e. this prompt without its trailing
     // generation prompt. Everything up to here is what the NEXT turn replays verbatim. Rendering the
-    // template a second time costs microseconds and saves a whole re-prefill per turn.
-    let ckpt_at = state.tokenizer
-        .apply_chat_template_no_gen(&req.messages, req.tools.as_deref(), Some(effort)).ok()
-        .and_then(|s| state.tokenizer.encode(&s, true).ok())
-        .map(|t| t.len())
-        .filter(|&n| n > 0 && n < prompt_len);
+    // template a second time costs microseconds and saves a whole re-prefill per turn — but only
+    // when the scheduler's prefix cache is actually on (batch.rs filters ckpt_at again); with the
+    // cache off this second render+encode is pure TTFT cost (fix (e), EXPERT_TTFT_PREFILL_RESPONSE).
+    let ckpt_at = if state.prefix_cache {
+        state.tokenizer
+            .apply_chat_template_no_gen(&req.messages, req.tools.as_deref(), effort).ok()
+            .and_then(|s| state.tokenizer.encode(&s, true).ok())
+            .map(|t| t.len())
+            .filter(|&n| n > 0 && n < prompt_len)
+    } else { None };
 
     // The KV cache holds exactly `max_seq_len` positions. A prompt past that end used to be written
     // out of bounds — silently, corrupting whatever allocation followed, which showed up as two
@@ -361,6 +347,7 @@ async fn chat_completions(
         prompt: prompt_tokens.clone(),
         max_new: req_max,
         temperature,
+        received_at: std::time::Instant::now(),
         top_p,
         top_k: req.top_k,
         rep_penalty,
@@ -369,6 +356,7 @@ async fn chat_completions(
         tx,
         seed: req.seed,
         ckpt_at,
+        domain: crate::batch::classify_domain(&prompt),
     };
     let _ = state.scheduler.send(request);
 
@@ -400,18 +388,22 @@ async fn chat_completions(
         let created = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
-        let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(false);
+        let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
         // Think markers + the initial reasoning/content state, from the model's vocab: qwen is
         // primed into a think block (starts in reasoning); hy_v3's no_think prompt closes the empty
         // block itself (starts as content) — but with reasoning_effort low|high the hy3 template
         // primes `…assistant<think:opensource>` too, so the stream also starts INSIDE the block.
         let (think_open, think_close, family_primed) = tokenizer.think_tags();
-        let starts_in_reasoning = family_primed || matches!(effort, "low" | "high");
+        let starts_in_reasoning = family_primed || matches!(effort, Some("low") | Some("high"));
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
                 format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
                     completion_id, created, model_name)));
+            // Byte-level stream decoder: the per-token decode path above would mangle every
+            // multi-byte char split across tokens (all emoji) into "�" — the crate's ByteLevel
+            // decode is String::from_utf8_lossy per call. Reassembles raw bytes across tokens.
+            let mut stream_dec = tokenizer.stream_decoder();
             let mut acc = String::new();
             let mut n = 0usize;
             let mut stop_hit = false;
@@ -430,9 +422,9 @@ async fn chat_completions(
                     TokEvent::Tok(t) => {
                         n += 1;
                         if first_tok.is_none() { first_tok = Some(std::time::Instant::now()); }
-                        if let Ok(text) = tokenizer.decode(&[t], true) {
-                            if !text.is_empty() {
-                                acc.push_str(&text);
+                        let text = stream_dec.push(t);
+                        if !text.is_empty() {
+                            acc.push_str(&text);
                                 match content_start {
                                     None => {
                                         // Search the close tag from reason_emitted, not from 0:
@@ -490,7 +482,6 @@ async fn chat_completions(
                                     }
                                 }
                             }
-                        }
                         if !stops.is_empty() {
                             if let Some(p) = stops.iter().filter_map(|s| acc.find(s)).min() {
                                 acc.truncate(p);

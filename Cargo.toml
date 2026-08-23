@@ -10,9 +10,12 @@ cudarc = { version = "0.9", features = ["driver", "nvrtc", "cublas", "cublaslt",
 tch = { version = "0.15", optional = true }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# Locking (immediate-unwrap guards)
+parking_lot = "0.12"
 # Serialization
 safetensors = "0.8"
 anyhow = "1.0"
+libc = "0.2"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.10"
@@ -37,10 +40,11 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # Content-addressed artifact hashing for --head/--node shard distribution
 sha2 = "0.10"
+# npz oracle reader (dsv4_load::read_npz_key) — the G3 probe reads oracle pieces directly.
+zip = "2.2"
 
 [dev-dependencies]
 criterion = "0.5"
-zip = "2.2"
 
 [build-dependencies]
 cc = "1.0"

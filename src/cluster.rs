@@ -21,7 +21,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 5;   // v5: + DraftManifest/DraftReady — the DFlash2 drafter rides the sync
+                                     //     into the node's blob cache (v4: per-epoch payload lengths)
 const DISCOVERY_PORT: u16 = 29499;          // UDP; TCP control plane defaults to 29500 (--port)
 const DISCOVERY_MAGIC: &str = "GB10-TP-DISCOVER";
 /// Binary-compat token: same compiled kernels + same Rust-side sources + protocol => same wire
@@ -51,6 +52,13 @@ enum Msg {
     BlobHeader { hash: String, size: u64 },
     Ready { model_dir: String },
     Config(crate::tp::TpConfig),
+    /// v5 — the DFlash2 draft artifact round, ALWAYS sent right after `Config` (empty artifacts
+    /// = "no draft this session") so both sides stay in strict lockstep without the node having
+    /// to guess from its config. The node answers `Missing` (shared with the model round), the
+    /// head streams `BlobHeader`+bytes, and the node answers `DraftReady` with the assembled
+    /// cache path. Nodes therefore NEVER need a local draft copy (owner gap fix 2026-08-23).
+    DraftManifest { model_id: String, artifacts: Vec<Artifact> },
+    DraftReady { model_dir: String },
     Error { msg: String },
 }
 
@@ -134,28 +142,46 @@ fn cached_key(path: &Path) -> Result<String> {
 
 /// Files a node needs to serve a model. Follows a symlinked model dir to the real files.
 fn model_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    // Recursive walk: a bundle may carry required subdirs the loader reads (DSV4's
+    // `inference/config.json`, `encoding/`). Top-level-only shipping starves the node of those and
+    // it crashes at load. Symlinks followed; editor/OS cruft + our sidecars skipped at every level.
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let e = entry?;
-        let p = e.path();
-        let meta = std::fs::metadata(&p)?;   // follows symlinks
-        if meta.is_file() {
-            // skip editor/OS cruft and our own sidecars
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).with_context(|| format!("read_dir {}", d.display()))? {
+            let e = entry?;
+            let p = e.path();
             let name = e.file_name();
             let name = name.to_string_lossy();
             if name.starts_with('.') || name.ends_with(".tmp") { continue; }
-            out.push(p);
+            let meta = std::fs::metadata(&p)?; // follows symlinks
+            if meta.is_file() {
+                out.push(p);
+            } else if meta.is_dir() {
+                stack.push(p);
+            }
         }
     }
     out.sort();
     Ok(out)
 }
 
-pub fn build_manifest(model_dir: &Path) -> Result<(String, Vec<Artifact>)> {
+pub fn build_manifest(model_dir: &Path, world: u32) -> Result<(String, Vec<Vec<Artifact>>)> {
+    let world = world.max(1) as usize;
     let mut cache = hash_cache_load();
     let mut dirty = false;
-    let mut artifacts = Vec::new();
+    // Per-rank artifact lists indexed by rank. rank 0 is the head's own shard and is never shipped;
+    // ranks 1..world-1 are each node's manifest. When `rank{r}/` exists the head ships ONLY that
+    // node's shard (+ the root inference/config.json + root config.json, exactly the world==2 set);
+    // when a rank dir does NOT exist, that rank receives the whole model (replicated, the P2
+    // replicate-if-not-divisible rule). For world==2 this is byte-identical to the pre-P4 single
+    // `rank1/` manifest.
+    let mut per_rank: Vec<Vec<Artifact>> = vec![Vec::new(); world];
+    let sharded: Vec<bool> = (1..world)
+        .map(|r| model_dir.join(format!("rank{r}")).exists())
+        .collect();
     for path in model_files(model_dir)? {
+        let rel = path.strip_prefix(model_dir).unwrap_or(&path).to_string_lossy().to_string();
         let key = cached_key(&path)?;
         let (hash, size) = if let Some(h) = cache.get(&key) {
             (h.clone(), std::fs::metadata(&path)?.len())
@@ -165,12 +191,55 @@ pub fn build_manifest(model_dir: &Path) -> Result<(String, Vec<Artifact>)> {
             dirty = true;
             (h, sz)
         };
-        let logical = path.strip_prefix(model_dir).unwrap_or(&path).to_string_lossy().to_string();
-        artifacts.push(Artifact { logical, hash, size });
+        let artifact = Artifact { logical: rel.clone(), hash, size };
+        for r in 1..world {
+            if include_for_rank(&rel, r, sharded[r - 1]) {
+                per_rank[r].push(artifact.clone());
+            }
+        }
     }
     if dirty { hash_cache_save(&cache); }
     let model_id = model_dir.file_name().map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
+    Ok((model_id, per_rank))
+}
+
+/// Whether a logical path (relative to the model dir) belongs in node rank `r`'s manifest. When
+/// `rank{r}/` exists (`sharded`), only files under `rank{r}/` plus the two always-shipped root
+/// files are kept; otherwise the whole model is replicated (P2 replicate-if-not-divisible).
+fn include_for_rank(rel: &str, rank: usize, sharded: bool) -> bool {
+    if !sharded {
+        return true;
+    }
+    let rank_dir = format!("rank{rank}");
+    rel.starts_with(&format!("{rank_dir}/")) || rel == "inference/config.json" || rel == "config.json"
+}
+
+/// Manifest for a REPLICATED auxiliary artifact dir — the DFlash2 drafter (gap fix 2026-08-23).
+/// Unlike `build_manifest` there is no rank partitioning: every file goes to every node (the
+/// drafter is never sharded over the sync; `Df2Round::load_tp` shards it in memory after load).
+/// Shares the per-path (path,mtime,size)→hash cache with the trunk manifest, so a re-launch
+/// re-hashes nothing.
+fn draft_manifest(dir: &Path) -> Result<(String, Vec<Artifact>)> {
+    let mut cache = hash_cache_load();
+    let mut dirty = false;
+    let mut artifacts = Vec::new();
+    for path in model_files(dir)? {
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().to_string();
+        let key = cached_key(&path)?;
+        let (hash, size) = if let Some(h) = cache.get(&key) {
+            (h.clone(), std::fs::metadata(&path)?.len())
+        } else {
+            let (h, sz) = sha256_file(&path)?;
+            cache.insert(key, h.clone());
+            dirty = true;
+            (h, sz)
+        };
+        artifacts.push(Artifact { logical: rel, hash, size });
+    }
+    if dirty { hash_cache_save(&cache); }
+    let model_id = dir.file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "draft".into());
     Ok((model_id, artifacts))
 }
 
@@ -320,6 +389,52 @@ fn ip_rank(ip: std::net::IpAddr, ifaces: &[Roce]) -> u8 {
     1
 }
 
+/// Deterministic total order over a node's `SocketAddr`. Higher RoCE-rail preference sorts FIRST,
+/// then ascending IPv4, then ascending port. The IPv4 tie-break is what makes the order a *total*
+/// order (hostnames may collide across boxes or be unset in explicit `--nodes` mode).
+fn node_order_key(addr: &SocketAddr, ifaces: &[Roce]) -> (u8, u128, u16) {
+    let rail = ip_rank(addr.ip(), ifaces);
+    let ip_key = match addr.ip() {
+        IpAddr::V4(v4) => u32::from(v4) as u128,
+        IpAddr::V6(v6) => u128::from(v6),
+    };
+    // rail desc => invert; ip/port asc.
+    (255u8.wrapping_sub(rail), ip_key, addr.port())
+}
+
+/// Assign node ranks 1..N-1 in a stable, reproducible order. The head is ALWAYS rank 0; the
+/// discovered nodes (sorted by `node_order_key`) become ranks 1,2,... in that order. The sort is
+/// decoupled from `discover_nodes` (which only picks the best source IP per hostname) so explicit
+/// `--nodes` and discovery take the same path.
+fn assign_ranks(nodes: &mut Vec<NodeInfo>, ifaces: &[Roce]) {
+    nodes.sort_by(|a, b| node_order_key(&a.addr, ifaces).cmp(&node_order_key(&b.addr, ifaces)));
+}
+
+/// Build the full rank→RoCE-IP topology (`Vec<String>` indexed by rank, size `world`). The head is
+/// rank 0 at its own RoCE rail-1 IP (or the first resolved RoCE IP); `ranked_nodes` must already be
+/// sorted by `assign_ranks` (ranks 1..N-1 in order). `topology[self_rank]` is the rank's own IP and
+/// is unused by the N-way transport.
+fn build_topology(ranked_nodes: &[NodeInfo], ifaces: &[Roce], world: u32) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        ranked_nodes.len() as u32 == world.saturating_sub(1),
+        "build_topology: got {} nodes for world {world} (need {})",
+        ranked_nodes.len(),
+        world.saturating_sub(1)
+    );
+    let mut topo: Vec<String> = vec![String::new(); world as usize];
+    // rank 0 = this process; use its own RoCE rail-1 IP (fall back to any resolved RoCE IP). This
+    // entry is the address every node uses to dial the control QP, so it MUST be non-empty.
+    let head_ip = ifaces.iter().find(|f| f.rail == 1).map(|f| f.ip)
+        .or_else(|| ifaces.first().map(|f| f.ip))
+        .context("no RoCE interface resolved — cannot build the rank->IP topology")?;
+    topo[0] = head_ip.to_string();
+    for (i, node) in ranked_nodes.iter().enumerate() {
+        let rank = (i + 1) as usize;
+        topo[rank] = node.addr.ip().to_string();
+    }
+    Ok(topo)
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "node".into())
@@ -383,10 +498,12 @@ fn assemble_model_dir(model_id: &str, artifacts: &[Artifact]) -> Result<PathBuf>
     Ok(dir)
 }
 
-/// Handle one head connection: Hello -> Manifest -> Missing -> blobs -> assemble -> Ready -> Config.
-/// Returns the assembled model dir + the head's TP config (so the node needs ZERO GB10_TP_* env) +
-/// the RETAINED control stream (the TP serving session runs over it; the bench path just drops it).
-fn node_handle(mut s: TcpStream) -> Result<(PathBuf, crate::tp::TpConfig, TcpStream)> {
+/// Handle one head connection: Hello -> Manifest -> Missing -> blobs -> assemble -> Ready ->
+/// Config -> DraftManifest -> (draft blobs) -> DraftReady. Returns the assembled model dir +
+/// the assembled DRAFT cache dir (None when the head shipped no drafter) + the head's TP config
+/// (so the node needs ZERO GB10_TP_* env, ZERO model paths, ZERO draft paths) + the RETAINED
+/// control stream (the TP serving session runs over it; the bench path just drops it).
+fn node_handle(mut s: TcpStream) -> Result<(PathBuf, Option<PathBuf>, crate::tp::TpConfig, TcpStream)> {
     match recv_msg(&mut s)? {
         Msg::Hello { version, hostname, .. } => {
             if version != binary_version() {
@@ -428,13 +545,50 @@ fn node_handle(mut s: TcpStream) -> Result<(PathBuf, crate::tp::TpConfig, TcpStr
     };
     eprintln!("  [node] config from head: shard_mixers={} graph={} fp32_partials={} mtp={} depth={:?} mode_serve={}",
               cfg.shard_mixers, cfg.graph, cfg.fp32_partials, cfg.mtp, cfg.mtp_depth, cfg.mode_serve);
-    Ok((dir, cfg, s))
+
+    // v5 — the DFlash2 draft round (always exactly one DraftManifest after Config). The bytes
+    // land in the SAME content-addressed blob store as the model shards; the assembled dir lives
+    // under models/<draft-id>/ exactly like a trunk model. A node therefore NEVER needs a local
+    // draft copy — the caller rewrites the config's df2_draft_dir to the returned cache path.
+    let draft_dir: Option<PathBuf> = match recv_msg(&mut s)? {
+        Msg::DraftManifest { model_id, artifacts } if artifacts.is_empty() => {
+            send_msg(&mut s, &Msg::DraftReady { model_dir: String::new() })?;
+            eprintln!("  [node] no draft artifact this session (head sent an empty manifest)");
+            None
+        }
+        Msg::DraftManifest { model_id, artifacts } => {
+            let missing: Vec<String> = artifacts.iter().map(|a| a.hash.clone())
+                .filter(|h| !have_blob(h)).collect();
+            let have = artifacts.len() - missing.len();
+            eprintln!("  [node] draft manifest '{model_id}': {} artifacts, {have} cached, {} to fetch",
+                      artifacts.len(), missing.len());
+            send_msg(&mut s, &Msg::Missing { hashes: missing.clone() })?;
+            for _ in 0..missing.len() {
+                match recv_msg(&mut s)? {
+                    Msg::BlobHeader { hash, size } => {
+                        let tmp = recv_blob(&mut s, &hash, size)?;
+                        publish_blob(&hash, &tmp)?;
+                        eprintln!("  [node] cached draft blob {} ({:.1} MB)", &hash[..12], size as f64 / 1e6);
+                    }
+                    _ => bail!("expected draft BlobHeader"),
+                }
+            }
+            let ddir = assemble_model_dir(&model_id, &artifacts)?;
+            send_msg(&mut s, &Msg::DraftReady { model_dir: ddir.to_string_lossy().to_string() })?;
+            eprintln!("  [node] DRAFT READY — drafter assembled at {} (loads from the cache, no local copy)",
+                      ddir.display());
+            Some(ddir)
+        }
+        _ => bail!("expected DraftManifest after Config"),
+    };
+    Ok((dir, draft_dir, cfg, s))
 }
 
 /// Run as a node: answer discovery, accept ONE head sync, return the assembled model dir + the head's
 /// IP (its RoCE address, used to bring up the RDMA data-plane link back to it) + the head's TP config
 /// + the retained control stream (dropped by bench sessions, kept by serving ones).
-pub fn run_node(tcp_port: u16) -> Result<(PathBuf, IpAddr, crate::tp::TpConfig, TcpStream)> {
+pub fn run_node(tcp_port: u16)
+    -> Result<(PathBuf, Option<PathBuf>, IpAddr, crate::tp::TpConfig, TcpStream)> {
     spawn_discovery_responder(tcp_port)?;
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp_port))
         .with_context(|| format!("bind TCP {tcp_port}"))?;
@@ -443,9 +597,11 @@ pub fn run_node(tcp_port: u16) -> Result<(PathBuf, IpAddr, crate::tp::TpConfig, 
     let (s, from) = listener.accept()?;
     eprintln!("[node] head connected from {from}");
     s.set_nodelay(true).ok();
-    let (dir, cfg, s) = node_handle(s)?;
-    eprintln!("[node] SYNCED — model ready at {}", dir.display());
-    Ok((dir, from.ip(), cfg, s))
+    let (dir, draft_dir, cfg, s) = node_handle(s)?;
+    eprintln!("[node] SYNCED — model ready at {}{}",
+              dir.display(),
+              draft_dir.as_ref().map(|d| format!(", drafter at {}", d.display())).unwrap_or_default());
+    Ok((dir, draft_dir, from.ip(), cfg, s))
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -453,11 +609,14 @@ pub fn run_node(tcp_port: u16) -> Result<(PathBuf, IpAddr, crate::tp::TpConfig, 
 // ---------------------------------------------------------------------------------------------------
 
 /// Push the model to one node: Hello -> Manifest -> receive Missing -> stream blobs -> Ready, then
-/// ship our TP config (`Msg::Config`) so the node runs with ZERO GB10_TP_* env vars. Returns the
-/// RETAINED control stream — the TP serving session keeps it as its control plane; the bench path
-/// (`run_head`) drops it, ending the session exactly as before.
-fn head_sync_one(node: &NodeInfo, model_dir: &Path, model_id: &str, artifacts: &[Artifact],
-                 cfg: &crate::tp::TpConfig) -> Result<TcpStream> {
+/// ship our TP config (`Msg::Config`) so the node runs with ZERO GB10_TP_* env vars. The shipped
+/// config is a per-node clone: `node_rank` identifies this node and `topology` is the full
+/// rank→RoCE-IP map (the node reads both back from its own `Msg::Config`). Returns the RETAINED
+/// control stream — the TP serving session keeps it as its control plane; the bench path drops it.
+fn head_sync_one(node: &NodeInfo, node_rank: i32, model_dir: &Path, model_id: &str,
+                 artifacts: &[Artifact], topology: &[String],
+                 cfg: &crate::tp::TpConfig,
+                 draft: Option<&(String, Vec<Artifact>)>) -> Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&node.addr, Duration::from_secs(10))
         .with_context(|| format!("connect {}", node.addr))?;
     s.set_nodelay(true).ok();
@@ -474,8 +633,8 @@ fn head_sync_one(node: &NodeInfo, model_dir: &Path, model_id: &str, artifacts: &
     };
     let by_hash: HashMap<&str, &Artifact> = artifacts.iter().map(|a| (a.hash.as_str(), a)).collect();
     let total: u64 = missing.iter().filter_map(|h| by_hash.get(h.as_str())).map(|a| a.size).sum();
-    eprintln!("[head] {} needs {} / {} artifacts ({:.2} GB)", node.hostname, missing.len(),
-              artifacts.len(), total as f64 / 1e9);
+    eprintln!("[head] {} (rank {node_rank}) needs {} / {} artifacts ({:.2} GB)", node.hostname,
+              missing.len(), artifacts.len(), total as f64 / 1e9);
     let t0 = std::time::Instant::now();
     for h in &missing {
         let a = by_hash.get(h.as_str()).context("node asked for unknown hash")?;
@@ -485,12 +644,57 @@ fn head_sync_one(node: &NodeInfo, model_dir: &Path, model_id: &str, artifacts: &
     match recv_msg(&mut s)? {
         Msg::Ready { model_dir } => {
             let secs = t0.elapsed().as_secs_f64();
-            eprintln!("[head] {} READY — model at {} ({:.2} GB in {:.1}s = {:.2} GB/s)",
+            eprintln!("[head] {} (rank {node_rank}) READY — model at {} ({:.2} GB in {:.1}s = {:.2} GB/s)",
                       node.hostname, model_dir, total as f64/1e9, secs,
                       if secs > 0.0 { total as f64/1e9/secs } else { 0.0 });
-            send_msg(&mut s, &Msg::Config(cfg.clone()))?;
-            eprintln!("[head] shipped config to {}: shard_mixers={} graph={} fp32_partials={} mtp={} depth={:?}",
-                      node.hostname, cfg.shard_mixers, cfg.graph, cfg.fp32_partials, cfg.mtp, cfg.mtp_depth);
+            let mut node_cfg = cfg.clone();
+            node_cfg.node_rank = node_rank;
+            node_cfg.topology = topology.to_vec();
+            send_msg(&mut s, &Msg::Config(node_cfg.clone()))?;
+            eprintln!("[head] shipped config to {} (rank {node_rank}/{})", node.hostname, node_cfg.world);
+
+            // v5 — the DFlash2 draft round: ALWAYS exactly one DraftManifest after Config (empty
+            // artifacts = none), so the node's receive state machine is unconditional and can
+            // never block waiting for a round the head decided not to send.
+            match draft {
+                Some((draft_id, draft_arts)) if !draft_arts.is_empty() => {
+                    send_msg(&mut s, &Msg::DraftManifest { model_id: draft_id.clone(),
+                                                          artifacts: draft_arts.clone() })?;
+                    let src_dir = Path::new(&cfg.df2_draft_dir);
+                    let dmissing = match recv_msg(&mut s)? {
+                        Msg::Missing { hashes } => hashes,
+                        _ => bail!("expected draft Missing from {}", node.hostname),
+                    };
+                    let dby_hash: HashMap<&str, &Artifact> =
+                        draft_arts.iter().map(|a| (a.hash.as_str(), a)).collect();
+                    let dtotal: u64 = dmissing.iter().filter_map(|h| dby_hash.get(h.as_str())).map(|a| a.size).sum();
+                    eprintln!("[head] {} drafter: {} / {} artifacts ({:.2} GB)",
+                              node.hostname, dmissing.len(), draft_arts.len(), dtotal as f64 / 1e9);
+                    let dt0 = std::time::Instant::now();
+                    for h in &dmissing {
+                        let a = dby_hash.get(h.as_str()).context("node asked for unknown draft hash")?;
+                        send_msg(&mut s, &Msg::BlobHeader { hash: a.hash.clone(), size: a.size })?;
+                        send_blob(&mut s, &src_dir.join(&a.logical))?;
+                    }
+                    match recv_msg(&mut s)? {
+                        Msg::DraftReady { model_dir } => {
+                            let secs = dt0.elapsed().as_secs_f64();
+                            eprintln!("[head] {} drafter READY at {} ({:.2} GB in {:.1}s)",
+                                      node.hostname, model_dir, dtotal as f64/1e9, secs);
+                        }
+                        Msg::Error { msg } => bail!("node draft error: {msg}"),
+                        _ => bail!("expected DraftReady"),
+                    }
+                }
+                _ => {
+                    send_msg(&mut s, &Msg::DraftManifest { model_id: String::new(), artifacts: Vec::new() })?;
+                    match recv_msg(&mut s)? {
+                        Msg::DraftReady { .. } => {}
+                        Msg::Error { msg } => bail!("node draft error: {msg}"),
+                        _ => bail!("expected DraftReady (none)"),
+                    }
+                }
+            }
             Ok(s)
         }
         Msg::Error { msg } => bail!("node error: {msg}"),
@@ -498,17 +702,21 @@ fn head_sync_one(node: &NodeInfo, model_dir: &Path, model_id: &str, artifacts: &
     }
 }
 
-/// Run as the head: discover nodes (or use explicit addrs), then sync the model to each.
+/// Run as the head: discover nodes (or use explicit addrs), assign ranks 1..N-1 deterministically,
+/// then sync the model to each node's OWN shard. Sets the process-global topology before returning
+/// (so `bring_up_head` can resolve its N-way partners).
 pub fn run_head(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wait: Duration,
                 cfg: &crate::tp::TpConfig)
     -> Result<Vec<NodeInfo>>
 {
-    eprintln!("[head] {} — building manifest for {} ...", hostname(), model_dir.display());
-    let (model_id, artifacts) = build_manifest(model_dir)?;
-    let total: u64 = artifacts.iter().map(|a| a.size).sum();
-    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB", artifacts.len(), total as f64/1e9);
+    let world = cfg.world.max(1);
+    eprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
+    let (model_id, per_rank) = build_manifest(model_dir, world)?;
+    let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
+    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB", total_artifacts(&per_rank), total as f64/1e9);
 
-    let nodes: Vec<NodeInfo> = match explicit {
+    let ifaces = roce_interfaces();
+    let mut nodes: Vec<NodeInfo> = match explicit {
         Some(addrs) => addrs.into_iter()
             .map(|a| NodeInfo { hostname: a.ip().to_string(), addr: a }).collect(),
         None => {
@@ -519,25 +727,47 @@ pub fn run_head(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wa
             n
         }
     };
-    for node in &nodes { head_sync_one(node, model_dir, &model_id, &artifacts, cfg)?; }
+    let need = (world - 1) as usize;
+    if nodes.len() != need {
+        bail!("--tp {world} needs exactly {need} node(s), got {} — start exactly {need} --node (or pass exactly {need} --nodes <ip:port>)",
+              nodes.len());
+    }
+    assign_ranks(&mut nodes, &ifaces);
+    let topology = build_topology(&nodes, &ifaces, world)?;
+    crate::tp::set_topology(topology.clone());
+    for (i, node) in nodes.iter().enumerate() {
+        let rank = (i + 1) as i32;
+        // Bench sessions ship no drafter (bench nodes never load a round; the bench wire adds
+        // only the empty-DraftManifest round to the pre-v5 behavior).
+        head_sync_one(node, rank, model_dir, &model_id, &per_rank[rank as usize], &topology, cfg, None)?;
+    }
     eprintln!("[head] all {} node(s) synced.", nodes.len());
     Ok(nodes)
 }
 
+fn total_artifacts(per_rank: &[Vec<Artifact>]) -> usize {
+    per_rank.iter().flatten().count()
+}
+
 /// Run as the head for a TP SERVING session (TP item A): identical to `run_head` (same manifest,
-/// discovery, and blob push), but TP=2 means EXACTLY one node, and the sync connection is RETAINED
-/// and returned — the whole serving control plane (calibration table, per-step events, shutdown)
-/// then runs over it as `tp_serve::ServingMsg`. The node side is `run_node`'s retained stream.
+/// discovery, and blob push), but the sync connections are RETAINED and returned — the whole serving
+/// control plane (calibration table, per-step events, shutdown) then runs over them as
+/// `tp_serve::ServingMsg`. The node count requirement is world-aware: exactly `world - 1` nodes.
+/// Returns the retained streams RANK-INDEXED (`streams[i]` is the stream to rank `i + 1`), so the
+/// head can fan out `CalibTable` / `Step` / `Shutdown` to every node (world > 2) and wait for
+/// `Ready` from every node. The node side is `run_node`'s retained stream.
 pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, discover_wait: Duration,
                         cfg: &crate::tp::TpConfig)
-    -> Result<(Vec<NodeInfo>, TcpStream)>
+    -> Result<(Vec<NodeInfo>, Vec<TcpStream>)>
 {
-    eprintln!("[head] {} — building manifest for {} ...", hostname(), model_dir.display());
-    let (model_id, artifacts) = build_manifest(model_dir)?;
-    let total: u64 = artifacts.iter().map(|a| a.size).sum();
-    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB", artifacts.len(), total as f64/1e9);
+    let world = cfg.world.max(1);
+    eprintln!("[head] {} — building manifest for {} (world {world}) ...", hostname(), model_dir.display());
+    let (model_id, per_rank) = build_manifest(model_dir, world)?;
+    let total: u64 = per_rank.iter().flatten().map(|a| a.size).sum();
+    eprintln!("[head] manifest '{model_id}': {} artifacts, {:.2} GB", total_artifacts(&per_rank), total as f64/1e9);
 
-    let nodes: Vec<NodeInfo> = match explicit {
+    let ifaces = roce_interfaces();
+    let mut nodes: Vec<NodeInfo> = match explicit {
         Some(addrs) => addrs.into_iter()
             .map(|a| NodeInfo { hostname: a.ip().to_string(), addr: a }).collect(),
         None => {
@@ -548,17 +778,59 @@ pub fn run_head_session(model_dir: &Path, explicit: Option<Vec<SocketAddr>>, dis
             n
         }
     };
-    if nodes.len() != 1 {
-        bail!("TP serving is TP=2: exactly one node required, got {} — start exactly one --node \
-               (or pass exactly one --nodes <ip:port>)", nodes.len());
+    let need = (world - 1) as usize;
+    if nodes.len() != need {
+        bail!("--tp {world} serving needs exactly {need} node(s), got {} — start exactly {need} --node (or pass exactly {need} --nodes <ip:port>)",
+              nodes.len());
     }
-    let stream = head_sync_one(&nodes[0], model_dir, &model_id, &artifacts, cfg)?;
-    eprintln!("[head] node synced; control stream RETAINED for the serving session");
-    Ok((nodes, stream))
+    assign_ranks(&mut nodes, &ifaces);
+    let topology = build_topology(&nodes, &ifaces, world)?;
+    crate::tp::set_topology(topology.clone());
+    // v5 — the DFlash2 drafter rides the same sync (gap fix 2026-08-23): on serve sessions with
+    // a DF2 spec source and a resolved --draft-dir, ship the WHOLE artifact (replicated, content-
+    // addressed) so every node loads it from its blob cache instead of a hand-copied local dir.
+    // A manifest failure is loud but not fatal here — the head's own round load fails the same
+    // way and CalibTable's df2_round=false keeps all ranks consistently on MTP.
+    let draft: Option<(String, Vec<Artifact>)> = if cfg.mode_serve
+        && crate::batch::is_df2_src(
+            crate::batch::SpecSource::from_cli(&cfg.spec_source).unwrap_or(crate::batch::SpecSource::Mtp))
+        && !cfg.df2_draft_dir.is_empty()
+    {
+        match draft_manifest(Path::new(&cfg.df2_draft_dir)) {
+            Ok((id, arts)) => {
+                let dtotal: u64 = arts.iter().map(|a| a.size).sum();
+                eprintln!("[head] draft manifest '{id}': {} artifacts, {:.2} GB — ships to every node",
+                          arts.len(), dtotal as f64 / 1e9);
+                Some((id, arts))
+            }
+            Err(e) => {
+                eprintln!("[head] WARN: draft manifest build FAILED ({e:#}) — nodes get NO drafter; \
+                           the head's round load fails the same way and all ranks fall back to MTP");
+                None
+            }
+        }
+    } else { None };
+
+    // Sync every node and RETAIN every node's sync stream, RANK-INDEXED (streams[i] == rank i+1).
+    // The serving control plane (CalibTable, per-step Step, Shutdown) must fan out to ALL world-1
+    // nodes; dropping rank 2..N-1's streams here is exactly what deadlocked world>2 bring-up (those
+    // nodes reached node_serve_tp and blocked forever on a CalibTable the head never sent them).
+    let mut streams: Vec<TcpStream> = Vec::with_capacity(need);
+    for (i, node) in nodes.iter().enumerate() {
+        let rank = (i + 1) as i32;
+        let stream = head_sync_one(node, rank, model_dir, &model_id, &per_rank[rank as usize],
+                                   &topology, cfg, draft.as_ref())?;
+        streams.push(stream);
+    }
+    anyhow::ensure!(streams.len() == need,
+        "expected {need} retained serving control stream(s), got {}", streams.len());
+    eprintln!("[head] {} node(s) synced; all control streams RETAINED for the serving session", streams.len());
+    Ok((nodes, streams))
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Blob cache management (ops CLI: --list-model-blobs / --remove-model-blob / --clear-model-blobs)
+// Blob cache management (ops CLI: --cached-models-list / --cached-models-remove /
+// --cached-models-remove-all — MODEL-centric; the old blob-centric names are deprecated aliases)
 // ---------------------------------------------------------------------------------------------------
 
 /// Walk every symlink under `cache/models/<model_id>/`, calling `f(model_id, link_path, target)`.
@@ -584,31 +856,68 @@ fn walk_model_links(mut f: impl FnMut(&str, &Path, &Path)) {
 
 fn fmt_gib(b: u64) -> String { format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64) }
 
-/// `--list-model-blobs`: every blob in the cache — its id (sha256 = the blob's file name), size,
-/// and which assembled model dir(s) reference it (ORPHAN = none). `tmp.*` rows are interrupted
-/// fetch partials, safe to reclaim via --clear-model-blobs.
-pub fn list_model_blobs() -> Result<()> {
-    let dir = cache_root().join("blobs");
-    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+/// The blobs (by hash) referenced by the assembled model dir `model_id` (empty if absent).
+fn model_blob_hashes(model_id: &str) -> Vec<String> {
+    let mut v = Vec::new();
     walk_model_links(|mid, _p, t| {
-        if let Some(h) = t.file_name() { refs.entry(h.to_string_lossy().to_string()).or_default().push(mid.to_string()); }
+        if mid == model_id {
+            if let Some(h) = t.file_name() { v.push(h.to_string_lossy().to_string()); }
+        }
     });
-    for v in refs.values_mut() { v.sort(); v.dedup(); }
+    v.sort(); v.dedup();
+    v
+}
 
-    let mut rows: Vec<(String, u64)> = Vec::new();
-    let mut tmp: Vec<(String, u64)> = Vec::new();
-    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-        if name.starts_with("tmp.") { tmp.push((name, size)); } else { rows.push((name, size)); }
+/// Blob file size in `blobs/<hash>` (0 if missing).
+fn blob_size(hash: &str) -> u64 {
+    std::fs::metadata(blob_path(hash)).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `--cached-models-list`: ONE line per assembled MODEL — name, total size (sum of its blob
+/// files), blob count — plus a cache summary and any orphan-blob / interrupted-fetch tail.
+pub fn list_cached_models() -> Result<()> {
+    let mdir = cache_root().join("models");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&mdir) {
+        for e in rd.flatten() {
+            let mid = e.file_name().to_string_lossy().to_string();
+            if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) { names.push(mid); }
+        }
     }
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
-    let total: u64 = rows.iter().map(|r| r.1).sum();
-    println!("cache {} — {} blobs, {}", dir.display(), rows.len(), fmt_gib(total));
-    for (h, sz) in &rows {
-        let users = refs.get(h).cloned().unwrap_or_default();
-        let tag = if users.is_empty() { "ORPHAN".to_string() } else { users.join(",") };
-        println!("{h}  {:>12}  {tag}", fmt_gib(*sz));
+    names.sort();
+    let mut rows: Vec<(String, u64, usize)> = Vec::new();
+    let mut all_blobs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mid in &names {
+        let hashes = model_blob_hashes(mid);
+        let total: u64 = hashes.iter().map(|h| blob_size(h)).sum();
+        all_blobs.extend(hashes.iter().cloned());
+        rows.push((mid.clone(), total, hashes.len()));
+    }
+    let blob_dir = cache_root().join("blobs");
+    let mut blob_total = 0u64;
+    let mut n_blobs = 0usize;
+    let mut tmp: Vec<(String, u64)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&blob_dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            if name.starts_with("tmp.") { tmp.push((name, size)); }
+            else { blob_total += size; n_blobs += 1; }
+        }
+    }
+    let orphans: Vec<String> = std::fs::read_dir(&blob_dir).into_iter().flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with("tmp.") && !all_blobs.contains(n))
+        .collect();
+    println!("cached models ({}):", rows.len());
+    for (mid, total, n) in &rows {
+        println!("  {mid}  {:>12}  {n} blob(s)", fmt_gib(*total));
+    }
+    println!("cache {} — {} blob(s), {} total", blob_dir.display(), n_blobs, fmt_gib(blob_total));
+    if !orphans.is_empty() {
+        let osz: u64 = orphans.iter().map(|h| blob_size(h)).sum();
+        println!("-- {} orphan blob(s), {} (referenced by no model; --cached-models-remove-all reclaims)", orphans.len(), fmt_gib(osz));
     }
     if !tmp.is_empty() {
         let t: u64 = tmp.iter().map(|x| x.1).sum();
@@ -617,62 +926,220 @@ pub fn list_model_blobs() -> Result<()> {
     Ok(())
 }
 
-/// `--remove-model-blob <hash|unique-prefix>`: delete ONE blob + the assembled-dir symlinks that
-/// reference it (so `models/` stays consistent). A model that loses files re-fetches the blob on
-/// its next head sync — removal never corrupts a later run. If every match is a `tmp.*`
-/// interrupted-fetch partial, ALL of them are deleted (they are junk by definition).
-pub fn remove_model_blob(id: &str) -> Result<()> {
-    if id.len() < 4 { bail!("refusing to match an id shorter than 4 characters"); }
-    let dir = cache_root().join("blobs");
+/// Match a model id by exact name or unique prefix (a 4-char floor, like the old blob op).
+fn resolve_model(id: &str) -> Result<String> {
+    let mdir = cache_root().join("models");
     let mut matches: Vec<String> = Vec::new();
-    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if name == id || name.starts_with(id) { matches.push(name); }
-    }
-    if matches.is_empty() { bail!("no blob matching '{id}' in {}", dir.display()); }
-    if matches.iter().all(|m| m.starts_with("tmp.")) {
-        let mut freed = 0u64;
-        for m in &matches {
-            freed += std::fs::metadata(dir.join(m)).map(|x| x.len()).unwrap_or(0);
-            let _ = std::fs::remove_file(dir.join(m));
+    if let Ok(rd) = std::fs::read_dir(&mdir) {
+        for e in rd.flatten() {
+            let mid = e.file_name().to_string_lossy().to_string();
+            if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && (mid == id || mid.starts_with(id)) { matches.push(mid); }
         }
-        println!("removed {} interrupted-fetch partial(s), {}", matches.len(), fmt_gib(freed));
-        return Ok(());
     }
-    let hash = match matches.len() {
-        1 => matches.pop().unwrap(),
-        n => bail!("'{id}' matches {n} blobs — give a longer prefix"),
-    };
-    let size = std::fs::metadata(blob_path(&hash)).map(|m| m.len()).unwrap_or(0);
-    std::fs::remove_file(blob_path(&hash)).with_context(|| format!("remove blob {hash}"))?;
-    let mut pruned = 0usize;
-    let mut affected: Vec<String> = Vec::new();
-    walk_model_links(|mid, p, t| {
-        if t.file_name().map(|h| h.to_string_lossy() == hash).unwrap_or(false) {
-            if std::fs::remove_file(p).is_ok() { pruned += 1; affected.push(mid.to_string()); }
-        }
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => bail!("no cached model matching '{id}' in {}", mdir.display()),
+        n => bail!("'{id}' matches {n} models — give a longer prefix"),
+    }
+}
+
+/// `--cached-models-remove <id>`: remove ONE cached MODEL — its assembled dir plus the blobs
+/// referenced by NO other model (shared blobs stay). Interrupted-fetch partials are never
+/// referenced and are reclaimed here too. Other models are untouched.
+pub fn remove_cached_model(id: &str) -> Result<()> {
+    if id.len() < 4 { bail!("refusing to match an id shorter than 4 characters"); }
+    let mid = resolve_model(id)?;
+    let hashes = model_blob_hashes(&mid);
+    let mdir = cache_root().join("models").join(&mid);
+    std::fs::remove_dir_all(&mdir).with_context(|| format!("remove model dir {mdir:?}"))?;
+    // Garbage-collect blobs no longer referenced by ANY remaining model.
+    let mut refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_model_links(|_m, _p, t| {
+        if let Some(h) = t.file_name() { refs.insert(h.to_string_lossy().to_string()); }
     });
-    affected.sort(); affected.dedup();
-    println!("removed blob {hash} ({}) — pruned {pruned} link(s) in [{}]",
-             fmt_gib(size), affected.join(","));
-    println!("note: those models now have missing files; a head re-sync re-fetches this blob on next use.");
+    let blob_dir = cache_root().join("blobs");
+    let mut removed = 0u64;
+    let mut n_removed = 0usize;
+    if let Ok(rd) = std::fs::read_dir(&blob_dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let orphan = if name.starts_with("tmp.") { true }
+                else { !refs.contains(&name) };
+            if orphan {
+                let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(e.path());
+                removed += sz; n_removed += 1;
+            }
+        }
+    }
+    let kept = hashes.iter().filter(|h| blob_path(h).exists()).count();
+    println!("removed model {mid} — {n_removed} unreferenced blob(s) reclaimed, {}",
+             fmt_gib(removed));
+    println!("  {kept} of its blob(s) still referenced by other models were kept");
     Ok(())
 }
 
-/// `--clear-model-blobs`: delete ALL cached blobs (including interrupted tmp.* partials) and the
-/// assembled model dirs (symlink trees). The next head run re-syncs from scratch.
-pub fn clear_model_blobs() -> Result<()> {
+/// `--cached-models-remove-all`: clear the whole cache (blobs incl. tmp.* partials + assembled
+/// model dirs). The next head run re-syncs from scratch.
+pub fn remove_all_cached_models() -> Result<()> {
     let dir = cache_root().join("blobs");
     let mut total = 0u64;
     let mut n = 0usize;
-    for e in std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?.flatten() {
-        total += e.metadata().map(|m| m.len()).unwrap_or(0);
-        std::fs::remove_file(e.path()).with_context(|| format!("remove {}", e.path().display()))?;
-        n += 1;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            total += e.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(e.path());
+            n += 1;
+        }
     }
     let mdir = cache_root().join("models");
     if mdir.exists() { std::fs::remove_dir_all(&mdir).context("remove assembled model dirs")?; }
     println!("cleared {n} blob(s), {} — assembled model dirs removed; next head run re-syncs from scratch",
              fmt_gib(total));
     Ok(())
+}
+
+// -- deprecated aliases (the old blob-centric names; warn once, route to the model-centric ops) --
+
+/// DEPRECATED alias for `--cached-models-list` (was: one line per BLOB). Warns once.
+pub fn list_model_blobs() -> Result<()> {
+    eprintln!("warning: --list-model-blobs is deprecated — use --cached-models-list (lists MODELS, not blobs)");
+    list_cached_models()
+}
+
+/// DEPRECATED alias for `--cached-models-remove <model-id>` (was: remove one BLOB by hash).
+/// The argument is now a MODEL name/prefix.
+pub fn remove_model_blob(id: &str) -> Result<()> {
+    eprintln!("warning: --remove-model-blob is deprecated — use --cached-models-remove <model> (removes a MODEL, not a blob)");
+    remove_cached_model(id)
+}
+
+/// DEPRECATED alias for `--cached-models-remove-all`. Warns once.
+pub fn clear_model_blobs() -> Result<()> {
+    eprintln!("warning: --clear-model-blobs is deprecated — use --cached-models-remove-all");
+    remove_all_cached_models()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(hostname: &str, ip: &str, port: u16) -> NodeInfo {
+        NodeInfo {
+            hostname: hostname.to_string(),
+            addr: SocketAddr::new(ip.parse().unwrap(), port),
+        }
+    }
+
+    // Synthetic RoCE rails: rail 1 = 192.168.177.0/24, rail 2 = 192.168.178.0/24.
+    fn rails() -> Vec<Roce> {
+        vec![
+            Roce {
+                ib: "rocep1s0f1".into(),
+                netdev: "r1".into(),
+                ip: "192.168.177.1".parse().unwrap(),
+                bcast: "192.168.177.255".parse().unwrap(),
+                mask: 0xffffff00,
+                rail: 1,
+            },
+            Roce {
+                ib: "roceP2p1s0f1".into(),
+                netdev: "r2".into(),
+                ip: "192.168.178.1".parse().unwrap(),
+                bcast: "192.168.178.255".parse().unwrap(),
+                mask: 0xffffff00,
+                rail: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn deterministic_rank_order_prefers_rail_then_ip() {
+        let ifaces = rails();
+        // rail-1 .13, rail-1 .12, rail-2 .99, non-RoCE .1 -> expected order.
+        let mut nodes = vec![
+            node("a", "10.0.0.1", 29500),
+            node("b", "192.168.178.99", 29500),
+            node("c", "192.168.177.13", 29500),
+            node("d", "192.168.177.12", 29500),
+        ];
+        assign_ranks(&mut nodes, &ifaces);
+        let order: Vec<String> = nodes.iter().map(|n| n.hostname.clone()).collect();
+        assert_eq!(order, vec!["d", "c", "b", "a"], "rail desc, then ip asc");
+
+        // Reassign with the same set in a different input order -> identical result.
+        let mut shuffled = vec![
+            node("d", "192.168.177.12", 29500),
+            node("b", "192.168.178.99", 29500),
+            node("a", "10.0.0.1", 29500),
+            node("c", "192.168.177.13", 29500),
+        ];
+        assign_ranks(&mut shuffled, &ifaces);
+        let order2: Vec<String> = shuffled.iter().map(|n| n.hostname.clone()).collect();
+        assert_eq!(order, order2, "order must be input-order independent");
+    }
+
+    #[test]
+    fn topology_is_full_and_indexed_by_rank() {
+        let ifaces = rails();
+        let mut nodes = vec![
+            node("b", "192.168.178.99", 29500),
+            node("c", "192.168.177.13", 29500),
+            node("d", "192.168.177.12", 29500),
+        ];
+        assign_ranks(&mut nodes, &ifaces);
+        let topo = build_topology(&nodes, &ifaces, 4).unwrap();
+        assert_eq!(topo.len(), 4);
+        assert_eq!(topo[0], "192.168.177.1"); // head = rail 1
+        assert_eq!(topo[1], "192.168.177.12"); // rail 1, lowest ip
+        assert_eq!(topo[2], "192.168.177.13"); // rail 1, next ip
+        assert_eq!(topo[3], "192.168.178.99"); // rail 2 last
+    }
+
+    #[test]
+    fn manifest_filtering_per_rank_and_world2_identity() {
+        // Logical paths exactly as model_files() would emit relative to the model dir.
+        let logicals = vec![
+            "config.json",
+            "inference/config.json",
+            "rank1/weights.safetensors",
+            "rank1/dspark_stage0.safetensors",
+            "rank2/weights.safetensors",
+            "rank3/weights.safetensors",
+            "rank0/weights.safetensors",
+        ];
+
+        // world==2 with rank1/ present: rank1 manifest == the pre-P4 set (rank1/* + 2 root files).
+        let got = |rank: usize, sharded: bool| -> Vec<&str> {
+            logicals.iter().copied().filter(|rel| include_for_rank(rel, rank, sharded)).collect()
+        };
+        assert_eq!(got(1, true), vec![
+            "config.json",
+            "inference/config.json",
+            "rank1/weights.safetensors",
+            "rank1/dspark_stage0.safetensors",
+        ]);
+
+        // world==4 with rank1/..rank3/ present: each node gets only its own shard.
+        assert_eq!(got(2, true), vec![
+            "config.json",
+            "inference/config.json",
+            "rank2/weights.safetensors",
+        ]);
+        assert_eq!(got(3, true), vec![
+            "config.json",
+            "inference/config.json",
+            "rank3/weights.safetensors",
+        ]);
+
+        // rank0's own shard must never leak into any node manifest.
+        assert!(!got(1, true).contains(&"rank0/weights.safetensors"));
+        assert!(!got(2, true).contains(&"rank0/weights.safetensors"));
+        assert!(!got(3, true).contains(&"rank0/weights.safetensors"));
+
+        // Replicate-if-not-divisible: a rank with no dir gets the whole model.
+        let all: Vec<&str> = logicals.iter().copied().filter(|rel| include_for_rank(rel, 2, false)).collect();
+        assert_eq!(all.len(), logicals.len());
+    }
 }

@@ -18,6 +18,15 @@ impl KernelModule {
             ("fused_decode", "src/ptx/fused_decode.ptx", vec!["fused_decode_single_token"]),
             ("rms_norm", "src/ptx/rms_norm.ptx", vec!["rms_norm_kernel", "silu_gate_mul_kernel", "add_residual_kernel", "apply_rope_kernel"]),
             ("silu_gate", "src/ptx/silu_gate.ptx", vec!["silu_gate_mul_kernel", "add_residual_kernel"]),
+            // DeepSeek-V4 G1 kernel prototypes (LANE D) — registration only; launched by tests/dsv4_kernels_test.rs
+            ("gpu_dsv4", "src/ptx/gpu_dsv4.ptx", vec![
+                "dsv4_topk", "dsv4_fwht_rotate",
+                "dsv4_act_quant_g64", "dsv4_act_quant_g128",
+                "dsv4_act_quant_sim_g64", "dsv4_act_quant_sim_g128",
+                "dsv4_fp4_act_quant", "dsv4_fp4_act_quant_sim",
+                "dsv4_hc_split_sinkhorn", "dsv4_gather_attn",
+                "dsv4_swiglu_clamp", "dsv4_swiglu_clamp_shared",
+            ]),
         ];
 
         let mut module = Self {

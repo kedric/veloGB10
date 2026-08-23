@@ -8,6 +8,7 @@
 //! invariants live in `native/tp_doorbell.h`; the rationale in `tp_doorbell_ref/`.
 
 use std::ffi::CString;
+use std::net::IpAddr;
 use std::os::raw::{c_char, c_int, c_void};
 
 #[repr(C)]
@@ -16,9 +17,13 @@ pub struct NetCtx {
 }
 
 extern "C" {
-    fn net_init(rank: c_int, peer_ip: *const c_char, tcp_port: c_int, dev_name: *const c_char,
+    fn net_init(rank: c_int, world: c_int, peer_ips: *const *const c_char, n_peers: c_int,
+                tcp_port: c_int, dev_name: *const c_char,
                 gid_idx: c_int, fp32_capacity_bytes: c_int, payload_bytes: c_int) -> *mut NetCtx;
     fn net_set_payload(c: *mut NetCtx, payload_bytes: c_int, fp32: c_int) -> c_int;
+    fn net_oneshot_on(c: *mut NetCtx) -> c_int;   // P3-1: the ctx's one-shot selector (single source of truth)
+    fn net_set_recv_mode(c: *mut NetCtx, gpu: c_int) -> c_int;
+    fn net_rx_done(c: *mut NetCtx) -> u64;
     fn net_ctx_dptr(c: *mut NetCtx) -> *mut c_void;
     fn net_flags_dptr(c: *mut NetCtx) -> *mut c_void;
     fn net_send_dptr(c: *mut NetCtx) -> *mut c_void;
@@ -42,8 +47,31 @@ extern "C" {
     fn net_counters(c: *mut NetCtx, posted: *mut u64, retired: *mut u64,
                     released: *mut u64, tail_fires: *mut u64);
     fn net_agree(c: *mut NetCtx, val: u64, step_mask: u64, step_val: u64) -> u64;
+    fn net_exchange_one(c: *mut NetCtx, peer_rank: c_int, nbytes: c_int) -> c_int;
+    fn net_ctrl_recv_hptr(c: *mut NetCtx, src: c_int) -> *mut c_void;
+    fn net_ctrl_send_hptr(c: *mut NetCtx) -> *mut c_void;
+    fn net_world(c: *mut NetCtx) -> c_int;
+    fn net_rank(c: *mut NetCtx) -> c_int;
     fn net_abort(c: *mut NetCtx);
     fn net_shutdown(c: *mut NetCtx);
+    // R9 DIAGNOSTIC (world>2, GB10_TP_DIAG=1) — per-epoch payload checksum rings.
+    fn net_diag_send_xor(c: *mut NetCtx) -> u64;
+    fn net_diag_recv_xor(c: *mut NetCtx) -> u64;
+    fn net_diag_send_hptr(c: *mut NetCtx) -> *mut c_void;
+    fn net_diag_recv_hptr(c: *mut NetCtx) -> *mut c_void;
+    fn net_diag_send_idx(c: *mut NetCtx) -> u64;
+    fn net_diag_recv_idx(c: *mut NetCtx) -> u64;
+    fn net_diag_folds(c: *mut NetCtx, send_fold: *mut u64, recv_fold: *mut u64);
+    fn net_diag_dump(c: *mut NetCtx, path: *const c_char);
+}
+
+/// Ring geometry mirror (TP_DIAG_RING_EPOCHS in net_shim.c). Entries are [epoch, partner, fnv64].
+pub const DIAG_RING_EPOCHS: usize = 65536;
+
+/// This process's TP rank from the registered link (0 = head). 0 when no link (single-node).
+pub fn diag_rank() -> i32 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_rank(c as *mut NetCtx) } }
 }
 
 /// Per-epoch CPU timestamp ring stride and slot indices (mirrors `net_shim.c`).
@@ -106,13 +134,197 @@ pub fn trace_data() -> Option<(&'static [u64], &'static [u64], (u64, u64, u64, u
 /// different number of drafted tokens they execute different barrier sequences forever after. Count alone
 /// is not enough — same count with different token ids desyncs the KV and recurrent state just as badly —
 /// so the token carries a hash of the accepted ids too.
+///
+/// world==2 keeps the proven pairwise `net_agree` (proxy inline-ships the token over the single QP) byte
+/// for byte. world>2 uses a head-hub gather+broadcast over `net_exchange_one`: every rank sends its token
+/// to the head, the head verifies all tokens are equal, then broadcasts the consensus (or a mismatch
+/// sentinel) back — every rank returns `Some(consensus)` on full agreement, `None` on any divergence.
 pub fn agree(step: u64, accept_count: u8, hash: u32) -> Option<(u8, u32)> {
+    agree_ext(step, accept_count, 0, hash)
+}
+
+/// B8/G1 EXTENDED determinism token: `(step | k_verify | accept_count | hash_of_ids)`.
+/// `k_verify` is this step's VERIFY WIDTH (the confidence-truncated bucket width under DSpark; the
+/// plain chain width under MTP). Ranks that disagree on k_verify execute different barrier
+/// sequences — the I9 silent-desync class — so it joins the per-step agreement token. The wire
+/// shape stays the 64-bit token (no protocol change): the 24-bit step field keeps [40..64),
+/// accept_count [32..40), and k_verify is folded into the hash word at bits [27..31) (4 bits,
+/// MAX_VERIFY=16 fits exactly), which every caller already compares in full. MTP callers can keep
+/// the 3-arg `agree` (k_verify=0); speculative callers that choose a width MUST use this one.
+pub fn agree_ext(step: u64, accept_count: u8, k_verify: u8, hash: u32) -> Option<(u8, u32)> {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c == 0 { return None; }
-    let val = ((step & 0xFF_FFFF) << 40) | ((accept_count as u64) << 32) | hash as u64;
-    let got = unsafe { net_agree(c as *mut NetCtx, val, 0xFF_FFFF << 40, (step & 0xFF_FFFF) << 40) };
-    if got == 0 { return None; }
-    Some((((got >> 32) & 0xFF) as u8, (got & 0xFFFF_FFFF) as u32))
+    let h_ext = (hash ^ ((k_verify as u32 & 0xF) << 27)) as u32;
+    let val = ((step & 0xFF_FFFF) << 40) | ((accept_count as u64) << 32) | h_ext as u64;
+    let ctx = c as *mut NetCtx;
+    let world = unsafe { net_world(ctx) };
+    if world <= 2 {
+        // R1: pairwise path unchanged.
+        let got = unsafe { net_agree(ctx, val, 0xFF_FFFF << 40, (step & 0xFF_FFFF) << 40) };
+        if got == 0 { return None; }
+        return Some((((got >> 32) & 0xFF) as u8, (got & 0xFFFF_FFFF) as u32));
+    }
+    // ---- world > 2: head-hub gather + broadcast over the dedicated control slots. ----
+    // Control frame layout (nbytes = 32): [0..8) token u64, [8..16) status u64 (0 = ok, 1 = mismatch),
+    // [16..24) the device epoch probe (this rank's barrier counter at agree time), [24..32) the tail
+    // tag (written by net_exchange_one). The epoch probe is diagnostic (the (k) epoch-divergence
+    // hypothesis): if any rank is one barrier ahead/behind, the head sees it immediately.
+    const AGREE_NBYTES: usize = 32;
+    const STATUS_OK: u64 = 0;
+    const STATUS_MISMATCH: u64 = 1;
+    let diag = std::env::var("GB10_TP_DIAG").is_ok();
+    let rank = unsafe { net_rank(ctx) };
+    let epoch = unsafe { net_device_epoch(ctx) };
+    let send = unsafe { net_ctrl_send_hptr(ctx) as *mut u64 };
+    unsafe {
+        // Round 1: stage this rank's token + ok status + the device-epoch probe.
+        std::ptr::write_unaligned(send, val);
+        // R9 DIAGNOSTIC: status word carries the send-ring (epoch,partner) XOR — an O(1) proof that
+        // every rank SAW the same barrier schedule. Frame stays 32 B (byte-identical wire shape).
+        std::ptr::write_unaligned(send.add(1),
+            if diag { net_diag_send_xor(ctx) } else { STATUS_OK });
+        std::ptr::write_unaligned(send.add(2), epoch);
+        if rank == 0 {
+            // Head: gather every node's token, then compute consensus.
+            let mut all_equal = true;
+            let mut diag_sched_ok = true;   // R9: schedule-ambiguity check across the gathered tokens
+            let my_sx = if diag { net_diag_send_xor(ctx) } else { 0 };
+            // B8 §1.5-6: a round-1 failure must NOT early-return — that parks nodes r+1.. in their
+            // round-1 placement wait. Collect the failed peer, keep gathering, then fan round 2 (the
+            // mismatch sentinel) so every node unblocks before we abort.
+            let mut round1_failed = false;
+            for r in 1..world {
+                let rc = net_exchange_one(ctx, r, AGREE_NBYTES as c_int);
+                if rc != 0 {
+                    // B8 §1.5-1: echo the abort code + watermarks — rc=-2 means the abort flag was
+                    // ALREADY set (a checkpoint, not a fault); the code classifies the real cause.
+                    eprintln!("[tp-agree] head round-1 exchange_one({r}) rc={rc} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={} — fanning round 2 anyway",
+                              net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                    round1_failed = true;
+                    continue;
+                }
+                let slot = net_ctrl_recv_hptr(ctx, r) as *const u64;
+                let peer_val = std::ptr::read_unaligned(slot);
+                let peer_sx = std::ptr::read_unaligned(slot.add(1));
+                let peer_epoch = std::ptr::read_unaligned(slot.add(2));
+                if peer_epoch != epoch {
+                    eprintln!("[tp-agree] EPOCH-PROBE: rank {r} device epoch {peer_epoch} != head {epoch} (delta {})",
+                              peer_epoch as i64 - epoch as i64);
+                }
+                if diag && peer_sx != my_sx {
+                    eprintln!("[tp-agree] DIAG-SCHED: rank {r} send-ring XOR {peer_sx:#018x} != head {my_sx:#018x} — barrier SCHEDULE diverged (not a content race)");
+                    diag_sched_ok = false;
+                }
+                if peer_val != val {
+                    eprintln!("[tp-agree] head MISMATCH: rank {r} val {peer_val:#018x} != head {val:#018x} (hash {peer_val:08x} vs {val:08x})");
+                    all_equal = false;
+                }
+            }
+            // R9 DIAGNOSTIC: on the FIRST mismatch, freeze and localize. Every rank dumps its own
+            // checksum rings (nodes do it on receipt of the mismatch sentinel below); the head
+            // prints its own per-partner folds here so the divergent (epoch, partner) can be read
+            // straight off the logs even before the offline ring diff.
+            if diag && !all_equal {
+                eprintln!("[tp-agree] DIAG: schedule-XOR {} — dumping per-epoch checksum rings",
+                          if diag_sched_ok { "MATCH (content race, not a schedule bug)" } else { "MISMATCH" });
+                let mut sf = [0u64; 16]; let mut rf = [0u64; 16];
+                net_diag_folds(ctx, sf.as_mut_ptr(), rf.as_mut_ptr());
+                for p in 0..world as usize {
+                    eprintln!("[tp-agree] DIAG head folds: partner {p} send={:#018x} recv={:#018x}", sf[p], rf[p]);
+                }
+                let path = CString::new("/tmp/tp_diag_head").unwrap();
+                net_diag_dump(ctx, path.as_ptr());
+                // R9 layer localizer: dump the xchain capture sink (per-layer residuals + logits).
+                eprintln!("[tp-agree] R9 head xchain dump: sink_entries={}", crate::gpu::xchain_sink_len());
+                let _ = crate::gpu::xchain_rank_dump("/tmp/tp_xchain", rank);
+                // R9 DECISIVE: the GDN recurrent state (never on the wire) — the divergence source.
+                crate::batch::r9_dump_gdn_state(rank);
+            }
+            // Round 2: fan the consensus (or mismatch/abort sentinel) back out — ALWAYS complete round 2
+            // (even on a round-1 failure) so every node's exchange_one unblocks before any abort.
+            let (out_val, out_status) = if all_equal && !round1_failed { (val, STATUS_OK) }
+                                        else { (0u64, STATUS_MISMATCH) };
+            std::ptr::write_unaligned(send, out_val);
+            std::ptr::write_unaligned(send.add(1), out_status);
+            for r in 1..world {
+                let rc = net_exchange_one(ctx, r, AGREE_NBYTES as c_int);
+                if rc != 0 {
+                    eprintln!("[tp-agree] head round-2 exchange_one({r}) rc={rc} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={}",
+                              net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                    round1_failed = true;
+                }
+            }
+            if round1_failed || !all_equal { return None; }
+            Some((((val >> 32) & 0xFF) as u8, (val & 0xFFFF_FFFF) as u32))
+        } else {
+            // Node: one round-1 exchange (send my token), one round-2 exchange (receive consensus).
+            let rc1 = net_exchange_one(ctx, 0, AGREE_NBYTES as c_int);
+            if rc1 != 0 {
+                eprintln!("[tp-agree] node rank {rank} round-1 exchange_one(0) rc={rc1} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={} — returning None",
+                          net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                return None;
+            }
+            let rc2 = net_exchange_one(ctx, 0, AGREE_NBYTES as c_int);
+            if rc2 != 0 {
+                eprintln!("[tp-agree] node rank {rank} round-2 exchange_one(0) rc={rc2} abort_status={:#018x} device_epoch={} gpu_ready={} rx_done={} — returning None",
+                          net_abort_status(ctx), net_device_epoch(ctx), net_gpu_ready(ctx), net_rx_done(ctx));
+                return None;
+            }
+            let slot = net_ctrl_recv_hptr(ctx, 0) as *const u64;
+            let status = std::ptr::read_unaligned(slot.add(1));
+            let out = std::ptr::read_unaligned(slot);
+            if status != STATUS_OK {
+                eprintln!("[tp-agree] node rank {rank}: head sent MISMATCH sentinel (my val {val:#018x}, out {out:#018x})");
+                // R9 DIAGNOSTIC: dump this rank's checksum rings so the head-side diff has all 4.
+                if diag {
+                    let mut sf = [0u64; 16]; let mut rf = [0u64; 16];
+                    net_diag_folds(ctx, sf.as_mut_ptr(), rf.as_mut_ptr());
+                    for p in 0..world as usize {
+                        eprintln!("[tp-agree] DIAG node rank {rank} folds: partner {p} send={:#018x} recv={:#018x}", sf[p], rf[p]);
+                    }
+                    let path = CString::new("/tmp/tp_diag_node").unwrap();
+                    net_diag_dump(ctx, path.as_ptr());
+                    // R9 layer localizer: the node's xchain capture sink.
+                    eprintln!("[tp-agree] R9 node rank {rank} xchain dump: sink_entries={}", crate::gpu::xchain_sink_len());
+                    let _ = crate::gpu::xchain_rank_dump("/tmp/tp_xchain", rank);
+                    // R9 DECISIVE: the GDN recurrent state.
+                    crate::batch::r9_dump_gdn_state(rank);
+                }
+                return None;
+            }
+            if out == 0 { return None; }
+            Some((((out >> 32) & 0xFF) as u8, (out & 0xFFFF_FFFF) as u32))
+        }
+    }
+}
+
+/// Ship a small u32 payload to the peer over the startup/audit channel (the `TpLink::exchange`
+/// path, using the process-registered ctx — works while the RDMA proxy runs: the exchange's send
+/// CQE is handed over via `xchg_send_done`, and the recv ring is separate from the hot-path rings).
+/// Both ranks call it in the same SPMD order; rank 0 fills `mine` with its payload, rank 1 with
+/// zeros, and BOTH read the peer's payload from the received slot. Returns the peer's words.
+///
+/// The wire frame's LAST 8 bytes are the generation tag and are clobbered (see net_exchange), so
+/// `wire_u32s` must leave 8 bytes of headroom: usable payload = (wire_u32s*4 - 8) bytes, and only
+/// `mine.len()` leading words are meaningful on the receive side.
+pub fn exchange_u32s(mine: &[u32], wire_u32s: usize) -> anyhow::Result<Vec<u32>> {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { anyhow::bail!("exchange_u32s: no registered TP link (single-node?)"); }
+    if mine.len() > wire_u32s { anyhow::bail!("exchange_u32s: payload {} > wire words {wire_u32s}", mine.len()); }
+    let nbytes = wire_u32s * 4;
+    if nbytes < 16 || nbytes > crate::tp::TP_SLOT_BYTES {
+        anyhow::bail!("exchange_u32s: {nbytes} bytes outside the exchange envelope (16..={})", crate::tp::TP_SLOT_BYTES);
+    }
+    unsafe {
+        let ctx = c as *mut NetCtx;
+        let send = std::slice::from_raw_parts_mut(net_send_hptr(ctx) as *mut u32, wire_u32s);
+        for x in send.iter_mut() { *x = 0; }
+        send[..mine.len()].copy_from_slice(mine);
+        let rc = net_exchange(ctx, nbytes as c_int);
+        if rc != 0 { anyhow::bail!("net_exchange failed rc={rc}"); }
+        let recv = std::slice::from_raw_parts(net_recv_hptr(ctx) as *const u32, wire_u32s);
+        Ok(recv[..mine.len()].to_vec())
+    }
 }
 
 /// Abort the registered TP link (cooperative stop: the abort STATUS word makes in-flight kernels
@@ -133,6 +345,28 @@ pub fn traced_gpu_ready() -> u64 {
     let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
     if c == 0 { 0 } else { unsafe { net_gpu_ready(c as *mut NetCtx) } }
 }
+/// The GPU's receive watermark (TP_F_RX_DONE) — the v2-receive watchdog's debt signal and the
+/// graph-instantiation tripwire sibling (rx_done == device_epoch at quiesce). 0 when no link.
+pub fn traced_rx_done() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_rx_done(c as *mut NetCtx) } }
+}
+
+/// The link's cooperative abort status word (0 = healthy) for the CURRENT registered ctx, or 0 when
+/// no TP link is attached. Mirrors `traced_rx_done` — used by the acceptance gates so an aborted
+/// run FAILS LOUDLY instead of reporting a number computed on no-op'd kernels (I9).
+pub fn traced_abort_status() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_abort_status(c as *mut NetCtx) } }
+}
+
+/// The link's tail-epoch guard fire count (MUST stay 0; a fire means RC/PCIe placement ordering
+/// failed). Same traced pattern as `traced_abort_status`.
+pub fn traced_tail_fires() -> u64 {
+    let c = TRACE_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    if c == 0 { 0 } else { unsafe { net_tail_fires(c as *mut NetCtx) } }
+}
+
 
 /// Spawn the persistent proxy loop for a TP link on its own thread, pinned to `core`. `ctx_addr` is a
 /// raw `*mut NetCtx` (from `TpLink::ctx_addr`); the caller must keep the ctx alive for the run (the
@@ -157,13 +391,21 @@ impl TpLink {
     /// `slot_bytes` is the ring-slot CAPACITY — size it for the FP32 payload (and the startup prompt
     /// frame) so switching precision later never re-addresses the rings, which would invalidate a
     /// captured graph. The active hot-path payload is set separately by `set_payload`.
+    /// P3-1: does this transport ctx run the one-shot all-peers push? (GB10_TP_ONESHOT + world==4,
+    /// resolved at net_init — the same field the proxy and K1 read. Single source of truth.)
+    pub fn oneshot_on(&self) -> bool { unsafe { net_oneshot_on(self.ctx) != 0 } }
+
     pub fn connect(rank: i32, peer_ip: &str, tcp_port: u16, dev: &str, gid_idx: i32,
                    slot_bytes: usize) -> anyhow::Result<Self> {
-        let peer = CString::new(peer_ip)?;
+        // world==2 legacy call: a synthetic 2-entry peer-IP list indexed by rank (peer_ips[1-rank]
+        // is the peer — identical to the old single peer_ip). net_init dispatches to the unchanged
+        // single-QP path. (rank 0 may pass "" — it listens and never dials.)
+        let peer_ips: [&str; 2] = if rank == 0 { ["0.0.0.0", peer_ip] } else { [peer_ip, "0.0.0.0"] };
         let dev_c = CString::new(dev)?;
-        // placeholder active payload; the model config sets the real one at attach time
+        let cstrs: Vec<CString> = peer_ips.iter().map(|s| CString::new(*s)).collect::<Result<_, _>>()?;
+        let ptrs: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
         let ctx = unsafe {
-            net_init(rank, peer.as_ptr(), tcp_port as c_int, dev_c.as_ptr(), gid_idx,
+            net_init(rank, 2, ptrs.as_ptr(), 1, tcp_port as c_int, dev_c.as_ptr(), gid_idx,
                      slot_bytes as c_int, 4)
         };
         if ctx.is_null() {
@@ -172,11 +414,46 @@ impl TpLink {
         Ok(TpLink { ctx, slot_bytes })
     }
 
-    /// Set the active hot-path payload. MUST be called before the proxy thread starts: both the proxy
-    /// and K1/K2 read it, and I8 forbids mutating protocol state under a running system.
+    /// N-way bring-up: `world` ranks, `peer_ips` indexed by PEER RANK (entry `[rank]` is unused).
+    /// world==2 takes the exact single-QP fast path; world>2 builds world-1 per-peer QPs. In P3 the
+    /// world>2 peer list is a PLACEHOLDER (P4 fills the real topology) — see bring_up_head/node.
+    pub fn connect_nway(rank: i32, world: i32, peer_ips: &[IpAddr], tcp_port: u16, dev: &str,
+                        gid_idx: i32, slot_bytes: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(world >= 2, "connect_nway: world must be >= 2");
+        anyhow::ensure!(peer_ips.len() >= world as usize, "connect_nway: peer_ips too short");
+        let dev_c = CString::new(dev)?;
+        let cstrs: Vec<CString> = peer_ips
+            .iter()
+            .map(|ip| CString::new(ip.to_string()))
+            .collect::<Result<_, _>>()?;
+        let ptrs: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
+        // placeholder active payload; the model config sets the real one at attach time
+        let ctx = unsafe {
+            net_init(rank, world as c_int, ptrs.as_ptr(), (world - 1) as c_int,
+                     tcp_port as c_int, dev_c.as_ptr(), gid_idx,
+                     slot_bytes as c_int, 4)
+        };
+        if ctx.is_null() {
+            anyhow::bail!("net_init failed (see [net_shim] logs above)");
+        }
+        Ok(TpLink { ctx, slot_bytes })
+    }
+
+    /// Set the DEFAULT hot-path payload (the K1 nbytes==0 path — decode/bench barriers; chunked
+    /// prefill barriers carry a per-call length). MUST be called before the proxy thread starts: both
+    /// the proxy and K1/K2 read it, and I8 forbids mutating protocol state under a running system.
     pub fn set_payload(&mut self, payload_bytes: usize, fp32: bool) -> anyhow::Result<()> {
         let rc = unsafe { net_set_payload(self.ctx, payload_bytes as c_int, fp32 as c_int) };
         if rc != 0 { anyhow::bail!("net_set_payload({payload_bytes}, fp32={fp32}) failed"); }
+        Ok(())
+    }
+
+    /// v2 receive mode (EXPERT_GPU_ALLREDUCE §8): with `gpu=true` the GPU kernels validate the
+    /// NIC-written payload tail directly and the proxy skips its RECV stage. MUST be called before
+    /// the proxy thread starts (same discipline as set_payload). Default off (v1 CPU bounce).
+    pub fn set_recv_mode(&mut self, gpu: bool) -> anyhow::Result<()> {
+        let rc = unsafe { net_set_recv_mode(self.ctx, gpu as c_int) };
+        if rc != 0 { anyhow::bail!("net_set_recv_mode(gpu={gpu}) failed"); }
         Ok(())
     }
 
@@ -256,6 +533,35 @@ impl TpLink {
             e => anyhow::bail!("exchange error {e}"),
         }
     }
+
+    /// P5 world>2: one bidirectional control-plane rendezvous with a SPECIFIC peer (head<->node) over
+    /// the dedicated per-rank control slots. The caller stages its payload into `send_host_mut` first;
+    /// on return the peer's payload for this exchange is in `ctrl_recv(peer_rank)`. world==2 must use
+    /// `exchange` (this panics as an invariant guard — it is never routed for world==2).
+    pub fn exchange_one(&mut self, peer_rank: i32, nbytes: usize) -> anyhow::Result<()> {
+        assert!(self.world() > 2, "exchange_one is world>2 only");
+        assert!(nbytes <= self.slot_bytes, "exchange_one nbytes > slot");
+        match unsafe { net_exchange_one(self.ctx, peer_rank as c_int, nbytes as c_int) } {
+            0 => Ok(()),
+            -2 => anyhow::bail!("exchange_one aborted"),
+            e => anyhow::bail!("exchange_one error {e}"),
+        }
+    }
+
+    /// Host view of the world>2 control receive slot for sender rank `src` (read the peer's reply after
+    /// `exchange_one`).
+    pub fn ctrl_recv<T: Copy>(&self, src: i32, n: usize) -> &[T] {
+        unsafe { std::slice::from_raw_parts(net_ctrl_recv_hptr(self.ctx, src as c_int) as *const T, n) }
+    }
+
+    /// Mutable host view of the world>2 dedicated control SEND staging slot (stage `exchange_one`'s
+    /// outgoing payload here — separate from the hot-path send ring and the world==2 `net_send_hptr`).
+    pub fn ctrl_send_mut<T: Copy>(&mut self, n: usize) -> &mut [T] {
+        assert!(n * std::mem::size_of::<T>() <= self.slot_bytes, "ctrl send slot overflow");
+        unsafe { std::slice::from_raw_parts_mut(net_ctrl_send_hptr(self.ctx) as *mut T, n) }
+    }
+
+    pub fn world(&self) -> i32 { unsafe { net_world(self.ctx) } }
 
     /// Release a blocked exchange / stop the proxy (dead-peer / shutdown path). Cooperative: it sets
     /// the abort STATUS word, so in-flight kernels no-op through the stream rather than trapping (I9).

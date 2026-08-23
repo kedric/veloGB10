@@ -33,6 +33,16 @@ impl QwenTokenizer {
             .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))
     }
 
+    /// An incremental byte-level stream decoder for THIS tokenizer (all qwen byte-level BPE
+    /// models). See `StreamByteDecoder` — the per-token `decode(&[t])` path it replaces
+    /// mangles every multi-byte char split across tokens (all emoji) into "�".
+    pub fn stream_decoder(&self) -> StreamByteDecoder {
+        let path = self.model_dir.as_deref()
+            .map(|d| d.join("tokenizer.json").to_string_lossy().into_owned())
+            .unwrap_or_default();
+        StreamByteDecoder::new(&self.tokenizer, &path)
+    }
+
     pub fn eos_token_id(&self) -> u32 {
         self.tokenizer.get_vocab(true).get("<|endoftext|>").copied().unwrap_or(151643) as u32
     }
@@ -172,8 +182,20 @@ impl QwenTokenizer {
             // hy_v3 optional reasoning: the template's `reasoning_effort` knob ('no_think'|'low'|
             // 'high'; undefined => 'no_think'). Passed as a STRING only — a JSON null raises in the
             // template. Other families' templates ignore the variable.
+            // S5F2 L3: `--thinking off` renders the template's enable_thinking=false branch (the
+            // S3R2 A2 mirror — a normal chat turn WITHOUT the <think> block; the engine's
+            // non-template raw-text path is a different regime).
+            // S9F: "no_think" is the server's normalization of the OpenAI no-think conventions
+            // (off/none/minimal) — the Qwen template RAISES on it as a reasoning_effort, so it
+            // must take the enable_thinking=false branch ("off"'s sibling). hy_v3's own serving
+            // path (dsv4_chat) handles its "no_think" knob separately; this branch only ever
+            // sees the Qwen "chat" template.
             if let Some(e) = reasoning_effort {
-                ctx["reasoning_effort"] = serde_json::Value::String(e.to_string());
+                if e == "off" || e == "no_think" {
+                    ctx["enable_thinking"] = serde_json::Value::Bool(false);
+                } else {
+                    ctx["reasoning_effort"] = serde_json::Value::String(e.to_string());
+                }
             }
             let rendered = env.get_template("chat")
                 .map_err(|e| anyhow::anyhow!("minijinja get_template: {}", e))?
@@ -292,6 +314,76 @@ impl ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a prior assistant tool_call whose arguments are NON-STRING (numbers,
+    /// booleans, objects) takes the template's `tojson(ensure_ascii=False)` path — the filter
+    /// must tolerate the kwarg (was: "too many arguments" → HTTP 500 on the tool-result turn).
+    #[test]
+    fn render_tool_call_with_numeric_arguments() {
+        let tok = match QwenTokenizer::from_file("/mnt/models/hy3-nvfp4/tokenizer.json") {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip: hy3 tokenizer not present ({})", e);
+                return;
+            }
+        };
+        assert!(tok.chat_env.is_some(), "hy3 chat template should have loaded");
+
+        let messages = vec![
+            ChatMessage::user("Read the first 60 lines of the file."),
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_0".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "read".into(),
+                        arguments: "{\"filePath\":\"/tmp/x\",\"limit\":60,\"offset\":1}".into(),
+                    },
+                }]),
+                tool_call_id: None, name: None, reasoning_content: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("line one\nline two".into()),
+                tool_calls: None, tool_call_id: Some("call_0".into()), name: Some("read".into()),
+                reasoning_content: None,
+            },
+        ];
+        let rendered = tok.apply_chat_template(&messages, None, None)
+            .expect("render must not raise 'too many arguments' on non-string tool args");
+        assert!(rendered.contains("read"), "tool name should appear in the prompt");
+        assert!(rendered.contains("60"), "numeric argument should render unescaped");
+    }
+
+    /// Regression: the SSE streaming path decodes one token at a time; a multi-byte UTF-8 char
+    /// split across byte-level-BPE tokens (every emoji) must round-trip without "�" — the
+    /// crate's per-token decode is String::from_utf8_lossy and mangles each fragment.
+    #[test]
+    fn stream_decoder_reassembles_emoji() {
+        let tpath = match std::env::var("GB10_TEST_TOKENIZER") {
+            Ok(t) if !t.is_empty() => t,
+            _ => { eprintln!("skip: GB10_TEST_TOKENIZER not set"); return; }
+        };
+        let tok = match QwenTokenizer::from_file(&tpath) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("skip: model tokenizer not present ({})", e); return; }
+        };
+        let text = "Hello \u{1F600} world! \u{1F680}\u{1F4A5}";   // 😀 🚀 💥
+        let ids = tok.encode(text, false).expect("encode");
+        let mut dec = tok.stream_decoder();
+        let mut out = String::new();
+        for &id in &ids {
+            out.push_str(&dec.push(id));
+        }
+        out.push_str(&dec.finish());
+        assert_eq!(out, text, "incremental decode must reassemble multi-byte chars");
+        assert!(!out.contains('\u{FFFD}'), "no replacement chars allowed: {out:?}");
+        // the whole-list decode (non-streaming path) must agree
+        let whole = tok.decode(&ids, false).expect("decode");
+        assert_eq!(whole, text, "whole-list decode should match too");
+    }
 
     /// Smoke-test that the model's real Jinja template is loaded and renders a
     /// multi-turn conversation the way Qwen3.5 expects. Verifies the two fixes the
@@ -434,7 +526,13 @@ fn register_pycompat(env: &mut minijinja::Environment<'static>) {
     //                    argument when a prior assistant tool_call is replayed.
     // `raise_exception`- the template calls it on malformed input; without it, a bad message would
     //                    fail with "unknown function" instead of the template's own diagnostic.
-    env.add_filter("tojson", |v: minijinja::value::Value| -> Result<String, minijinja::Error> {
+    env.add_filter("tojson", |v: minijinja::value::Value, kwargs: minijinja::value::Kwargs|
+                   -> Result<String, minijinja::Error> {
+        // The hy_v3 template calls `value | tojson(ensure_ascii=False)` when replaying non-string
+        // tool_call arguments. serde_json already emits literal UTF-8 (== ensure_ascii=False
+        // semantics — the only value any known template passes), so the kwarg is consumed and
+        // ignored; WITHOUT this a kwarg'd call raises "too many arguments" and the whole request 500s.
+        let _ = kwargs.get::<Option<bool>>("ensure_ascii").ok().flatten();
         serde_json::to_string(&v).map_err(|e| minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}")))
     });
@@ -534,4 +632,116 @@ fn register_pycompat(env: &mut minijinja::Environment<'static>) {
 
 fn arg_str(args: &[minijinja::value::Value], i: usize) -> Result<&str, ()> {
     args.get(i).and_then(|v| v.as_str()).ok_or(())
+}
+
+/// GPT-2-style `bytes_to_unicode` INVERSE table (mapped char -> raw byte), mirroring the
+/// `tokenizers` crate's CHAR_BYTES. Qwen byte-level BPE vocabs store raw bytes as single
+/// mapped chars (e.g. 'Ā' -> 0x00, 'ð' -> 0xF0). The crate's ByteLevel decoder maps them
+/// back but decodes the byte stream with `String::from_utf8_lossy` — so a multi-byte UTF-8
+/// char split across tokens (every emoji: 2-4 byte-mapped tokens) becomes one U+FFFD "�"
+/// per fragment in any per-token decode. `StreamByteDecoder` uses this table to reassemble
+/// the raw bytes and decode only complete sequences.
+fn bytes_to_unicode_inverse() -> std::collections::HashMap<char, u8> {
+    let mut inv = std::collections::HashMap::with_capacity(256);
+    let mut bs: Vec<u32> = Vec::with_capacity(256);
+    let mut cs: Vec<u32> = Vec::with_capacity(256);
+    bs.extend(33..=126); bs.extend(161..=172); bs.extend(174..=255);
+    cs.extend(33..=126); cs.extend(161..=172); cs.extend(174..=255);
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        if !bs.contains(&b) { bs.push(b); cs.push(256 + n); n += 1; }
+    }
+    for (b, c) in bs.iter().zip(cs.iter()) {
+        if let Some(c) = char::from_u32(*c) { inv.insert(c, *b as u8); }
+    }
+    inv
+}
+
+/// Raw bytes a vocab piece decodes to under byte-level BPE: byte-mapped chars -> their byte
+/// (any non-mapped char in the piece -> the piece's UTF-8 bytes, the crate's fallback), plus
+/// the `<0xXX>` byte-fallback form for tokenizers that ship it.
+fn piece_bytes(piece: &str, inv: &std::collections::HashMap<char, u8>) -> Vec<u8> {
+    if piece.len() == 6 && piece.starts_with("<0x") && piece.ends_with('>') {
+        if let Ok(b) = u8::from_str_radix(&piece[3..5], 16) { return vec![b]; }
+    }
+    let mut bytes = Vec::with_capacity(piece.len());
+    for c in piece.chars() {
+        match inv.get(&c) {
+            Some(b) => bytes.push(*b),
+            None => return piece.as_bytes().to_vec(),
+        }
+    }
+    bytes
+}
+
+/// Special-token ids from tokenizer.json's `added_tokens` (honoring the `special` flag, the
+/// crate's skip_special_tokens semantics). Empty on any parse failure (never fires in
+/// practice — the crate parsed the same file).
+fn special_ids(tokenizer_path: &str) -> std::collections::HashSet<u32> {
+    let mut set = std::collections::HashSet::new();
+    if let Ok(raw) = std::fs::read(tokenizer_path) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+            if let Some(arr) = v["added_tokens"].as_array() {
+                for tok in arr {
+                    if tok["special"].as_bool().unwrap_or(false) {
+                        if let Some(id) = tok["id"].as_u64() { set.insert(id as u32); }
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Incremental byte-level stream decoder: reassembles multi-byte UTF-8 chars split across
+/// tokens by accumulating RAW bytes and emitting only complete UTF-8 sequences, holding back
+/// the ≤3-byte tail. Replaces the lossy per-token `decode(&[t], true)` in the SSE streaming
+/// path (server.rs) — without it, "That's wonderful to hear! 😀" arrives as "�" per byte.
+/// Applies to ALL qwen byte-level BPE models via the shared server path.
+pub struct StreamByteDecoder {
+    inv: std::collections::HashMap<char, u8>,
+    vocab: std::collections::HashMap<u32, String>,
+    specials: std::collections::HashSet<u32>,
+    pending: Vec<u8>,
+}
+
+impl StreamByteDecoder {
+    pub fn new(tokenizer: &Tokenizer, tokenizer_path: &str) -> Self {
+        let vocab = tokenizer.get_vocab(true).into_iter()
+            .map(|(s, id)| (id as u32, s)).collect();
+        Self {
+            inv: bytes_to_unicode_inverse(),
+            vocab,
+            specials: special_ids(tokenizer_path),
+            pending: Vec::with_capacity(16),
+        }
+    }
+
+    /// Feed one generated token id; returns the decodable text (an incomplete trailing
+    /// UTF-8 char is held back for the next token). Special tokens are skipped, matching
+    /// `decode(ids, true)`.
+    pub fn push(&mut self, id: u32) -> String {
+        if self.specials.contains(&id) { return String::new(); }
+        let piece = match self.vocab.get(&id) { Some(p) => p.clone(), None => return String::new() };
+        self.pending.extend(piece_bytes(&piece, &self.inv));
+        // Emit the longest complete UTF-8 prefix; keep the trailing ≤3 bytes that could be
+        // a truncated char.
+        for cut in 0..=3.min(self.pending.len()) {
+            let end = self.pending.len() - cut;
+            if let Ok(s) = std::str::from_utf8(&self.pending[..end]) {
+                let out = s.to_string();
+                self.pending.drain(..end);
+                return out;
+            }
+        }
+        String::new()
+    }
+
+    /// Flush the held-back tail at stream end; invalid bytes become U+FFFD (the crate's
+    /// lossy semantics for a genuinely truncated sequence).
+    pub fn finish(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).to_string();
+        self.pending.clear();
+        out
+    }
 }

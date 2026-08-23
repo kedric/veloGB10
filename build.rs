@@ -45,12 +45,23 @@ fn main() {
     let _ = std::fs::create_dir_all(&out_dir);
 
     // Exactly the modules gpu.rs loads. If you add a load_ptx, add it here.
+    // mxfp4_bench.cu is the Phase-0 standalone OMMA microbench (probe-only, loaded lazily by
+    // --probe-mxfp4): the mxf4nvf4 mma and cvt.e2m1x2 are sm_121a family-specific features that
+    // plain sm_121 REJECTS, so it gets its own arch per file (the serving manifest stays sm_121
+    // and byte-identical — the non-destruction contract).
     let kernels = [
-        ("gpu_batch.cu", "gpu_batch.ptx"),
-        ("gpu_kernels.cu", "gpu_kernels.ptx"),
+        ("gpu_batch.cu", "gpu_batch.ptx", "sm_121"),
+        ("gpu_kernels.cu", "gpu_kernels.ptx", "sm_121"),
+        ("gpu_dsv4.cu", "gpu_dsv4.ptx", "sm_121"),
+        ("gpu_dsv4_attn.cu", "gpu_dsv4_attn.ptx", "sm_121"),
+        ("gpu_dsv4_comp.cu", "gpu_dsv4_comp.ptx", "sm_121"),
+        ("gpu_dflash.cu", "gpu_dflash.ptx", "sm_121"),
+        ("mxfp4_bench.cu", "mxfp4_bench.ptx", "sm_121a"),
+        ("gpu_mxfp4.cu", "gpu_mxfp4.ptx", "sm_121a"),
+        ("gpu_mxfp4_moe.cu", "gpu_mxfp4_moe.ptx", "sm_121a"),
     ];
 
-    for (src_name, _) in &kernels {
+    for (src_name, _, _) in &kernels {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(src_name).display());
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -67,7 +78,7 @@ fn main() {
     // pair fails LOUDLY at startup, on any box, however it was assembled -- including ones this repo's
     // deploy script never touched.
     let mut hasher = DefaultHasher::new();
-    for (src_name, _) in &kernels {
+    for (src_name, _, _) in &kernels {
         std::fs::read(kernel_dir.join(src_name))
             .unwrap_or_else(|e| panic!("cannot read kernels/{src_name}: {e}"))
             .hash(&mut hasher);
@@ -112,7 +123,7 @@ fn main() {
         return;
     }
 
-    for (src_name, dst_name) in &kernels {
+    for (src_name, dst_name, arch) in &kernels {
         let src = kernel_dir.join(src_name);
         let dst = out_dir.join(dst_name);
         if !src.exists() {
@@ -120,7 +131,7 @@ fn main() {
         }
         let out = Command::new(&nvcc)
             .args([
-                "--gpu-architecture=sm_121",
+                &format!("--gpu-architecture={arch}"),
                 "--ptx",
                 "--default-stream=per-thread",
                 "-O3",
@@ -137,6 +148,37 @@ fn main() {
             panic!(
                 "nvcc failed on {} -- the build must NOT proceed on the stale {}:\n{}",
                 src.display(),
+                dst.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // TurboQuant b=3 K variant (GB10_KV_TQ=3): the same gpu_batch.cu compiled with -DTQ_B3 (K
+    // codes at 3 bits -> 68-B rows). Loaded INSTEAD of gpu_batch.ptx only when GB10_KV_TQ=3;
+    // gpu_batch.ptx stays the golden-anchored b=2 build. Same KERNEL_BUILD_ID (same source
+    // bytes), so the assert_kernel_build_id handshake covers both files.
+    {
+        let src = kernel_dir.join("gpu_batch.cu");
+        let dst = out_dir.join("gpu_batch_b3.ptx");
+        let out = Command::new(&nvcc)
+            .args([
+                "--gpu-architecture=sm_121",
+                "--ptx",
+                "--default-stream=per-thread",
+                "-O3",
+                "-Inative",
+                "-DTQ_B3",
+                &format!("-DKERNEL_BUILD_ID=0x{build_id}ULL"),
+                "-o",
+            ])
+            .arg(&dst)
+            .arg(&src)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {nvcc:?} for gpu_batch_b3.ptx: {e}"));
+        if !out.status.success() {
+            panic!(
+                "nvcc failed on gpu_batch.cu (-DTQ_B3) -- the b=3 build must NOT proceed on the stale {}:\n{}",
                 dst.display(),
                 String::from_utf8_lossy(&out.stderr)
             );

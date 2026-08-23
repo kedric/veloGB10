@@ -330,3 +330,700 @@ extern "C" __global__ void argmax_pass2(int* token, const int* idxs, const float
     if (tid == 0) token[0] = si[0];
 }
 
+
+// ===========================================================================================
+// S3F — DFlash2 draft-block kernels (additive; the gpu_batch.cu serving family is untouched).
+// bf16 activations (col-major [dim, B]), bf16 weights (row-major [out, in]), fp32 accumulate,
+// fixed reduction orders (cross-rank bit-identity), no atomics. Reused serving kernels:
+// rmsnorm_b / rmsnorm_perhead_b / rope_b / gather_rope_b / add_residual_b / silu_mul_b /
+// write_kv_b (gpu_batch.cu). New here: the skinny GEMM, the ctx-side tiled GEMM, the grouped
+// dynamic causal conv, and the band-masked dual-source GQA attention.
+// ===========================================================================================
+
+// ---- S3F skinny GEMM (gemm_dsp_b): one block per R output rows, 256 threads, 16 B vectorized
+// W loads (uint4 = 8 bf16), x col-major [inn, M] read as M uint4 column loads (8 consecutive k
+// each, 16 B-aligned since inn % 8 == 0) reused across the R rows. Templated on M (batch columns)
+// and R (output rows/block) so the acc[R][M] register arrays never land in local memory
+// (AGENTS.md §4). Fixed-order reduce: warp shuffle down, then the 8 warp partials in ascending
+// warp order. W row-major [outn, inn]; x col-major [inn, M]; out col-major [outn, M].
+template <int M, int R>
+__device__ __forceinline__ void gemm_dsp_impl(__nv_bfloat16* __restrict__ out,
+                                              const __nv_bfloat16* __restrict__ w,
+                                              const __nv_bfloat16* __restrict__ x,
+                                              int outn, int inn) {
+    const int n0 = blockIdx.x * R;
+    const int nvec = inn >> 3;                       // inn % 8 == 0 for every DFlash2 tensor
+    const uint4* wrow[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n = n0 + r;
+        wrow[r] = reinterpret_cast<const uint4*>(w + (long long)(n < outn ? n : outn - 1) * (long long)inn);
+    }
+    const uint4* xcol[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+        xcol[m] = reinterpret_cast<const uint4*>(x + (long long)m * inn);   // column m, k-major
+    float acc[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[r][m] = 0.f;
+    for (int i = threadIdx.x; i < nvec; i += 256) {
+        uint4 wp[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) wp[r] = wrow[r][i];
+        uint4 xm[M];
+#pragma unroll
+        for (int m = 0; m < M; ++m) xm[m] = xcol[m][i];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const __nv_bfloat16* w8 = reinterpret_cast<const __nv_bfloat16*>(&wp[r]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float wv = __bfloat162float(w8[j]);
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const __nv_bfloat16* x8 = reinterpret_cast<const __nv_bfloat16*>(&xm[m]);
+                    acc[r][m] = fmaf(wv, __bfloat162float(x8[j]), acc[r][m]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+#pragma unroll
+            for (int off = 16; off; off >>= 1) acc[r][m] += __shfl_down_sync(0xffffffffu, acc[r][m], off);
+    __shared__ float wsum[8][R][M];
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 0; m < M; ++m) wsum[wid][r][m] = acc[r][m];
+    }
+    __syncthreads();
+    if (wid == 0 && lane < 8) {
+        // Mask covers exactly lanes 0..7 (the 8 warp partials) — a full mask here would be UB.
+        const unsigned mask8 = 0xFFu;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float t[M];
+#pragma unroll
+            for (int m = 0; m < M; ++m) t[m] = wsum[lane][r][m];
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+#pragma unroll
+                for (int off = 4; off; off >>= 1) t[m] += __shfl_down_sync(mask8, t[m], off);
+            if (lane == 0 && n0 + r < outn) {
+#pragma unroll
+                for (int m = 0; m < M; ++m) out[(long long)m * outn + n0 + r] = __float2bfloat16(t[m]);
+            }
+        }
+    }
+}
+
+// The two R values measured (R=4 best — see PLAN/B8_S3F_REPORT.md R4). M=8 = the fixed draft block.
+extern "C" __global__ void __launch_bounds__(256) gemm_dsp_b_m8_r2(
+    __nv_bfloat16* out, const __nv_bfloat16* w, const __nv_bfloat16* x, int outn, int inn) {
+    gemm_dsp_impl<8, 2>(out, w, x, outn, inn);
+}
+extern "C" __global__ void __launch_bounds__(256) gemm_dsp_b_m8_r4(
+    __nv_bfloat16* out, const __nv_bfloat16* w, const __nv_bfloat16* x, int outn, int inn) {
+    gemm_dsp_impl<8, 4>(out, w, x, outn, inn);
+}
+
+// ---- S3F ctx-side tiled GEMM (gemm_tiled_b): deterministic register-blocked bf16 GEMM for the
+// large-M cases (fc [5120,25600] @ [25600,C], k/v_proj [1024,5120] @ [5120,C]). out [N, M]
+// col-major; W [N, K] row-major; x [K, M] col-major (the engine convention, element (k,m) at
+// m*K + k). 8x8 register blocking, block (16,16)=256 threads, TK=16 smem staging. Fixed
+// ascending-k accumulation, no atomics.
+#define DF2_TN 128
+#define DF2_TM 128
+#define DF2_TK 16
+extern "C" __global__ void __launch_bounds__(256) gemm_tiled_b(
+    __nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ x, int N, int K, int M) {
+    __shared__ __nv_bfloat16 sW[DF2_TN][DF2_TK];
+    __shared__ __nv_bfloat16 sX[DF2_TK][DF2_TM];
+    const int ty = threadIdx.y, tx = threadIdx.x;      // 0..15
+    const int n0 = blockIdx.y * DF2_TN;
+    const int m0 = blockIdx.x * DF2_TM;
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += DF2_TK) {
+        // cooperative load sW[TN][TK]
+        for (int i = ty * 16 + tx; i < DF2_TN * DF2_TK; i += 256) {
+            const int r = i / DF2_TK, c = i % DF2_TK;
+            const int nr = n0 + r, kc = k0 + c;
+            sW[r][c] = (nr < N && kc < K) ? w[(long long)nr * K + kc] : __float2bfloat16(0.f);
+        }
+        // cooperative load sX[TK][TM] — x is col-major [K, M] (element (kc, mc) at mc*K + kc).
+        for (int i = ty * 16 + tx; i < DF2_TK * DF2_TM; i += 256) {
+            const int r = i / DF2_TM, c = i % DF2_TM;
+            const int kc = k0 + r, mc = m0 + c;
+            sX[r][c] = (kc < K && mc < M) ? x[(long long)mc * K + kc] : __float2bfloat16(0.f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < DF2_TK; ++kk) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float wv = __bfloat162float(sW[ty * 8 + i][kk]);
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc[i][j] = fmaf(wv, __bfloat162float(sX[kk][tx * 8 + j]), acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int nr = n0 + ty * 8 + i;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int mc = m0 + tx * 8 + j;
+            if (nr < N && mc < M) out[(long long)mc * N + nr] = __float2bfloat16(acc[i][j]);
+        }
+    }
+}
+
+// ---- S3F grouped dynamic causal 2-tap conv (DECISION M; model.py _grouped_dynamic_convolve).
+// out[r,c] = (base[0,c] + dyn[r,0,g])*x[r,c] + (r>=1 ? (base[1,c] + dyn[r,1,g])*x[r-1,c] : 0)
+// with g = c / gs (grouped channel). x/out col-major [hidden, n]; base [k, hidden] row-major for
+// ONE side; dyn_all col-major [2*k*groups, n] (the full kernel_projection output); dyn_side is the
+// row offset into dyn_all for this side (0 = prepare/side 0, k*groups = finish/side 1). k=2.
+extern "C" __global__ void conv2_dynamic_b(__nv_bfloat16* __restrict__ out,
+                                           const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ dyn_all,
+                                           const __nv_bfloat16* __restrict__ base,
+                                           int hidden, int n, int groups, int gs,
+                                           int dyn_side, int dyn_stride) {
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)n * hidden;
+    if (idx >= total) return;
+    const int r = (int)(idx / hidden);
+    const int c = (int)(idx % hidden);
+    const int g = c / gs;
+    const float b0 = __bfloat162float(base[c]);
+    const float b1 = __bfloat162float(base[hidden + c]);
+    // dyn_all is [2*k*groups, n] col-major; `dyn_side` is the SIDE's row offset (side * k * groups)
+    // and each tap o adds o*groups rows. dyn_all[r, dyn_side + o*groups + g].
+    const float d0 = __bfloat162float(dyn_all[(long long)r * dyn_stride + dyn_side + g]);
+    const float d1 = __bfloat162float(dyn_all[(long long)r * dyn_stride + dyn_side + groups + g]);
+    float acc = (b0 + d0) * __bfloat162float(x[(long long)r * hidden + c]);
+    if (r >= 1) acc += (b1 + d1) * __bfloat162float(x[(long long)(r - 1) * hidden + c]);
+    out[(long long)r * hidden + c] = __float2bfloat16(acc);
+}
+
+// ---- S3F band-masked dual-source GQA attention (DECISION C). One block per (query row, q head),
+// blockDim = hd (128). q [nh*hd, B] col-major (post q_norm + RoPE); k/v cache [nkv, stride, hd]
+// (ctx rows 0..C-1, block rows C..C+7; stride is the allocated row pitch). Band: visible keys
+// j in [lo, ntot) where lo = max(0, pos[b] - (window-1)); the upper band side is vacuous
+// (in-block separation <= 7). Two-pass fp32 softmax (fixed ascending key order), deterministic.
+// Args packed to fit the 12-arg cudarc launch cap: ntot_stride = (ntot<<16)|stride (both <2^13),
+// nh_packed = (nh<<20)|(hd<<10)|nkv, window_B = (window<<4)|B.
+extern "C" __global__ void __launch_bounds__(128) gqa_attn_band_b(
+    __nv_bfloat16* __restrict__ out,          // [nh*hd, B] col-major
+    const __nv_bfloat16* __restrict__ q,      // [nh*hd, B] col-major
+    const __nv_bfloat16* __restrict__ k_cache,// [nkv, stride, hd]
+    const __nv_bfloat16* __restrict__ v_cache,// [nkv, stride, hd]
+    const int* pos,                            // [B] block key positions (C..C+7)
+    long long ntot_stride, int nh_packed, int window_B, float scale) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int nkv = nh_packed & 0x3FF;
+    const int ntot   = (int)(ntot_stride >> 16);
+    const int stride = (int)(ntot_stride & 0xFFFF);
+    const int window = window_B >> 4;
+    // VOLATILE smem is LOAD-BEARING: ptxas -O2/-O3 (CUDA 13.0.88, sm_121) miscompiles this
+    // kernel's barrier-ordered scores/red pattern — sporadically reorders a shared access
+    // across bar.sync, so one block reads stale smem and emits a whole-block wrong output
+    // (~1 bad launch per 1e2..1e4, always the tail blocks). volatile forbids the reorder;
+    // ptxas -O0/-O1 and volatile-at-O3 are bit-stable over 4x10k launches (repro:
+    // kernels/tests/sm121_ptxas_race_repro.cu). Do NOT silently drop the volatile.
+    extern __shared__ volatile float sm[];
+    const int b = blockIdx.x / nh;
+    const int qh = blockIdx.x % nh;
+    const int kvh = qh / (nh / nkv);
+    const int d = threadIdx.x;                 // 0..hd-1 (blockDim == hd)
+    const int qp = pos[b];
+    int lo = qp - (window - 1);
+    if (lo < 0) lo = 0;
+
+    const int B = window_B & 0xF;             // S10R: unpacked (scores bound; see ring twin)
+    volatile float* qs = sm;              // [hd]
+    // S10R — WINDOW-BOUNDED scores region, relative index j - lo (same bound + proof as
+    // gqa_attn_band_ring_b; PLAN/B8_S10R_DISSECTION.md §4): min(window+B, ntot) slots.
+    const int scores_len = (window + B < ntot) ? (window + B) : ntot;
+    volatile float* scores = qs + hd;     // [scores_len], relative index j - lo
+    volatile float* red = scores + scores_len;  // [32]
+    qs[d] = __bfloat162float(q[(long long)b * (nh * hd) + (long long)qh * hd + d]);
+    __syncthreads();
+
+    const __nv_bfloat16* kbase = k_cache + (long long)kvh * (long long)stride * hd;
+    const __nv_bfloat16* vbase = v_cache + (long long)kvh * (long long)stride * hd;
+
+    // pass 1: scores + block max over [lo, ntot) — thread d owns keys j == lo+d (mod hd).
+    float mx = -1e30f;
+    for (int j = lo + d; j < ntot; j += hd) {
+        const __nv_bfloat16* kr = kbase + (long long)j * hd;
+        float s = 0.f;
+        for (int dd = 0; dd < hd; ++dd) s = fmaf(qs[dd], __bfloat162float(kr[dd]), s);
+        s *= scale;
+        scores[j - lo] = s;
+        mx = fmaxf(mx, s);
+    }
+    // The cross-warp reduce runs on lanes 0..nw (nw = hd/32); its shuffle mask MUST cover exactly
+    // those lanes (a full 0xffffffff mask with the rest of the warp outside the branch deadlocks).
+    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+    if ((d & 31) == 0) red[d >> 5] = mx;
+    __syncthreads();
+    // cross-warp reduce: SERIAL ASCENDING on thread 0 (fixed order = the host mirror's; no
+    // partial-mask/runtime-offset shuffles under divergence — the sm_121 nondeterminism hunt)
+    if (d == 0) {
+        float v = red[0];
+        for (int w = 1; w < hd / 32; ++w) v = fmaxf(v, red[w]);
+        red[0] = v;
+    }
+    __syncthreads();
+    mx = red[0];
+
+    // pass 2: exp + sum over [lo, ntot). The accurate expf (~2 ulp) keeps the softmax close to
+    // the oracle's correctly-rounded exp (the fast __expf is ~2+floor(1.16|x|) ulp).
+    float l = 0.f;
+    for (int j = lo + d; j < ntot; j += hd) { const float e = expf(scores[j - lo] - mx); scores[j - lo] = e; l += e; }
+    for (int off = 16; off; off >>= 1) l += __shfl_xor_sync(0xffffffffu, l, off);
+    if ((d & 31) == 0) red[d >> 5] = l;
+    __syncthreads();
+    // serial ascending sum on thread 0 — the mirror's exact association
+    if (d == 0) {
+        float v = red[0];
+        for (int w = 1; w < hd / 32; ++w) v += red[w];
+        red[0] = v;
+    }
+    __syncthreads();
+    const float inv = 1.0f / red[0];
+
+    // pass 3: PV, ascending over [lo, ntot) — thread d reads every score, accumulates out[d].
+    float acc = 0.f;
+    for (int j = lo; j < ntot; ++j)
+        acc = fmaf(scores[j - lo] * inv, __bfloat162float(vbase[(long long)j * hd + d]), acc);
+    out[(long long)b * (nh * hd) + (long long)qh * hd + d] = __float2bfloat16(acc);
+}
+
+// ===========================================================================================
+// S4F (K-DF2-2/3) — additive kernels: ring-KV band attention, radix top-16, selector walk.
+// No existing kernel body modified (S3F discipline). All fixed-order, no atomics except the
+// order-INDEPENDENT radix histogram (min/max/add on integers — commutative, deterministic).
+// ===========================================================================================
+
+// ---- S4F ring-KV band attention (gqa_attn_band_ring_b) -----------------------
+// The production attention for the incremental ctx-injection path (workdoc §3.2): ctx KV lives
+// in a C_ring-deep RING (ctx seq position j at cache row j % C_ring), the 8 block rows at
+// physical rows [C_ring, C_ring+8) of the [nkv, stride=C_ring+8, hd] cache. A query at absolute
+// position q_pos sees the trailing band [max(0, q_pos-2047), ntot) — <= 2048 ctx keys + the 8
+// block keys — WINDOW-BOUNDED (no unbounded growth; the dossier §6.2 bound). The visit order,
+// two-pass fp32 softmax tree and PV accumulation are IDENTICAL to gqa_attn_band_b, so a
+// non-wrapping C (C <= C_ring) reproduces S3F's numbers bit-for-bit (the probe's control).
+//   physical row of key j:  j < C (ctx)  -> j % C_ring
+//                           j >= C (blk) -> C_ring + (j - C)
+// Args packed: ntot_stride = ((u64)ntot<<32)|((u64)C_ring<<16)|stride; window_B=(window<<4)|B.
+// S5F: `ntot_dev` (optional device i32) OVERRIDES the packed ntot when non-NULL — the CUDA-graph
+// replay path needs ntot to vary per replay while the launch config (smem, args) is frozen at
+// capture, so the graph writes the current ntot to a device int and passes its address here.
+// Pass NULL/0 to keep the exact packed-arg behavior (bit-identical — the S4F probe path).
+extern "C" __global__ void __launch_bounds__(128) gqa_attn_band_ring_b(
+    __nv_bfloat16* __restrict__ out,          // [nh*hd, B] col-major
+    const __nv_bfloat16* __restrict__ q,      // [nh*hd, B] col-major
+    const __nv_bfloat16* __restrict__ k_cache,// [nkv, stride, hd]
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* pos,                            // [B] block key positions (ABSOLUTE C..C+7)
+    unsigned long long ntot_stride, const int* ntot_dev, int nh_packed, int window_B, float scale) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int nkv = nh_packed & 0x3FF;
+    const int ntot    = ntot_dev ? *ntot_dev : (int)(ntot_stride >> 32);
+    const int C_ring  = (int)((ntot_stride >> 16) & 0xFFFF);
+    const int stride  = (int)(ntot_stride & 0xFFFF);
+    const int window  = window_B >> 4;
+    const int B       = window_B & 0xF;
+    const int C = ntot - B;                    // committed ctx rows
+    // VOLATILE smem is LOAD-BEARING: ptxas -O2/-O3 (CUDA 13.0.88, sm_121) miscompiles this
+    // kernel's barrier-ordered scores/red pattern — sporadically reorders a shared access
+    // across bar.sync, so one block reads stale smem and emits a whole-block wrong output
+    // (~1 bad launch per 1e2..1e4, always the tail blocks). volatile forbids the reorder;
+    // ptxas -O0/-O1 and volatile-at-O3 are bit-stable over 4x10k launches (repro:
+    // kernels/tests/sm121_ptxas_race_repro.cu). Do NOT silently drop the volatile.
+    extern __shared__ volatile float sm[];
+    const int b  = blockIdx.x / nh;
+    const int qh = blockIdx.x % nh;
+    const int kvh = qh / (nh / nkv);
+    const int d = threadIdx.x;
+    const int qp = pos[b];
+    int lo = qp - (window - 1);
+    if (lo < 0) lo = 0;
+
+    volatile float* qs = sm;              // [hd]
+    // S10R — the scores region is WINDOW-BOUNDED, indexed RELATIVELY (scores[j - lo]): the
+    // visit range [lo, ntot) spans at most window+B-1 entries (lo = max(0,qp-(window-1)),
+    // qp >= C, ntot = C+B), so min(window+B, ntot) slots always suffice. The old absolute
+    // layout ([ntot] slots) sized smem by TOTAL context and capped ctx at 12120 (the 48 KiB
+    // dynamic-smem default); this bound is ctx-INDEPENDENT (PLAN/B8_S10R_DISSECTION.md §4).
+    // Values stored/loaded and every reduction tree are UNCHANGED — only the base offset.
+    const int scores_len = (window + B < ntot) ? (window + B) : ntot;
+    volatile float* scores = qs + hd;     // [scores_len], relative index j - lo
+    volatile float* red = scores + scores_len;  // [32]
+    qs[d] = __bfloat162float(q[(long long)b * (nh * hd) + (long long)qh * hd + d]);
+    __syncthreads();
+
+    const __nv_bfloat16* kbase = k_cache + (long long)kvh * (long long)stride * hd;
+    const __nv_bfloat16* vbase = v_cache + (long long)kvh * (long long)stride * hd;
+
+    // pass 1: scores + band max, ascending key index (same schedule as gqa_attn_band_b).
+    float mx = -1e30f;
+    for (int j = lo + d; j < ntot; j += hd) {
+        const int rj = (j < C) ? (j % C_ring) : (C_ring + (j - C));
+        const __nv_bfloat16* kr = kbase + (long long)rj * hd;
+        float s = 0.f;
+        for (int dd = 0; dd < hd; ++dd) s = fmaf(qs[dd], __bfloat162float(kr[dd]), s);
+        s *= scale;
+        scores[j - lo] = s;
+        mx = fmaxf(mx, s);
+    }
+    for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+    if ((d & 31) == 0) red[d >> 5] = mx;
+    __syncthreads();
+    // cross-warp reduce: SERIAL ASCENDING on thread 0 (fixed order = the host mirror's; no
+    // partial-mask/runtime-offset shuffles under divergence — the sm_121 nondeterminism hunt)
+    if (d == 0) {
+        float v = red[0];
+        for (int w = 1; w < hd / 32; ++w) v = fmaxf(v, red[w]);
+        red[0] = v;
+    }
+    __syncthreads();
+    mx = red[0];
+
+    // pass 2: exp + sum (accurate expf, ~2 ulp — the documented S3F tail).
+    float l = 0.f;
+    for (int j = lo + d; j < ntot; j += hd) { const float e = expf(scores[j - lo] - mx); scores[j - lo] = e; l += e; }
+    for (int off = 16; off; off >>= 1) l += __shfl_xor_sync(0xffffffffu, l, off);
+    if ((d & 31) == 0) red[d >> 5] = l;
+    __syncthreads();
+    // serial ascending sum on thread 0 — the mirror's exact association
+    if (d == 0) {
+        float v = red[0];
+        for (int w = 1; w < hd / 32; ++w) v += red[w];
+        red[0] = v;
+    }
+    __syncthreads();
+    const float inv = 1.0f / red[0];
+
+    // pass 3: PV, ascending over the band.
+    float acc = 0.f;
+    for (int j = lo; j < ntot; ++j) {
+        const int rj = (j < C) ? (j % C_ring) : (C_ring + (j - C));
+        acc = fmaf(scores[j - lo] * inv, __bfloat162float(vbase[(long long)rj * hd + d]), acc);
+    }
+    out[(long long)b * (nh * hd) + (long long)qh * hd + d] = __float2bfloat16(acc);
+}
+
+// ---- S4F deterministic radix top-16 (top16_b) --------------------------------
+// The total order (DECISION L): (logit DESC, token-id ASC) — the SGLang _radix_topk answer,
+// bit-deterministic. Two-level radix over the 16-bit bf16 total-order key
+//   key16 = (bits & 0x8000) ? (~bits & 0xFFFF) : (bits | 0x8000)
+// (monotone in the float value; sign folded in). bf16 keys are VALUE-UNIQUE, so the level-2
+// group is exactly the tie set (equal logits) — resolved by ascending id, which is precisely
+// (logit desc, id asc). Histogram atomics are INTEGER adds — order-independent, so the output
+// is a pure function of the input bytes (the probe asserts two runs identical).
+// Documented divergence vs the oracle's f32 compare: -0.0 vs +0.0 compare equal in f32 but
+// order +0 > -0 by key; the probe asserts no +-0 pair straddles a top-16 boundary.
+// grid: one block per row; logits bf16 [vocab, rows] col-major; out_vals f32 + out_ids u32
+// [16, rows] col-major (element (k, row) at k*rows + row).
+#define TOP16_K 16
+#define TOP16_MAX_ENT 24
+__device__ __forceinline__ unsigned short df2_key16(unsigned short bits) {
+    return (bits & 0x8000u) ? (unsigned short)((~bits) & 0xFFFFu) : (unsigned short)(bits | 0x8000u);
+}
+__device__ __forceinline__ float df2_key_to_f32(unsigned key) {
+    // inverse of df2_key16, then bf16->f32 (low 16 bits zero)
+    const unsigned b16 = (key & 0x8000u) ? (key & 0x7FFFu) : ((~key) & 0xFFFFu);
+    return __uint_as_float(b16 << 16);
+}
+extern "C" __global__ void __launch_bounds__(256) top16_b(
+    float* __restrict__ out_vals, unsigned* __restrict__ out_ids,
+    const __nv_bfloat16* __restrict__ logits, int vocab, int rows) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const __nv_bfloat16* lg = logits + (long long)row * vocab;
+    __shared__ int hist[256];
+    __shared__ int hist2[256];
+    __shared__ int sdata[256];
+    __shared__ int sh_thr[2];
+    __shared__ int sh_need;
+    __shared__ int sh_nent;
+    __shared__ unsigned tie_ids[256 * TOP16_K];
+    __shared__ unsigned ent_id[TOP16_MAX_ENT * 16];   // strictly-above entries (<= 15 real)
+    __shared__ unsigned ent_key[TOP16_MAX_ENT * 16];
+    const int tid = threadIdx.x;
+
+    // ---- level 1: histogram of key16 >> 8 ----
+    hist[tid] = 0;
+    __syncthreads();
+    for (int i = tid; i < vocab; i += 256)
+        atomicAdd(&hist[df2_key16(*reinterpret_cast<const unsigned short*>(lg + i)) >> 8], 1);
+    __syncthreads();
+    if (tid == 255) {
+        int cum = 0, bin = 255;
+        while (bin >= 0) { cum += hist[bin]; if (cum >= TOP16_K) break; --bin; }
+        sh_thr[0] = bin;
+    }
+    __syncthreads();
+    const int tbin = sh_thr[0];
+    sdata[tid] = (tid > tbin) ? hist[tid] : 0;
+    __syncthreads();
+    for (int s2 = 128; s2 > 0; s2 >>= 1) {
+        if (tid < s2) sdata[tid] += sdata[tid + s2];
+        __syncthreads();
+    }
+    const int above1 = sdata[0];              // ids strictly above the threshold bin (< 16)
+
+    // ---- level 2: sub-histogram (key16 & 0xFF) of the threshold bin ----
+    hist2[tid] = 0;
+    __syncthreads();
+    for (int i = tid; i < vocab; i += 256) {
+        const unsigned key = df2_key16(*reinterpret_cast<const unsigned short*>(lg + i));
+        if ((int)(key >> 8) == tbin) atomicAdd(&hist2[key & 0xFF], 1);
+    }
+    __syncthreads();
+    if (tid == 255) {
+        int cum = above1, sub = 255;
+        while (sub >= 0) { cum += hist2[sub]; if (cum >= TOP16_K) break; --sub; }
+        sh_thr[1] = sub;
+        sh_need = TOP16_K - (cum - hist2[sub]);   // ids to take from the tie sub-bin (>= 1)
+    }
+    __syncthreads();
+    const int tsub = sh_thr[1];
+    const unsigned thr_key16 = (((unsigned)tbin) << 8) | ((unsigned)tsub & 0xFFu);
+    const int need = sh_need;
+
+    // ---- collection pass ----
+    int loc_key[TOP16_MAX_ENT]; int loc_id[TOP16_MAX_ENT]; int nloc = 0;
+    unsigned loc_tie[TOP16_K]; int ntie = 0;
+    for (int i = tid; i < vocab; i += 256) {
+        const unsigned key = df2_key16(*reinterpret_cast<const unsigned short*>(lg + i));
+        if (key > thr_key16) {
+            int p = 0;
+            while (p < nloc && ((unsigned)loc_key[p] > key ||
+                   ((unsigned)loc_key[p] == key && (unsigned)loc_id[p] < (unsigned)i))) ++p;
+            if (p < TOP16_MAX_ENT) {
+                for (int q = nloc < TOP16_MAX_ENT ? nloc : TOP16_MAX_ENT-1; q > p; --q)
+                    { loc_key[q] = loc_key[q-1]; loc_id[q] = loc_id[q-1]; }
+                loc_key[p] = (int)key; loc_id[p] = i;
+                if (nloc < TOP16_MAX_ENT) ++nloc;
+            }
+        } else if (key == thr_key16) {
+            int p = 0;
+            while (p < ntie && loc_tie[p] < (unsigned)i) ++p;
+            if (p < need) {
+                for (int q = ntie < TOP16_K ? ntie : TOP16_K-1; q > p; --q) loc_tie[q] = loc_tie[q-1];
+                loc_tie[p] = (unsigned)i;
+                if (ntie < TOP16_K) ++ntie;
+            }
+        }
+    }
+    if (tid == 0) sh_nent = 0;
+    __syncthreads();
+    for (int q = 0; q < nloc; ++q) {
+        const int slot = atomicAdd(&sh_nent, 1);
+        if (slot < TOP16_MAX_ENT * 16) { ent_key[slot] = (unsigned)loc_key[q]; ent_id[slot] = (unsigned)loc_id[q]; }
+    }
+    for (int q = 0; q < ntie; ++q) tie_ids[tid * TOP16_K + q] = loc_tie[q];
+    for (int q = ntie; q < TOP16_K; ++q) tie_ids[tid * TOP16_K + q] = 0xFFFFFFFFu;
+    __syncthreads();
+    const int nent = sh_nent;
+
+    // ---- final merge (thread 0, serial): the 16 winners by (key desc, id asc) ----
+    if (tid == 0) {
+        unsigned vk[TOP16_K]; unsigned id[TOP16_K]; int cnt = 0;
+        for (int e = 0; e < nent && e < TOP16_MAX_ENT * 16; ++e) {
+            const unsigned key = ent_key[e]; const unsigned i = ent_id[e];
+            int p = 0;
+            while (p < cnt && (vk[p] > key || (vk[p] == key && id[p] < i))) ++p;
+            if (p < TOP16_K) {
+                for (int q = cnt >= TOP16_K ? TOP16_K-1 : cnt; q > p; --q) { vk[q]=vk[q-1]; id[q]=id[q-1]; }
+                vk[p] = key; id[p] = i;
+                if (cnt < TOP16_K) ++cnt;
+            }
+        }
+        for (int t = 0; t < need && cnt < TOP16_K; ++t) {
+            unsigned best = 0xFFFFFFFFu;
+            for (int th = 0; th < 256; ++th) {
+                const unsigned cand = tie_ids[th * TOP16_K];
+                if (cand < best) best = cand;
+            }
+            if (best == 0xFFFFFFFFu) break;
+            for (int th = 0; th < 256; ++th) {
+                if (tie_ids[th * TOP16_K] == best) {
+                    for (int q = 0; q + 1 < TOP16_K; ++q)
+                        tie_ids[th * TOP16_K + q] = tie_ids[th * TOP16_K + q + 1];
+                    tie_ids[th * TOP16_K + TOP16_K - 1] = 0xFFFFFFFFu;
+                    break;
+                }
+            }
+            const unsigned key = thr_key16;
+            int p = 0;
+            while (p < cnt && (vk[p] > key || (vk[p] == key && id[p] < best))) ++p;
+            if (p < TOP16_K) {
+                for (int q = cnt >= TOP16_K ? TOP16_K-1 : cnt; q > p; --q) { vk[q]=vk[q-1]; id[q]=id[q-1]; }
+                vk[p] = key; id[p] = best;
+                if (cnt < TOP16_K) ++cnt;
+            }
+        }
+        for (int k = 0; k < TOP16_K; ++k) {          // row-major [rows, 16] — the walk's layout
+            out_vals[row * TOP16_K + k] = df2_key_to_f32(vk[k]);
+            out_ids[row * TOP16_K + k] = id[k];
+        }
+    }
+}
+
+// ---- S4F fused selector walk (df2_sel_walk_b) --------------------------------
+// The greedy chain (DECISION L/E) in SGLang _selector_walk_kernel's shape: ONE block walks the
+// 7 positions serially and computes the codebook dot products IN the kernel (the walk IS the
+// consumer — no intermediate scores round-trip). Per position: a = pred_codebook[prev][tid] *
+// hp[p][tid] (one product per lane); per candidate k: s_k = unary[k] + sum_r a*succ[cand_k][r]
+// via a 256-lane shuffle-DOWN tree (offsets 16..1) then a SERIAL ASCENDING sum of the 8 warp
+// partials on thread 0 — a single fixed order, mirrored exactly on the host. All barriers are
+// block-uniform. The argmax is a strictly-greater scan (FIRST maximal index = the oracle's
+// tie-break) computed redundantly by every lane — no divergence, no atomics, deterministic.
+//   hp [7,256] f32; cand [7,16] u32; unary [7,16] f32; pred/succ [vocab,256] bf16 row-major;
+//   tokens [7] u32; scores_out [7,16] f32 row-major [p*16+k].
+extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_b(
+    unsigned* __restrict__ tokens, float* __restrict__ scores_out,
+    const float* __restrict__ hp, const unsigned* __restrict__ cand,
+    const float* __restrict__ unary,
+    const __nv_bfloat16* __restrict__ pred_codebook, const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned anchor, const unsigned* anchor_dev, int rank) {
+    __shared__ float sh_sc[16];
+    __shared__ float sh_warp[8];
+    const int tid = threadIdx.x;
+    const int R = rank;                        // 256
+    unsigned prev = anchor_dev ? *anchor_dev : anchor;
+    for (int p = 0; p < 7; ++p) {
+        const float a = __bfloat162float(pred_codebook[(long long)prev * R + tid]) * hp[p * R + tid];
+        for (int k = 0; k < 16; ++k) {
+            const float prod = a * __bfloat162float(succ_codebook[(long long)cand[p * 16 + k] * R + tid]);
+            float t = prod;
+            #pragma unroll
+            for (int off = 16; off; off >>= 1) t += __shfl_down_sync(0xffffffffu, t, off);
+            if ((tid & 31) == 0) sh_warp[tid >> 5] = t;      // 8 warp leaders write
+            __syncthreads();                                  // ALL threads (uniform)
+            if (tid == 0) {
+                float w = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) w += sh_warp[i];  // serial ascending cross-warp sum
+                sh_sc[k] = unary[p * 16 + k] + w;
+            }
+            __syncthreads();                                  // ALL threads (uniform)
+        }
+        float best = sh_sc[0]; int bi = 0;
+        #pragma unroll
+        for (int k = 1; k < 16; ++k) if (sh_sc[k] > best) { best = sh_sc[k]; bi = k; }
+        const unsigned tok = cand[p * 16 + bi];
+        if (tid == 0) {
+            tokens[p] = tok;
+            for (int k = 0; k < 16; ++k) scores_out[p * 16 + k] = sh_sc[k];
+        }
+        prev = tok;
+        __syncthreads();
+    }
+}
+
+// ---- S5F2 sampled selector walk (df2_sel_walk_sample_b) ----------------------
+// The S4F walk's score computation (identical fixed-order reduction), but each position DRAWS
+// a multinomial sample over the 16 candidates at `temperature` instead of the argmax — the
+// SGLang `CandidateSelector.sample_path` semantics (softmax(scores/T), `uniforms.ge(cumsum)`
+// multinomial pick). Outputs are packed to keep the launch at the 12-arg cudarc cap:
+//   out_tok[0..7]           the DRAWN draft tokens; out_tok[7 + 16p + k] the candidate ids
+//   out_q[0..7]             the drawn candidate's softmax weight per position (the q in the
+//                           real-q RS accept u*q < p); out_q[7 + 16p + k] the candidate
+//                           weights (the exact relu(p - q) verify residual's q table).
+// RNG: per-position seeds (host-derived from the step key, RNG_DOM_DF2_SEL); the draw is the
+// same LCG + (sr>>8) uniform class as spec_verify_b. The draw is a scalar computed by thread 0
+// and broadcast through shared memory (the walk's predecessor must be warp-uniform).
+extern "C" __global__ void __launch_bounds__(256) df2_sel_walk_sample_b(
+    unsigned* __restrict__ out_tok, float* __restrict__ out_q,
+    const float* __restrict__ hp, const unsigned* __restrict__ cand,
+    const float* __restrict__ unary,
+    const __nv_bfloat16* __restrict__ pred_codebook, const __nv_bfloat16* __restrict__ succ_codebook,
+    unsigned anchor, const unsigned* anchor_dev,
+    const unsigned int* seeds, float temperature, int rank) {
+    __shared__ float sh_sc[16];
+    __shared__ float sh_warp[8];
+    __shared__ unsigned sh_prev;
+    const int tid = threadIdx.x;
+    const int R = rank;                        // 256
+    unsigned prev = anchor_dev ? *anchor_dev : anchor;
+    float inv_t = (temperature > 0.f) ? (1.0f / temperature) : 1.0f;
+    for (int p = 0; p < 7; ++p) {
+        const float a = __bfloat162float(pred_codebook[(long long)prev * R + tid]) * hp[p * R + tid];
+        for (int k = 0; k < 16; ++k) {
+            const float prod = a * __bfloat162float(succ_codebook[(long long)cand[p * 16 + k] * R + tid]);
+            float t = prod;
+            #pragma unroll
+            for (int off = 16; off; off >>= 1) t += __shfl_down_sync(0xffffffffu, t, off);
+            if ((tid & 31) == 0) sh_warp[tid >> 5] = t;      // 8 warp leaders write
+            __syncthreads();                                  // ALL threads (uniform)
+            if (tid == 0) {
+                float w = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) w += sh_warp[i];  // serial ascending cross-warp sum
+                sh_sc[k] = unary[p * 16 + k] + w;
+            }
+            __syncthreads();                                  // ALL threads (uniform)
+        }
+        if (tid == 0) {
+            // softmax over the 16 candidates at `temperature`
+            float mx = sh_sc[0];
+            #pragma unroll
+            for (int k = 1; k < 16; ++k) if (sh_sc[k] > mx) mx = sh_sc[k];
+            float sum = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                float e = __expf((sh_sc[k] - mx) * inv_t);
+                out_q[7 + p * 16 + k] = e;                    // unnormalized scratch
+                sum += e;
+            }
+            // P3(b) fix: normalize ALL 16 entries BEFORE the draw. The prior code normalized
+            // in-place inside the multinomial loop and `break`ed on the chosen candidate, leaving
+            // the tail entries (k > chosen) at their RAW exp values — the candidate q table fed to
+            // spec_verify_realq_b's exact relu(p-q) residual was then a MIX of normalized and raw
+            // weights (qsum != 1), biasing the reject-side distribution. The draw itself is
+            // bit-identical (same cumsum, same ru, same chosen); only the table is corrected.
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) out_q[7 + p * 16 + k] /= sum;
+            // multinomial draw: first candidate whose cumulative mass strictly exceeds u
+            // (the vendor's `uniforms.ge(cumsum)` pick). q_rows = the drawn candidate's weight.
+            unsigned int sr = seeds[p];
+            sr = sr * 1664525u + 1013904223u;
+            float ru = (sr >> 8) * (1.0f / 16777216.0f);
+            float cum = 0.f; int chosen = 15;
+            for (int k = 0; k < 16; ++k) {
+                cum += out_q[7 + p * 16 + k];
+                if (ru < cum) { chosen = k; break; }
+            }
+            const unsigned tok = cand[p * 16 + chosen];
+            out_tok[p] = tok;
+            out_q[p] = out_q[7 + p * 16 + chosen];
+            for (int k = 0; k < 16; ++k) out_tok[7 + p * 16 + k] = cand[p * 16 + k];
+            sh_prev = tok;
+        }
+        __syncthreads();
+        prev = sh_prev;
+        __syncthreads();
+    }
+}

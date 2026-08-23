@@ -25,6 +25,12 @@ pub struct BenchArgs {
     pub port: u16,
     pub dev: String,
     pub gid: i32,
+    /// TP rank count (power of two). 2 = the byte-identical legacy pair mode; >2 drives the
+    /// recursive-doubling round schedule (transport invariants only — numerical equality is P5/P6).
+    pub world: u32,
+    /// Peer-IP list indexed by PEER RANK (P3: placeholder; P6 supplies the real topology). Empty means
+    /// "derive a placeholder" (head IP for rank 0, loopback for the rest).
+    pub peer_ips: Vec<String>,
     pub barriers: u64,
     pub payload_bytes: usize,
     pub spacing_us: u64,
@@ -155,6 +161,22 @@ pub fn trace_dump(label: &str) {
     }
 }
 
+/// P3 placeholder peer-IP list for the N-way bench (P6 supplies the real topology). Indexed by PEER
+/// RANK: rank 0 = the head IP, everything else = loopback (the world>2 attach is still gated behind
+/// `attach_tp`'s panic, so this path only exercises the QP bootstrap + round schedule transport).
+fn bench_peer_ips(world: u32, head_ip: &str) -> Vec<std::net::IpAddr> {
+    let mut v = Vec::with_capacity(world as usize);
+    for r in 0..world as i32 {
+        let ip = if r == 0 {
+            head_ip.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap())
+        } else {
+            "127.0.0.1".parse().unwrap()
+        };
+        v.push(ip);
+    }
+    v
+}
+
 pub fn run(a: BenchArgs) -> anyhow::Result<()> {
     println!("=== --tp-barrier-bench  rank {} ===", a.rank);
     println!("    barriers {}  payload {} B  window {}", a.barriers, a.payload_bytes, a.window);
@@ -163,11 +185,11 @@ pub fn run(a: BenchArgs) -> anyhow::Result<()> {
 
     let dev = CudaDevice::new(0)?;
     let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_batch.ptx")?);
-    let names = ["tp_gate_copy_signal", "tp_wait_add", "tp_bench_fill", "tp_bench_validate",
+    let names = ["tp_gate_copy_signal", "tp_wait_add", "tp_wait_add_4way", "tp_bench_fill", "tp_bench_validate",
                  "tp_bench_stall", "tp_bench_now", "kernel_build_id"];
     dev.load_ptx(ptx, "tpb", &names)?;
     let f = |n: &str| dev.get_func("tpb", n).ok_or_else(|| anyhow::anyhow!("missing kernel {n}"));
-    let (k1, k2) = (f("tp_gate_copy_signal")?, f("tp_wait_add")?);
+    let k1 = f("tp_gate_copy_signal")?;
     let (kfill, kval, kstall, know) = (f("tp_bench_fill")?, f("tp_bench_validate")?,
                                        f("tp_bench_stall")?, f("tp_bench_now")?);
 
@@ -177,11 +199,36 @@ pub fn run(a: BenchArgs) -> anyhow::Result<()> {
         anyhow::bail!("could not pin the bench thread to core {} — refusing to report numbers", a.main_core);
     }
 
-    let mut link = TpLink::connect(a.rank, &a.peer, a.port, &a.dev, a.gid, crate::tp::TP_SLOT_BYTES)?;
+    let link = if a.world > 2 {
+        // P6 supplies the real peer-IP topology via `--peer`-rank list; P3 falls back to a placeholder
+        // (head IP for rank 0, loopback for the rest) so the N-way QP bootstrap + round schedule run.
+        let ips: Vec<std::net::IpAddr> = if a.peer_ips.len() >= a.world as usize {
+            a.peer_ips[..a.world as usize].iter().map(|s| s.parse()).collect::<Result<_, _>>()?
+        } else {
+            bench_peer_ips(a.world, &a.peer)
+        };
+        TpLink::connect_nway(a.rank, a.world as i32, &ips, a.port, &a.dev, a.gid, crate::tp::TP_SLOT_BYTES)?
+    } else {
+        TpLink::connect(a.rank, &a.peer, a.port, &a.dev, a.gid, crate::tp::TP_SLOT_BYTES)?
+    };
+    let mut link = link;
     link.set_payload(a.payload_bytes, false)?;
+    // P3-1: when the transport ctx selected the one-shot push (GB10_TP_ONESHOT, world==4), K2 MUST
+    // be tp_wait_add_4way (sender-indexed rings) — the v1 tp_wait_add would wait on round-keyed
+    // slots the proxy never wrote. The ctx is the single source of truth; read it AFTER connect.
+    let k2 = if link.oneshot_on() {
+        // One-shot REQUIRES the v2 GPU-direct receive: the CPU proxy's RECV stage validates
+        // round-keyed slots and would tail-guard-abort on sender-indexed traffic (observed:
+        // TAIL-EPOCH GUARD FIRED on ranks 2/3 at epoch 1). The serving path pairs one-shot with
+        // GPU-direct receive for the same reason.
+        link.set_recv_mode(true)?;
+        f("tp_wait_add_4way")?
+    } else {
+        f("tp_wait_add")?
+    };
     link.bench_config(a.inject_delay_us_max, true);
     if a.cq_hold > 0 { link.bench_cq_hold(a.cq_hold, a.cq_hold_us)?; }
-    println!("[bench] link up; proxy → core {}", a.proxy_core);
+    println!("[bench] link up (world {}); proxy → core {}", a.world, a.proxy_core);
 
     // GPU<->CPU clock offset: %globaltimer and CLOCK_MONOTONIC_RAW have different epochs, so any
     // cross-domain stage delta is meaningless without this. Bracket a timestamp kernel and take the

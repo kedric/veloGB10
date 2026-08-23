@@ -128,6 +128,7 @@ pub const BLOCK: usize = 16;
 /// weights to 9.5% relative L2 — i.e. ordinary 4-bit quantization noise. With the scale applied the
 /// other way the error is 8.8e7. The convention, the nibble order (low nibble = even index) and the
 /// float decode of E4M3 were all confirmed against that checkpoint.
+#[derive(Debug, Clone)]
 pub struct Nvfp4Tensor {
     pub qweight: Vec<u8>,   // [M, K/2]  two nibbles per byte; low nibble = even index
     pub scales: Vec<u8>,    // [M, K/16] E4M3 block scales
@@ -216,6 +217,51 @@ pub fn dequantize_nvfp4(q: &Nvfp4Tensor) -> Vec<bf16> {
 pub fn fake_quant_nvfp4(w: &mut [bf16], m: usize, k: usize) {
     let q = quantize_nvfp4(w, m, k);
     w.copy_from_slice(&dequantize_nvfp4(&q));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Q2 (2-bit, E26) — the 2-bit codec. Per-16 block along K (the NVFP4 granularity, so the future
+// kernel reuses the tile machinery), Lloyd-Max 2-bit levels for a standard normal (the published
+// optimum for Gaussian sources): {-1.5104, -0.4528, +0.4528, +1.5104} — RTN midpoints ±0.9816, 0.
+// Block scale E4M3, tensor global scale in the reciprocal convention (as NVFP4).
+pub const Q2_LEVELS: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+pub const Q2_MAX: f32 = 1.5104;
+
+#[inline]
+fn q2_index(x: f32) -> usize {
+    if x < -0.9816 { 0 } else if x < 0.0 { 1 } else if x < 0.9816 { 2 } else { 3 }
+}
+
+/// Simulated 2-bit quantization in place (bytes stay bf16, values carry exactly the error a real
+/// 2-bit kernel would produce): per-16 block, E4M3 block scale round-trip, RTN to Q2_LEVELS.
+/// Row-parallel like quantize_nvfp4; single pass (the q2 amax is derived, not materialized).
+pub fn fake_quant_q2(w: &mut [bf16], m: usize, k: usize) {
+    assert_eq!(w.len(), m * k, "shape mismatch");
+    assert_eq!(k % BLOCK, 0, "K={} is not a multiple of {}", k, BLOCK);
+    let amax = w.iter().fold(0.0f32, |a, x| a.max(x.to_f32().abs()));
+    let gs = if amax > 0.0 { (Q2_MAX * E4M3_MAX) / amax } else { 1.0 };
+    let s_tensor = 1.0 / gs;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let rows_per = m.div_ceil(nthreads).max(1);
+    std::thread::scope(|sc| {
+        for (t, chunk) in w.chunks_mut(rows_per * k).enumerate() {
+            sc.spawn(move || {
+                for row in 0..chunk.len() / k {
+                    for b in 0..k / BLOCK {
+                        let blk = &mut chunk[row * k + b * BLOCK..][..BLOCK];
+                        let bmax = blk.iter().fold(0.0f32, |a, x| a.max(x.to_f32().abs()));
+                        let s_code = f32_to_e4m3(if bmax > 0.0 { bmax / Q2_MAX / s_tensor } else { 0.0 });
+                        let s = e4m3_to_f32(s_code) * s_tensor;
+                        let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+                        for x in blk.iter_mut() {
+                            let q = Q2_LEVELS[q2_index(x.to_f32() * inv)];
+                            *x = bf16::from_f32(q * s);
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -375,6 +421,83 @@ pub fn fake_quant_spec() -> Option<Vec<(Group, Fmt)>> {
     parse_recipe(&spec)
 }
 
+/// The per-LAYER override half of a recipe spec (the same env var / `--recipe` string): tokens
+/// `layers:<sel>:<fmt>` where `<sel>` is `lo-hi` (inclusive range) or a comma list of indices.
+/// Layer rules WIN over the group map for the trunk layers they cover (last rule wins on
+/// overlap). Used by the S5F2 clean-tap ladder (L1a: `layers:5,19,33,47,61:fp8` on top of
+/// `all`; L1b: `layers:0-61:bf16` on top of `all` — the bf16 override = no fake-quant on the
+/// clean prefix). `fmt:bf16` in a layer rule means "keep this layer at the raw bf16 weights".
+pub fn fake_quant_layer_rules() -> Vec<LayerRule> {
+    match std::env::var("RUST_INFER_FAKE_QUANT") {
+        Ok(spec) => parse_layer_rules(&spec),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One per-layer precision override: trunk layers `[lo, hi]` (inclusive) at `fmt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerRule { pub lo: usize, pub hi: usize, pub fmt: Fmt }
+
+/// Parse the `layers:` tokens out of a recipe spec string, in spec order (later wins).
+/// `layers:0-61:bf16` (range) or `layers:5,19,33,47,61:fp8` (comma list).
+pub fn parse_layer_rules(spec: &str) -> Vec<LayerRule> {
+    let mut rules = Vec::new();
+    for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let tok = tok.strip_prefix('-').unwrap_or(tok);
+        let Some(rest) = tok.strip_prefix("layers:") else { continue };
+        let (sel, fmt) = match rest.rsplit_once(':') {
+            Some((s, f)) => (s, f),
+            None => continue,
+        };
+        let fmt = match fmt {
+            "fp8" => Fmt::Fp8,
+            "nvfp4" => Fmt::Nvfp4,
+            "bf16" => Fmt::Bf16,
+            _ => { eprintln!("RUST_INFER_FAKE_QUANT: unknown layer format {:?}", fmt); std::process::exit(1); }
+        };
+        // The selector is `lo-hi` (range) or a list separated by `,` or `+` (the `+` form
+        // keeps the whole token comma-free so the recipe spec tokenizes cleanly).
+        for part in sel.split([',', '+']) {
+            let part = part.trim();
+            if let Some((lo, hi)) = part.split_once('-') {
+                let (lo, hi): (usize, usize) = match (lo.parse(), hi.parse()) {
+                    (Ok(a), Ok(b)) if a <= b => (a, b),
+                    _ => { eprintln!("RUST_INFER_FAKE_QUANT: bad layer range {:?}", part); std::process::exit(1); }
+                };
+                rules.push(LayerRule { lo, hi, fmt });
+            } else if let Ok(li) = part.parse::<usize>() {
+                rules.push(LayerRule { lo: li, hi: li, fmt });
+            } else {
+                eprintln!("RUST_INFER_FAKE_QUANT: bad layer selector {:?}", part);
+                std::process::exit(1);
+            }
+        }
+    }
+    rules
+}
+
+/// The trunk layer index in a weight name (`...layers.<N>.<rest>` — both the qwen3.5
+/// `model.language_model.layers.N.*` and the hy_v3 `model.layers.N.*` roots), or None.
+pub fn layer_index_of(name: &str) -> Option<usize> {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    let idx = stem.rfind("layers.")?;
+    let rest = &stem[idx + "layers.".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { return None; }
+    digits.parse().ok()
+}
+
+/// Layer-aware format selection: a matching per-layer rule wins over the group map; otherwise
+/// the group map decides (`fmt_for`). `fmt:bf16` from a rule returns Bf16 = "no fake-quant".
+pub fn fmt_for_layer(map: &[(Group, Fmt)], rules: &[LayerRule], name: &str) -> Fmt {
+    if let Some(li) = layer_index_of(name) {
+        for r in rules.iter().rev() {
+            if li >= r.lo && li <= r.hi { return r.fmt; }
+        }
+    }
+    fmt_for(map, name)
+}
+
 /// Parse a recipe string into a per-group format map. `None` means "no quantization".
 pub fn parse_recipe(spec: &str) -> Option<Vec<(Group, Fmt)>> {
     let spec = spec.trim().to_string();
@@ -383,6 +506,7 @@ pub fn parse_recipe(spec: &str) -> Option<Vec<(Group, Fmt)>> {
                Group::Router, Group::Expert];
     let mut map: Vec<(Group, Fmt)> = Vec::new();
     for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if tok.strip_prefix('-').unwrap_or(tok).starts_with("layers:") { continue; } // per-layer overrides
         let (neg, tok) = match tok.strip_prefix('-') { Some(r) => (true, r), None => (false, tok) };
         let (name, fmt) = match tok.split_once(':') {
             Some((n, "fp8")) => (n, Fmt::Fp8),
@@ -514,8 +638,7 @@ fn repack_fp4_tile(qw: &[u8], sc: &[u8], k: usize, nblk: usize, mt: usize, kb: u
 
 /// Permute a row-major FP8 tensor [M, K] into MMA tile order. Row scales are unchanged: FP8 scales
 /// are per output row, constant over K, so they fold into the f32 accumulator once at the end.
-pub fn repack_fp8_mma(qw: &[u8], m: usize, k: usize) -> Vec<u8> {
-    assert!(m % MMA_M == 0 && k % MMA_K == 0, "MMA repack needs M,K % 16 == 0 (got {}x{})", m, k);
+pub fn repack_fp8_mma(qw: &[u8], m: usize, k: usize) -> Vec<u8> {    assert!(m % MMA_M == 0 && k % MMA_K == 0, "MMA repack needs M,K % 16 == 0 (got {}x{})", m, k);
     let (ntm, nblk) = (m / MMA_M, k / MMA_K);
     let mut wt = vec![0u8; ntm * nblk * MMA_TILE_FP8];
     repack_driver(ntm * nblk, |t, wtc, _| {
@@ -535,6 +658,61 @@ fn repack_fp8_tile(qw: &[u8], k: usize, mt: usize, kb: usize, wt_tile: &mut [u8]
         }
     }
 }
+
+/// Quantize a bf16 weight [M, K] into the `gemm_dsv4_fp8_bsb` device format (the engine's
+/// `Fp8Weight`): MMA-repacked e4m3 codes + UE8M0 block scales [M/128, K/128] (row-major,
+/// matching the kernel's `Sb[(mt>>3)*nkb + kb]`). Per 128-row × 128-K block: amax (floored
+/// at 1e-4) → s = 2^ceil(log2(amax/448)) (UE8M0, always up — the §C.1 convention) →
+/// codes = e4m3(x/s). One-time load-path quantizer (the DSpark fp8 draft heads behind
+/// GB10_DSPARK_FP8_LOGITS) — NOT the serving GEMM's weights (those ship quantized).
+/// Returns (repacked codes, sb bytes).
+pub fn quantize_fp8_bsb(w: &[bf16], m: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(w.len(), m * k, "shape mismatch");
+    assert!(m % 128 == 0 && k % 128 == 0, "fp8_bsb quantize needs M,K % 128 (got {m}x{k})");
+    let nkb = k / 128;
+    let nbm = m / 128;
+    let mut codes = vec![0u8; m * k];
+    let mut sb = vec![0u8; nbm * nkb];
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let bms_per = nbm.div_ceil(nthreads).max(1);
+    std::thread::scope(|sc| {
+        for (t, (cp, sp)) in codes
+            .chunks_mut(bms_per * 128 * k)
+            .zip(sb.chunks_mut(bms_per * nkb))
+            .enumerate()
+        {
+            sc.spawn(move || {
+                let bm0 = t * bms_per;
+                for bm in bm0..(bm0 + bms_per).min(nbm) {
+                    let cl = &mut cp[(bm - bm0) * 128 * k..][..128 * k];
+                    let sl = &mut sp[(bm - bm0) * nkb..][..nkb];
+                    for bk in 0..nkb {
+                        let mut amax = 0.0f32;
+                        for r in 0..128 {
+                            let row = &w[(bm * 128 + r) * k + bk * 128..][..128];
+                            for x in row {
+                                amax = amax.max(x.to_f32().abs());
+                            }
+                        }
+                        amax = amax.max(1e-4);
+                        let s = crate::dsv4_cpu::fast_round_scale(amax, 1.0 / 448.0);
+                        sl[bk] = (s.to_bits() >> 23) as u8; // UE8M0 byte (s is a normal pow2)
+                        let inv = 1.0 / s;
+                        for r in 0..128 {
+                            let src = &w[(bm * 128 + r) * k + bk * 128..][..128];
+                            let dst = &mut cl[r * k + bk * 128..][..128];
+                            for (d, x) in dst.iter_mut().zip(src) {
+                                *d = f32_to_e4m3(x.to_f32() * inv);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (repack_fp8_mma(&codes, m, k), sb)
+}
+
 
 /// Don't spawn a thread for less work than this: a thread costs tens of µs, 4096 tiles (~0.5 MB)
 /// costs ~2-3 ms single-core — below that the spawn overhead is the optimization.
@@ -720,6 +898,34 @@ pub fn draft_vocab_rows(top: usize, vocab: usize) -> Vec<u32> {
     rows
 }
 
+/// FR-Spec subset from an explicit id file (RUST_INFER_DRAFT_VOCAB_FILE) — the corpus-ranked
+/// variant of `draft_vocab_rows` (the offline artifact step produces this from real frequencies).
+/// Format: whitespace/newline-separated decimal token ids. The special-token tail is appended
+/// (same rule as `draft_vocab_rows`, so a corpus list that omits specials stays chat-safe), then
+/// id-order tokens fill the last partial 16-row tile. Rows are independent in every codec, so ANY
+/// subset is exact — the file only chooses WHICH tokens are proposable.
+pub fn draft_vocab_rows_file(path: &str, vocab: usize) -> std::io::Result<Vec<u32>> {
+    let txt = std::fs::read_to_string(path)?;
+    let mut rows: Vec<u32> = txt.split_whitespace()
+        .filter_map(|t| t.parse::<u32>().ok())
+        .filter(|&i| (i as usize) < vocab)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    const TAIL: usize = 512;
+    let tail_start = if vocab == 120832 { 120000 } else { vocab.saturating_sub(TAIL) };
+    let mut next: std::collections::HashSet<u32> = rows.iter().copied().collect();
+    for i in tail_start as u32..vocab as u32 {
+        if next.insert(i) { rows.push(i); }
+    }
+    let mut fill = 0u32;
+    while rows.len() % MMA_M != 0 {
+        while !next.insert(fill) { fill += 1; }
+        rows.push(fill);
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +1041,52 @@ mod tests {
         assert!(rel < 0.15, "relative error {} too large", rel);
         assert_eq!(q.qweight.len(), m * k / 2);
         assert_eq!(q.scales.len(), m * k / BLOCK);
+    }
+}
+
+#[cfg(test)]
+mod q2_tests {
+    use super::*;
+    #[test]
+    fn layer_rules_parse_and_select() {
+        // S5F2 L1 ladder spec: `layers:<sel>:<fmt>` tokens (list via `+`/`,`, range via `-`).
+        let rules = parse_layer_rules("all,layers:5+19+33+47+61:fp8");
+        assert_eq!(rules.len(), 5);
+        assert!(rules.iter().all(|r| r.fmt == Fmt::Fp8));
+        let rules2 = parse_layer_rules("all,layers:0-61:bf16");
+        assert_eq!(rules2.len(), 1);
+        assert_eq!((rules2[0].lo, rules2[0].hi, rules2[0].fmt), (0, 61, Fmt::Bf16));
+        // layer_index_of: both qwen3.5 (`model.language_model.layers.N.*`) and hy_v3 roots.
+        assert_eq!(layer_index_of("model.language_model.layers.5.self_attn.q_proj.weight"), Some(5));
+        assert_eq!(layer_index_of("model.layers.61.mlp.down_proj.weight"), Some(61));
+        assert_eq!(layer_index_of("lm_head.weight"), None);
+        assert_eq!(layer_index_of("mtp.layers.0.mlp.gate_up_proj.weight"), Some(0));
+        // Layer rules WIN over the group map; non-layered tensors fall back to the group map.
+        let map = parse_recipe("all").unwrap();
+        let f1 = fmt_for_layer(&map, &rules, "model.language_model.layers.19.self_attn.q_proj.weight");
+        let f2 = fmt_for_layer(&map, &rules, "model.language_model.layers.20.self_attn.q_proj.weight");
+        let f3 = fmt_for_layer(&map, &rules, "lm_head.weight");
+        assert!(matches!(f1, Fmt::Fp8), "tap-layer override must win: {f1:?}");
+        assert!(matches!(f2, Fmt::Nvfp4), "non-tap layer falls back to the group map: {f2:?}");
+        assert!(matches!(f3, Fmt::Nvfp4), "non-layered tensor uses the group map: {f3:?}");
+        // bf16 override = "no fake-quant" on the covered layers.
+        let f4 = fmt_for_layer(&map, &rules2, "model.language_model.layers.5.self_attn.q_proj.weight");
+        assert!(matches!(f4, Fmt::Bf16));
+    }
+    #[test]
+    fn q2_levels_assigned() {
+        // one block with a known spread: expect all four levels to appear
+        let mut w: Vec<bf16> = vec![-0.249, -0.994, 0.497, -0.994, -1.491, 0.746, -0.249, 0.746,
+                                    -0.994, 0.994, -0.994, -0.994, 1.491, 0.0, -0.249, 1.491]
+            .iter().map(|&x| bf16::from_f32(x)).collect();
+        // scale so the block amax is exactly Q2_MAX (s = e4m3(1)*st ≈ 1.0 path)
+        let k = 16;
+        let orig: Vec<f32> = w.iter().map(|x| x.to_f32()).collect();
+        fake_quant_q2(&mut w, 1, k);
+        let got: Vec<f32> = w.iter().map(|x| x.to_f32()).collect();
+        eprintln!("orig: {:?}", orig);
+        eprintln!("got:  {:?}", got);
+        let has_small = got.iter().any(|v| v.abs() < 1.0);
+        assert!(has_small, "q2 collapsed everything to the extreme level: {:?}", got);
     }
 }

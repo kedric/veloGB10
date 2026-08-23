@@ -115,7 +115,12 @@ fn test_gpu_mixers_vs_cpu() {
     // ---- mlp layer 0 ----
     {
         let mut mlp_cpu = host.mlp_forward(&normed, &host.layers[0].mlp);
-        let mlp_dev = gpu.mlp(&mut pool, &normed_dev, &gpu.layer(0).mlp);
+        // gpu.layer(i).mlp is now an Ffn (Dense|Moe); the legacy mlp() probe takes the GpuMlp.
+        let mlp_gpu_m = match &gpu.layer(0).mlp {
+            gb10_inference::gpu::Ffn::Dense(m) => m,
+            gb10_inference::gpu::Ffn::Moe(_) => panic!("test expects a dense mlp in layer 0"),
+        };
+        let mlp_dev = gpu.mlp(&mut pool, &normed_dev, mlp_gpu_m);
         let mlp_gpu = gpu.dev().dtoh_sync_copy(&mlp_dev).unwrap();
         println!("mlp gpu-vs-cpu max abs diff: {:.6}", maxdiff(&mlp_gpu, &mlp_cpu));
         let _ = &mut mlp_cpu;

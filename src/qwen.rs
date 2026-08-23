@@ -16,7 +16,7 @@ pub enum LayerType {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Family { Qwen35, HyV3 }
+pub enum Family { Qwen35, HyV3, Dsv4 }
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -76,9 +76,22 @@ impl Config {
         let root: serde_json::Value = serde_json::from_str(&raw)?;
 
         // Family detection. hy_v3 keeps everything at the ROOT of config.json (no text_config);
-        // the qwen3.5 family nests under text_config.
+        // the qwen3.5 family nests under text_config. DSV4 (deepseek_v4) is NOT a GpuModel family
+        // — it has its own Dsv4GpuModel + Dsv4Config; detection here is a safety rail so a
+        // `GpuModel::load_from_dir` on a DSV4 bundle fails with a clear pointer instead of
+        // mis-parsing it as Qwen35.
         let model_type = root["model_type"].as_str().unwrap_or("");
-        let family = if model_type == "hy_v3" { Family::HyV3 } else { Family::Qwen35 };
+        let family = if model_type == "hy_v3" { Family::HyV3 }
+                     else if model_type == "deepseek_v4" { Family::Dsv4 }
+                     else { Family::Qwen35 };
+        if family == Family::Dsv4 {
+            anyhow::bail!(
+                "DeepSeek-V4 (model_type {model_type:?}) is not a GpuModel family — it has its own\n \
+                 Dsv4GpuModel (src/dsv4_model.rs) loaded via Dsv4Config::load_config. Use\n \
+                 `gb10_inference --probe-dsv4 --model-dir <bundle>` (or the DSV4 server path),\n \
+                 not the Qwen/Hy3 GpuModel loader."
+            );
+        }
         let tc_owned;
         let tc: &serde_json::Value = if family == Family::HyV3 {
             tc_owned = root.clone(); &tc_owned

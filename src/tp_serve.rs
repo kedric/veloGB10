@@ -34,6 +34,9 @@ pub struct WireRequest {
     pub frequency_penalty: f32,
     pub seed: Option<u64>,
     pub ckpt_at: Option<usize>,
+    /// S8F routing domain (S6F adjudication): rides the wire so a future TP-DF2 lane split is
+    /// SPMD-identical; a pure function of the prompt, default `General`.
+    pub domain: crate::batch::Domain,
 }
 
 /// One scheduler-visible event within a step. Ordering inside a step: all Admits (in admit order),
@@ -53,10 +56,22 @@ pub struct StepEvents {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ServingMsg {
-    /// The head's measured MTP cost-per-depth table. The node runs the SAME SPMD calibration
-    /// forwards (the all-reduces are barriers the head waits on) but discards its own table, so
-    /// both ranks drive `MtpPolicy` from one identical set of numbers.
-    CalibTable { r: Vec<(u32, f32)> },
+    /// The head's measured MTP cost-per-depth tables, per context bucket (E17): (measurement ctx,
+    /// r table at that ctx). The node runs the SAME SPMD calibration forwards (the all-reduces are
+    /// barriers the head waits on) but discards its own tables, so both ranks drive `MtpPolicy`
+    /// from one identical set of numbers.
+    /// S9F (the TP-DF2 leg): `df2_round` = the head's DFlash2-round LOAD OUTCOME (the config only
+    /// ships the intent; the head knows the artifact's residency only after its own load). The
+    /// node must load the round iff the head did — a one-sided round is a lane-branch mismatch
+    /// that desyncs the verify all-reduces (the node panics loudly if its own load contradicts
+    /// the shipped flag rather than silently serving a different lane).
+    CalibTable { ctx_r: Vec<(u32, Vec<(u32, f32)>)>, df2_round: bool },
+    /// The head's measured DSpark depth-cost table (item 3.3): (drafted rows D, r(D) = step cost /
+    /// decode cost). Both ranks run the identical SPMD calibration forwards (the verify all-reduces
+    /// are barriers the head waits on); the node discards its own timings and drives the depth
+    /// policy from the head's table — a per-rank timing difference must never diverge the depth
+    /// decision (the serve loop is SPMD).
+    DsparkRd { table: Vec<(u32, f32)> },
     /// Node → head: scheduler built (graph capture done), mirror loop armed. The head binds the
     /// HTTP listener only after receiving this, so no client request can arrive before the mirror
     /// is in lockstep.
@@ -80,6 +95,7 @@ impl From<&BatchRequest> for WireRequest {
             frequency_penalty: r.frequency_penalty,
             seed: r.seed,
             ckpt_at: r.ckpt_at,
+            domain: r.domain,
         }
     }
 }
@@ -101,6 +117,8 @@ impl WireRequest {
             tx,
             seed: self.seed,
             ckpt_at: self.ckpt_at,
+            domain: self.domain,
+            received_at: std::time::Instant::now(),
         }
     }
 }

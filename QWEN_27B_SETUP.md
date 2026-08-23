@@ -1,0 +1,232 @@
+# Qwen 3.8 27B NVFP4 — step-by-step setup
+
+This guide walks through bringing up the **Qwen3.8 27B NVFP4** model with **DFlash 2** speculative
+decoding on veloGB10, in three deployment shapes: **single node**, **TP=2**, and **TP=4**. It covers
+the required files on each machine, the exact launch commands, and the log lines you should expect.
+
+- **Target model:** `doth4580/Qwen3.8-27B-NVFP4-FULL` — https://huggingface.co/doth4580/Qwen3.8-27B-NVFP4-FULL
+- **Drafter (requires download):** `doth4580/Qwen3.8-27B-DFlash2` — https://huggingface.co/doth4580/Qwen3.8-27B-DFlash2
+- **Full context:** launch with `--max-seq-len 262144` (the model's full 256K).
+
+> **Use only our quantized models.** Our NVFP4 artifacts are built and tuned specifically for the
+> veloGB10 engine. An alternative is to run `--quantize all` on the original Qwen bf16 model and use
+> that output — the result is identical to our NVFP4 artifact.
+
+---
+
+## 1. The files you need
+
+### Binary + PTX (every machine)
+
+The engine is **the binary + a `src/ptx/` directory of kernel artifacts**. The binary loads the PTX
+relative to its **current working directory**, so run it from a directory that contains both. The
+binary is ~16 MB; the PTX files total ~12 MB. Do not mismatch a binary with foreign PTX.
+
+On every machine (nodes included), the directory must look like this:
+
+```
+.
+├── gb10_inference
+└── src
+    └── ptx
+        ├── fused_decode.ptx
+        ├── gemm_nvfp4.ptx
+        ├── gpu_batch.ptx
+        ├── gpu_batch_b3.ptx
+        ├── gpu_dflash.ptx
+        ├── gpu_dsv4.ptx
+        ├── gpu_dsv4_attn.ptx
+        ├── gpu_dsv4_comp.ptx
+        ├── gpu_kernels.ptx
+        ├── gpu_mxfp4.ptx
+        ├── gpu_mxfp4_moe.ptx
+        ├── mxfp4_bench.ptx
+        ├── rms_norm.ptx
+        └── silu_gate.ptx
+```
+
+**Copy the binary and the `src/ptx/` directory to each node machine.**
+
+### The drafter (on every machine that will serve)
+
+The DFlash 2 drafter checkpoint must be present locally:
+
+- `Qwen3.8-27B-DFlash2/` — `config.json`, `model.safetensors`, `README.md`, `dl.log` (the full
+  directory as downloaded from `doth4580/Qwen3.8-27B-DFlash2`).
+
+### The target model (head only)
+
+You do **not** need to copy the target model to the node machines. The head ships what each node
+needs automatically (see §4). Only the **head** needs the full model directory plus the drafter.
+
+---
+
+## 2. Start the node(s)
+
+On each node machine, first ensure the directory from §1 is in place (binary + `src/ptx/`), then run:
+
+```bash
+./gb10_inference --node --port 29500
+```
+
+Expected output:
+
+```
+[node-resident] supervisor up on port 29500 — one process per head session; kill this process to stop the node
+[node] gx10-1dcd ready: discovery on UDP 29499, control on TCP 29500, cache ~/.cache/gb10_tp
+```
+
+At this point the nodes are waiting for the head to launch.
+
+For the examples below we assume nodes are running at:
+
+- **TP=4:** `192.168.177.12:29500`, `192.168.177.13:29500`, `192.168.177.14:29500`
+- **TP=2:** `192.168.177.12:29500`
+
+> **You do NOT need to copy the model to the nodes.** Required model shards and files are transferred
+> automatically by the head, and in most cases only the files that are actually needed are copied —
+> not necessarily the whole model.
+
+---
+
+## 3. Bring up the server on the head
+
+Ensure the head directory has the binary + `src/ptx/`, the target model directory, and the drafter
+directory. For this example, copy the models next to the binary, each in its own subdirectory:
+
+```
+.
+├── 3.8-27b-nvfp4-full-all
+│   ├── LICENSE
+│   ├── README.md
+│   ├── chat_template.jinja
+│   ├── config.json
+│   ├── generation_config.json
+│   ├── merges.txt
+│   ├── model-00001.safetensors
+│   ├── model-00002.safetensors
+│   ├── model.safetensors.index.json
+│   ├── preprocessor_config.json
+│   ├── tokenizer.json
+│   ├── tokenizer_config.json
+│   └── vocab.json
+├── Qwen3.8-27B-DFlash2
+│   ├── LICENSE
+│   ├── README.md
+│   ├── assets
+│   │   └── dflash2-figure.png
+│   ├── config.json
+│   ├── dl.log
+│   └── model.safetensors
+├── gb10_inference
+└── src
+    └── ptx
+        └── ... (as in §1)
+```
+
+`3.8-27b-nvfp4-full-all` is the main model directory; `Qwen3.8-27B-DFlash2` is the DFlash 2 drafter
+directory. In a single-node or TP deployment, verify the full directory tree from §1 and these two
+model directories before launching.
+
+### TP=4 (three nodes + head)
+
+```bash
+./gb10_inference --server \
+  --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
+  --tp 4 \
+  --nodes 192.168.177.12:29500,192.168.177.13:29500,192.168.177.14:29500 \
+  --port 9000 \
+  --max-seq-len 262144 \
+  --max-batch 1 \
+  --max-tokens 65536 \
+  --prefix-cache on \
+  --default-presence-penalty 1.5 \
+  --mtp=auto \
+  --spec-source dflash2-auto \
+  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+```
+
+### TP=2 (one node + head)
+
+```bash
+./gb10_inference --server \
+  --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
+  --tp 2 \
+  --nodes 192.168.177.12:29500 \
+  --port 9000 \
+  --max-seq-len 262144 \
+  --max-batch 1 \
+  --max-tokens 65536 \
+  --prefix-cache on \
+  --default-presence-penalty 1.5 \
+  --mtp=auto \
+  --spec-source dflash2-auto \
+  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+```
+
+### Single node
+
+```bash
+./gb10_inference --server \
+  --model-dir ~/veloGB10/3.8-27b-nvfp4-full-all \
+  --port 9000 \
+  --max-seq-len 262144 \
+  --max-batch 1 \
+  --max-tokens 65536 \
+  --prefix-cache on \
+  --default-presence-penalty 1.5 \
+  --mtp=auto \
+  --spec-source dflash2-auto \
+  --draft-dir ~/veloGB10/Qwen3.8-27B-DFlash2
+```
+
+### What you should see
+
+During the head bring-up you should see lines like:
+
+```
+[tp] config installed: world=4 shard_mixers=true shard_mtp=true graph=false ...
+[head] gx10-c9c4 — building manifest for ~/veloGB10/3.8-27b-nvfp4-full-all (world 4) ...
+[head] manifest '3.8-27b-nvfp4-full-all': 39 artifacts, 48.95 GB
+[head] draft manifest 'Qwen3.8-27B-DFlash2': 6 artifacts, 3.85 GB — ships to every node
+[head] 192.168.177.12 (rank 1) needs 0 / 13 artifacts (0.00 GB)
+[head] 192.168.177.12 (rank 1) READY — model at ~/.cache/gb10_tp/models/3.8-27b-nvfp4-full-all (0.00 GB in 0.0s = 0.00 GB/s)
+[head] shipped config to 192.168.177.12 (rank 1/4)
+[head] 192.168.177.12 drafter: 5 / 6 artifacts (3.85 GB)
+[head] 192.168.177.12 drafter READY at ~/.cache/gb10_tp/models/Qwen3.8-27B-DFlash2 (3.85 GB in 7.6s)
+...
+[head] 3 node(s) synced; all control streams RETAINED for the serving session
+[tp] rank 0/4 — bringing up RDMA data-plane link on rocep1s0f1 (listening) ...
+[tp] rank 0/4 — link UP
+[tp] rank 0/4 — data-plane all-reduce link SANE
+[df2] DFlash2 round RESIDENT (spec-source=dflash2-auto) — serving via the S4F integrated round (b==1 lanes); MTP remains the fallback (standing directive)
+TP -- all 3 node(s) READY; binding HTTP
+OpenAI-compatible server running on http://0.0.0.0:9000
+Serving model: 3.8-27b-nvfp4-full-all  (GET /v1/models)
+POST /v1/chat/completions   max_batch=1  default max_tokens=65536
+```
+
+Once you see the final three lines, the server is up and you can connect with any OpenAI-compatible
+client.
+
+**Checking the nodes connected properly** — look for the `READY` lines listing your node IPs:
+
+- **TP=4:** three `READY` lines (ranks 1, 2, 3) — if you get all 3, your nodes are configured correctly.
+- **TP=2:** one `READY` line for rank 1.
+
+**Checking DFlash 2 is enabled** — look for this line:
+
+```
+[df2] DFlash2 round RESIDENT (spec-source=dflash2-auto) — serving via the S4F integrated round (b==1 lanes); MTP remains the fallback (standing directive)
+```
+
+---
+
+## 4. Notes
+
+- **First load is slower.** The first time the model loads, the engine creates caches for various
+  things. Subsequent loads are significantly faster.
+- **Model transfer is automatic.** The head transfers model shards and config to the nodes on demand;
+  in most cases only the needed files are copied, not the whole model.
+- **Cache management.** The engine caches transferred model blobs on the node at
+  `~/.cache/gb10_tp`. To inspect or reclaim that cache, see **MANAGING_CACHE.md**.

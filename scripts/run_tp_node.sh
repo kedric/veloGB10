@@ -16,6 +16,10 @@ else cd "$SDIR/.."; BIN="./target/release/gb10_inference"; fi                   
 
 PORT=${PORT:-29500}
 [ -n "${RDMA_DEV:-}" ] && export GB10_RDMA_DEV="$RDMA_DEV"
+# R9 DIAGNOSTIC: honor GB10_TP_DIAG only when explicitly set. It must match the head — diag forces
+# the non-graph decode path (a DIFFERENT barrier schedule), so a diag node + non-diag head deadlock.
+# The node is a resident supervisor with no env of its own; set it explicitly when diagnosing.
+[ -n "${GB10_TP_DIAG:-}" ] && export GB10_TP_DIAG=1
 
 echo "=== GB10 TP=2 NODE — resident on port $PORT (zero config; head ships everything) ==="
 exec "$BIN" --node --port "$PORT"

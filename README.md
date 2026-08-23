@@ -37,6 +37,73 @@ inference binary, the required PTX kernels, SHA-256 checksums, and build provena
 run an NVIDIA DGX Spark or a compatible OEM GB10 machine, you can use a release binary without
 compiling anything.
 
+## Update — Qwen 3.8 27B NVFP4 with DFlash 2
+
+**veloGB10 now fully supports the Qwen3.8 27B NVFP4 model, with native DFlash 2 speculative
+decoding, at the model's full 256K context.**
+
+The supported configuration combines our NVFP4-quantized
+[Qwen3.8-27B-NVFP4-FULL](https://huggingface.co/doth4580/Qwen3.8-27B-NVFP4-FULL) target model with
+the mirrored [Qwen3.8-27B-DFlash2](https://huggingface.co/doth4580/Qwen3.8-27B-DFlash2) drafter —
+launched via `--spec-source dflash2-auto --draft-dir <dflash2 dir>` — and runs at **max-seq-len
+262144** (full 256K context).
+
+### Qwen 3.8 27B NVFP4 performance
+
+Single-stream decode, greedy, NVFP4 with DFlash 2. Figures are representative sustained
+average/peak; real numbers vary with content type. **Highest performance is on code generation.**
+
+| Mode | Average | Bottoms | Peaks |
+|---|---:|---:|---:|
+| Single node | **> 30 tok/s** | ~18 tok/s (some content types) | 45–50 tok/s |
+| TP=2 | **56 tok/s** | ~30 tok/s | 75 tok/s |
+| TP=4 | **75 tok/s** | ~45 tok/s | 125 tok/s |
+
+> Peak rates are typically reached on **code content generation**; prose and mixed content sit lower
+> in the ranges above.
+
+#### Live throughput traces
+
+These are `TOKENS/SECOND` traces pulled straight from the engine's live stats panel while serving
+the Qwen3.8 27B NVFP4 + DFlash 2 config. For each deployment mode you get one **peak-vs-lowest**
+trace (the full spread of a session — where the throughput bottoms out and where it tops out) and
+one **sustained peak** trace (a segment holding its best rate). Download the images to see them at
+full size.
+
+**Single node** — average >30 tok/s, peaks 45–50, some content types ~18 tok/s. The peak-vs-lowest
+trace shows the swing between content types; the sustained-peak trace is a clean stretch running
+near the 45–50 tok/s ceiling.
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![Single node — peak vs lowest](assets/single_min_max.png) | ![Single node — sustained peak](assets/single_max.png) |
+
+**TP=2** — the two-node setup lifts the ceiling: average 56 tok/s, bottoms ~30, peaks 75. Even the
+lowest points sit comfortably above the single-node average.
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![TP=2 — peak vs lowest](assets/tp2_min_max.png) | ![TP=2 — sustained peak](assets/tp2_max.png) |
+
+**TP=4** — four-node serving pushes heads well past 100 tok/s on the best content: average 75,
+bottoms ~45, peaks up to 125. The sustained-peak trace holds a ~120 tok/s plateau.
+
+| Peak vs lowest | Sustained peak |
+|---|---|
+| ![TP=4 — peak vs lowest](assets/tp4_min_max.png) | ![TP=4 — sustained peak](assets/tp4_max.png) |
+
+Scaling up from one to four nodes roughly **doubles the ceiling** and more than doubles the average
+on code-heavy content.
+
+### Getting started with Qwen 3.8 27B
+
+Full, step-by-step setup instructions for single-node, TP=2, and TP=4 deployments (node layout,
+required files, launch commands, and expected output) are in
+**[QWEN_27B_SETUP.md](QWEN_27B_SETUP.md)**. Managing the engine's TP model cache is documented in
+**[MANAGING_CACHE.md](MANAGING_CACHE.md)**.
+
+---
+
 ## Building from source
 
 **System prerequisites** (on the GB10 itself):
@@ -63,6 +130,12 @@ binary/PTX pairs, so the two never silently drift apart).
 Don't want to build? Use the prebuilt package on the [**Releases** page](https://github.com/sf-stav/veloGB10/releases) instead.
 
 ## Running
+
+> **Qwen3.8 27B with DFlash 2 requires the draft-model arguments.** Add
+> `--spec-source dflash2-auto --draft-dir <path/to/Qwen3.8-27B-DFlash2>` to the launch command, and
+> point `--model-dir` at the DFlash2-capable quantized model. The Qwen3.8 27B NVFP4 model is not a
+> standalone drafter runner — it needs the DFlash2 drafter for speculative decoding. See
+> [QWEN_27B_SETUP.md](QWEN_27B_SETUP.md) for the full Qwen3.8 27B command lines.
 
 **Single node, single user (maximum speed):**
 
