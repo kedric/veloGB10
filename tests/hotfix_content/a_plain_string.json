@@ -1,0 +1,9 @@
+{
+  "model": "qwen",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Say hello in one short sentence."}
+  ],
+  "max_tokens": 16,
+  "stream": false
+}

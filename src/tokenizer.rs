@@ -244,6 +244,64 @@ pub struct ToolCall {
 
 fn default_tool_type() -> String { "function".to_string() }
 
+/// Deserialize an OpenAI chat-message `content`, which the spec allows to be either a plain
+/// STRING or an ARRAY of content parts (`{"type":"text",...}`, `{"type":"image_url",...}`).
+/// Agent clients (the OpenAI agent SDK and the Pi harness) send the array form, which a bare
+/// `Option<String>` rejected with a confusing 422 `invalid type: sequence, expected a string`.
+///
+/// Resolution (documented in the hotfix commit `serve-content-parts`):
+/// - string -> used verbatim (unchanged from before);
+/// - null / absent -> `None` (agents send `"content": null` on the assistant `tool_calls` turn);
+/// - array -> only `{"type":"text","text":...}` parts are kept. A single text part is used
+///   VERBATIM; multiple are JOINED with "\n" (a code comment in the commit records that choice).
+///   Any other part shape is handled below.
+/// - non-text part (`image_url`, `input_image`, ...) -> a CLEAR, actionable 422 rather than a
+///   serde type error. **This is the vision entry point**: when the image tower lands, this
+///   branch becomes the dispatch into image preprocessing instead of rejecting the request.
+fn deserialize_content<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Array(parts) => {
+            let mut texts: Vec<String> = Vec::new();
+            for part in &parts {
+                match part {
+                    // Lenient: a bare string element in the array counts as a text part.
+                    serde_json::Value::String(s) => texts.push(s.clone()),
+                    serde_json::Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = o.get("text").and_then(|t| t.as_str()) {
+                                texts.push(t.to_string());
+                            }
+                        }
+                        Some(_) => {
+                            // Any non-text part (image_url, input_image, ...). Vision entry point:
+                            // swap this rejection for the image path when the tower lands.
+                            return Err(serde::de::Error::custom(
+                                "image content parts are not supported by this build"));
+                        }
+                        None => {
+                            // No `type` field: leniently accept a `text` field if present.
+                            if let Some(t) = o.get("text").and_then(|t| t.as_str()) {
+                                texts.push(t.to_string());
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            if texts.is_empty() { Ok(None) } else { Ok(Some(texts.join("\n"))) }
+        }
+        _ => Err(serde::de::Error::custom(
+            "content must be a string or an array of content parts")),
+    }
+}
+
 /// One message of the conversation, in the shape agent harnesses actually send.
 ///
 /// `content` MUST be optional: every OpenAI client sends `"content": null` on the assistant turn that
@@ -253,7 +311,9 @@ fn default_tool_type() -> String { "function".to_string() }
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default)]
+    /// Spec allows a STRING or an ARRAY of content parts. `content: Option<String>` alone
+    /// rejected the array form → 422. See `deserialize_content` for the resolution steps.
+    #[serde(default, deserialize_with = "deserialize_content")]
     pub content: Option<String>,
     /// Assistant turn: the calls the model previously made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -355,6 +415,52 @@ mod tests {
             .expect("render must not raise 'too many arguments' on non-string tool args");
         assert!(rendered.contains("read"), "tool name should appear in the prompt");
         assert!(rendered.contains("60"), "numeric argument should render unescaped");
+    }
+
+    /// HOTFIX `serve-content-parts`: the OpenAI spec allows `content` as a STRING or an ARRAY of
+    /// content parts. A bare `Option<String>` rejected the array form with a confusing 422
+    /// `invalid type: sequence, expected a string`. Headless unit test on the deserializer.
+    #[test]
+    fn content_accepts_string_array_and_null() {
+        // (a) plain string (regression): unchanged.
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some("hello"));
+
+        // (b) single-text-part array — the Pi payload shape. Used verbatim.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"hello world"}]}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some("hello world"));
+
+        // (c) multi-text-part array — joined with "\n" (documented join choice).
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some("a\nb"));
+
+        // (d) null content on an assistant tool_calls turn -> None (agents send this).
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}"#).unwrap();
+        assert_eq!(m.content, None);
+        assert!(m.tool_calls.is_some(), "tool_calls must still deserialize");
+
+        // (e) an array containing an image_url part -> the CLEAR 422 message, not a serde type error.
+        let e = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}"#).unwrap_err();
+        assert!(e.to_string().contains("image content parts are not supported by this build"),
+            "got: {e}");
+
+        // (f) realistic agent conversation: system + user + assistant(tool_calls,null) + tool result.
+        let msgs: Vec<ChatMessage> = serde_json::from_str(
+            r#"[
+                {"role":"system","content":"You are a helpful assistant."},
+                {"role":"user","content":[{"type":"text","text":"What is 2+2?"}]},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"calc","arguments":"{\"expr\":\"2+2\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","name":"calc","content":[{"type":"text","text":"4"}]}
+            ]"#).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1].content.as_deref(), Some("What is 2+2?"));
+        assert_eq!(msgs[2].content, None);
+        assert_eq!(msgs[3].content.as_deref(), Some("4"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("call_1"));
     }
 
     /// Regression: the SSE streaming path decodes one token at a time; a multi-byte UTF-8 char

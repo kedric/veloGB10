@@ -1,0 +1,8 @@
+{
+  "model": "qwen",
+  "messages": [
+    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}
+  ],
+  "max_tokens": 16,
+  "stream": false
+}

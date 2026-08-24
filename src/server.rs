@@ -126,7 +126,10 @@ fn split_think(s: &str, think_open: &str, think_close: &str) -> (Option<String>,
 
 #[derive(Deserialize)]
 struct ChatCompletionRequest {
-    model: String,
+    /// OpenAI spec requires `model`, but single-model agent clients sometimes omit it. Accept
+    /// and fall back to the served model name rather than 422 on a missing field.
+    #[serde(default)]
+    model: Option<String>,
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<usize>,
@@ -382,7 +385,7 @@ async fn chat_completions(
     if req.stream {
         eprintln!("[req] stream  prompt_tokens={} max_tokens={} stop={:?}", prompt_len, req_max, req.stop);
         let tokenizer = Arc::clone(&state.tokenizer);
-        let model_name = req.model.clone();
+        let model_name = req.model.clone().unwrap_or_else(|| state.model_name.clone());
         let stops = req.stop.clone();
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
         let created = chrono::Utc::now().timestamp();
@@ -606,7 +609,7 @@ async fn chat_completions(
             id: completion_id,
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp(),
-            model: req.model,
+            model: req.model.clone().unwrap_or_else(|| state.model_name.clone()),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ResponseMessage {

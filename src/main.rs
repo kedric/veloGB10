@@ -5842,11 +5842,16 @@ fn run_cluster_node_once(port: u16) {
     };
     // v5 gap fix (2026-08-23): when the head shipped the DFlash2 drafter, its bytes are in OUR
     // blob cache and `draft_dir` is the assembled cache path — rewrite the config's draft dir to
-    // it so node_serve_tp loads the drafter FROM THE CACHE. The node never touches the head's
-    // filesystem path (which may not exist here — that used to require a manual copy per node).
-    if let Some(d) = &draft_dir {
-        println!("NODE — draft artifact synced via blob cache: {} (no local copy needed)", d.display());
-        tpc.df2_draft_dir = d.to_string_lossy().to_string();
+    // it so node_serve_tp loads the drafter FROM THE CACHE. When the head shipped NO drafter,
+    // CLEAR the path: a node must never open the head's filesystem path (a stale local dir at
+    // the same location would silently stand in for a failed sync — the round load then fails
+    // cleanly and the CalibTable df2_round outcome keeps both sides consistent instead).
+    match &draft_dir {
+        Some(d) => {
+            println!("NODE — draft artifact synced via blob cache: {} (no local copy needed)", d.display());
+            tpc.df2_draft_dir = d.to_string_lossy().to_string();
+        }
+        None => { tpc.df2_draft_dir.clear(); }
     }
     // The head's TP config, shipped during the sync — install BEFORE any TP consumer reads a setting,
     // so the node reproduces the head's behavior with ZERO GB10_TP_* env vars.

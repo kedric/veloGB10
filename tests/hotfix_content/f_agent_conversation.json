@@ -1,0 +1,12 @@
+{
+  "model": "qwen",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": [{"type": "text", "text": "What is 3+4?"}]},
+    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "calc", "arguments": "{\"expr\": \"3+4\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "calc", "content": [{"type": "text", "text": "7"}]},
+    {"role": "user", "content": [{"type": "text", "text": "Now multiply that by 2."}]}
+  ],
+  "max_tokens": 16,
+  "stream": false
+}
