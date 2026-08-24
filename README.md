@@ -158,7 +158,9 @@ types;
 Full, step-by-step setup instructions for single-node, TP=2, and TP=4 deployments (node layout,
 required files, launch commands, and expected output) are in
 **[QWEN_27B_SETUP.md](QWEN_27B_SETUP.md)**. Managing the engine's TP model cache is documented in
-**[MANAGING_CACHE.md](MANAGING_CACHE.md)**.
+**[MANAGING_CACHE.md](MANAGING_CACHE.md)**. If you want to see how the stack holds up under a long
+run, there's an **8-hour endurance report** — throughput, latency, determinism, and thermals over a
+mixed workload — in **[ENDURANCE_REPORT.md](ENDURANCE_REPORT.md)**.
 
 ### Notes
 
