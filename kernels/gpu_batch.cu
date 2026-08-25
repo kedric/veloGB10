@@ -1404,6 +1404,298 @@ extern "C" __global__ void gdn_prep_b(const __nv_bfloat16* __restrict__ qkv,
     }
 }
 
+// GB10_GDN_CHUNK2 (2026-08-26): tensor-core chunked GDN prefill scan — the chunk math of
+// gdn_chunk_prefill_b (o/S rel-L2 7.6e-5 scalar) with every GEMM phase on mma.m16n8k16
+// bf16 (probe: tool_probe/gdn_chunk_tc.cu, 9.4 ms/layer at N=8192 vs 198 sequential = 21x;
+// o/S rel-L2 ~2.2e-2 vs the f32 seq oracle = the bf16-operand envelope, non-compounding
+// over N=32..8192). Consumes the SAME gdn_prep_b P0 scratch; S carried in bf16 across
+// chunks (FLA precedent). Host dispatches only for kd==128 && vd==128 && n>=256.
+__device__ __forceinline__ unsigned gtc_pack2(float lo, float hi) {
+    __nv_bfloat162 v = __float22bfloat162_rn(make_float2(lo, hi));
+    return *reinterpret_cast<unsigned*>(&v);
+}
+__device__ __forceinline__ void gtc_mma(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#define GTC_C 32
+#define GTC_VC 64
+#define GTC_KD2 (128 + 8)
+#define GTC_CD2 (GTC_C + 8)
+#define GTC_VD2 (GTC_VC + 8)
+#define GTC_THR 256
+extern "C" __global__ __launch_bounds__(GTC_THR, 1) void gdn_chunk_tc_b(
+    __nv_bfloat16* __restrict__ core, float* __restrict__ state,
+    const float* __restrict__ Qs, const float* __restrict__ Ks,
+    const float* __restrict__ Vs, const float* __restrict__ Ps,
+    int kd_vd, int N_nkh)
+{
+    const int kd = kd_vd & 0xFFFF;
+    const int vd = kd_vd >> 16;
+    (void)kd; (void)vd;              // host-guaranteed 128/128; tiles below are compile-time
+    const int N = N_nkh & 0xFFFFFF;
+    const int ncb = GTC_VC == 64 ? 2 : 1;
+    const int NH_ = (int)(gridDim.x / ncb);
+    const int C = GTC_C, VC = GTC_VC, KD = 128, VD = 128, KD2 = GTC_KD2, CD2 = GTC_CD2, VD2 = GTC_VD2;
+    const int head = blockIdx.x / ncb;
+    const int bb0 = (blockIdx.x % ncb) * VC;
+    const int t = threadIdx.x;
+    const int warp = t >> 5, lane = t & 31;
+    const int g = lane >> 2, tq = lane & 3;      // fragment coords
+
+    extern __shared__ unsigned char gtc_dyn[];
+    __nv_bfloat16* Qb = (__nv_bfloat16*)gtc_dyn;                        // [C][KD2]
+    __nv_bfloat16* Kb = Qb + C * KD2;                      // [C][KD2]
+    __nv_bfloat16* Kt = Kb + C * KD2;                      // [KD][CD2] (transposed K)
+    __nv_bfloat16* Vb = Kt + KD * CD2;                     // [C][VD2]
+    __nv_bfloat16* Db = Vb + C * VD2;                      // [C][CD2]
+    __nv_bfloat16* Ub = Db + C * CD2;                      // [C][VD2]  (unscaled U)
+    __nv_bfloat16* Ulb = Ub + C * VD2;                     // [C][VD2]  (lambda-scaled U)
+    __nv_bfloat16* Sb = Ulb + C * VD2;                     // [KD][VD2]
+    float* Af = (float*)(Sb + KD * VD2);          // [C][C]
+    float* Wf = Af + C * C;                       // [C][VC]
+    float* Of = Wf + C * VC;                      // [C][VC]
+    float* bt = Of + C * VC;                      // [C]
+    float* lg = bt + C;                           // [C+1]
+
+    const float* S_in = state + ((long long)head * KD) * VD + bb0;
+    for (int i = t; i < KD * VC; i += GTC_THR) {
+        int r = i / VC, c = i % VC;
+        Sb[r * VD2 + c] = f2b(S_in[(long long)r * VD + c]);
+    }
+    __syncthreads();
+
+    for (int c0 = 0; c0 < N; c0 += C) {
+        const int n = min(C, N - c0);
+        // ---- stage: prep f32 -> bf16 tiles; pads zero ----
+        for (int i = t; i < n * KD; i += GTC_THR) {
+            int tt = i / KD, r = i % KD;
+            const long long base = ((long long)(c0 + tt) * NH_ + head);
+            Qb[tt * KD2 + r] = f2b(Qs[base * 132 + r]);
+            const float kv = Ks[base * 132 + r];
+            Kb[tt * KD2 + r] = f2b(kv);
+            Kt[r * CD2 + tt] = f2b(kv);
+        }
+        for (int i = t; i < n * VC; i += GTC_THR) {
+            int tt = i / VC, c = i % VC;
+            const long long base = ((long long)(c0 + tt) * NH_ + head);
+            Vb[tt * VD2 + c] = f2b(Vs[base * 128 + bb0 + c]);
+        }
+        __syncthreads();
+        for (int i = t; i < (C - n) * KD; i += GTC_THR) {
+            int tt = n + i / KD, r = i % KD;
+            Qb[tt * KD2 + r] = f2b(0.f); Kb[tt * KD2 + r] = f2b(0.f); Kt[r * CD2 + tt] = f2b(0.f);
+        }
+        for (int i = t; i < (C - n) * VC; i += GTC_THR) {
+            Vb[(n + i / VC) * VD2 + (i % VC)] = f2b(0.f);
+        }
+        __syncthreads();
+        for (int i = t; i < C; i += GTC_THR) {
+            if (i < n) {
+                const long long base = ((long long)(c0 + i) * NH_ + head);
+                bt[i] = Ps[base * 2 + 0]; lg[i + 1] = Ps[base * 2 + 1];
+            } else { bt[i] = 0.f; lg[i + 1] = 0.f; }
+        }
+        __syncthreads();
+        if (warp == 0 && lane < C) {              // inclusive scan (one warp)
+            float v = lg[lane + 1];
+#pragma unroll
+            for (int o = 1; o < C; o <<= 1) {
+                float u = __shfl_up_sync(0xFFFFFFFFu, v, o);
+                if ((int)lane >= o) v += u;
+            }
+            lg[lane + 1] = v;
+        }
+        if (t == 0) lg[0] = 0.f;
+        __syncthreads();
+
+        // ---- A / D grams (mma, out 32x32 = 8 tiles, one per warp; k=128) ----
+        {
+            const int mt = warp >> 2, nt = warp & 3;
+            float accA[4] = {0,0,0,0}, accD[4] = {0,0,0,0};
+            for (int ks = 0; ks < KD; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq, s_row = nt * 8 + g;
+                unsigned aK[4] = {
+                    *(const unsigned*)(Kb + r0 * KD2 + cc), *(const unsigned*)(Kb + r1 * KD2 + cc),
+                    *(const unsigned*)(Kb + r0 * KD2 + cc + 2), *(const unsigned*)(Kb + r1 * KD2 + cc + 2)};
+                unsigned aQ[4] = {
+                    *(const unsigned*)(Qb + r0 * KD2 + cc), *(const unsigned*)(Qb + r1 * KD2 + cc),
+                    *(const unsigned*)(Qb + r0 * KD2 + cc + 2), *(const unsigned*)(Qb + r1 * KD2 + cc + 2)};
+                unsigned bK[2] = {
+                    gtc_pack2(b2f(Kb[s_row * KD2 + cc]), b2f(Kb[s_row * KD2 + cc + 1])),
+                    gtc_pack2(b2f(Kb[s_row * KD2 + cc + 2]), b2f(Kb[s_row * KD2 + cc + 3]))};
+                gtc_mma(accA, aK, bK);
+                gtc_mma(accD, aQ, bK);
+            }
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = mt * 16 + g + 8 * (e >= 2);
+                const int scol = nt * 8 + 2 * tq + (e & 1);
+                Af[row * C + scol] = (scol < row) ? accA[e] * __expf(lg[row] - lg[scol + 1]) : 0.f;
+                Db[row * CD2 + scol] =
+                    (scol <= row && scol < n) ? f2b(accD[e] * __expf(lg[row + 1] - lg[scol + 1])) : f2b(0.f);
+            }
+        }
+        __syncthreads();
+
+        // ---- W = V - exp(lg[tt+1]) * (K S) (mma, out 32x64 = 2 tiles/warp; k=128) ----
+        {
+            const int mt = warp >> 2, nt0 = (warp & 3) * 2;
+            float acc[2][4] = {{0,0,0,0},{0,0,0,0}};
+            for (int ks = 0; ks < KD; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+                unsigned aK[4] = {
+                    *(const unsigned*)(Kb + r0 * KD2 + cc), *(const unsigned*)(Kb + r1 * KD2 + cc),
+                    *(const unsigned*)(Kb + r0 * KD2 + cc + 2), *(const unsigned*)(Kb + r1 * KD2 + cc + 2)};
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int col = (nt0 + j) * 8 + g;
+                    unsigned bS[2] = {
+                        gtc_pack2(b2f(Sb[(ks + 4 * tq) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 1) * VD2 + col])),
+                        gtc_pack2(b2f(Sb[(ks + 4 * tq + 2) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 3) * VD2 + col]))};
+                    gtc_mma(acc[j], aK, bS);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                    const float v = (row < n) ? b2f(Vb[row * VD2 + col]) : 0.f;
+                    Wf[row * VC + col] = v - __expf(lg[row + 1]) * acc[j][e];
+                }
+        }
+        __syncthreads();
+
+        // ---- U = (I + diag(beta)A)^-1 (beta . W): fwd-subst in place, parallel cols ----
+        for (int c = t; c < VC; c += GTC_THR) {
+            for (int tt = 0; tt < n; tt++) {
+                const float b = bt[tt];
+                float acc = b * Wf[tt * VC + c];
+                for (int s = 0; s < tt; s++) acc -= b * Af[tt * C + s] * Wf[s * VC + c];
+                Wf[tt * VC + c] = acc;
+            }
+        }
+        __syncthreads();
+
+        // ---- materialize Ub (unscaled) and Ulb (lambda_s = exp(lg[n]-lg[s+1])) ----
+        {
+            const float gn = __expf(lg[n]);
+            for (int i = t; i < C * VC; i += GTC_THR) {
+                int s = i / VC, c = i % VC;
+                const float u = (s < n) ? Wf[s * VC + c] : 0.f;
+                Ub[s * VD2 + c] = f2b(u);
+                Ulb[s * VD2 + c] = f2b(u * __expf(lg[n] - lg[s + 1]));
+            }
+            (void)gn;
+        }
+        __syncthreads();
+
+        // ---- O = exp(lg[tt+1]) * (Q S) + (D U) (mma; QS k=128 then DU k=C accumulates) ----
+        {
+            const int mt = warp >> 2, nt0 = (warp & 3) * 2;
+            float acc[2][4] = {{0,0,0,0},{0,0,0,0}};
+            for (int ks = 0; ks < KD; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+                unsigned aQ[4] = {
+                    *(const unsigned*)(Qb + r0 * KD2 + cc), *(const unsigned*)(Qb + r1 * KD2 + cc),
+                    *(const unsigned*)(Qb + r0 * KD2 + cc + 2), *(const unsigned*)(Qb + r1 * KD2 + cc + 2)};
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int col = (nt0 + j) * 8 + g;
+                    unsigned bS[2] = {
+                        gtc_pack2(b2f(Sb[(ks + 4 * tq) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 1) * VD2 + col])),
+                        gtc_pack2(b2f(Sb[(ks + 4 * tq + 2) * VD2 + col]), b2f(Sb[(ks + 4 * tq + 3) * VD2 + col]))};
+                    gtc_mma(acc[j], aQ, bS);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                    acc[j][e] = __expf(lg[row + 1]) * acc[j][e];
+                }
+            for (int ks = 0; ks < C; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+                unsigned aD[4] = {
+                    *(const unsigned*)(Db + r0 * CD2 + cc), *(const unsigned*)(Db + r1 * CD2 + cc),
+                    *(const unsigned*)(Db + r0 * CD2 + cc + 2), *(const unsigned*)(Db + r1 * CD2 + cc + 2)};
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int col = (nt0 + j) * 8 + g;
+                    unsigned bU[2] = {
+                        gtc_pack2(b2f(Ub[(ks + 4 * tq) * VD2 + col]), b2f(Ub[(ks + 4 * tq + 1) * VD2 + col])),
+                        gtc_pack2(b2f(Ub[(ks + 4 * tq + 2) * VD2 + col]), b2f(Ub[(ks + 4 * tq + 3) * VD2 + col]))};
+                    gtc_mma(acc[j], aD, bU);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 2; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    if (row < n) {
+                        const int col = (nt0 + j) * 8 + 2 * tq + (e & 1);
+                        core[(long long)(c0 + row) * (NH_ * 128) + head * 128 + bb0 + col] = f2b(acc[j][e]);
+                    }
+                }
+        }
+        __syncthreads();
+
+        // ---- S' = gamma S + Kt . Ulb  (mma out KD x VC = 8 tiles/warp; k=C) ----
+        {
+            const int mt = warp;                   // 8 m-tiles of 16 kd-rows
+            const float gam = __expf(lg[n]);
+            float acc[8][4];
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = j * 8 + 2 * tq + (e & 1);
+                    acc[j][e] = gam * b2f(Sb[row * VD2 + col]);
+                }
+            for (int ks = 0; ks < C; ks += 16) {
+                const int r0 = mt * 16 + g, r1 = r0 + 8, cc = ks + 4 * tq;
+                unsigned aKt[4] = {
+                    *(const unsigned*)(Kt + r0 * CD2 + cc), *(const unsigned*)(Kt + r1 * CD2 + cc),
+                    *(const unsigned*)(Kt + r0 * CD2 + cc + 2), *(const unsigned*)(Kt + r1 * CD2 + cc + 2)};
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int col = j * 8 + g;
+                    unsigned bU[2] = {
+                        gtc_pack2(b2f(Ulb[(ks + 4 * tq) * VD2 + col]), b2f(Ulb[(ks + 4 * tq + 1) * VD2 + col])),
+                        gtc_pack2(b2f(Ulb[(ks + 4 * tq + 2) * VD2 + col]), b2f(Ulb[(ks + 4 * tq + 3) * VD2 + col]))};
+                    gtc_mma(acc[j], aKt, bU);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = mt * 16 + g + 8 * (e >= 2);
+                    const int col = j * 8 + 2 * tq + (e & 1);
+                    Sb[row * VD2 + col] = f2b(acc[j][e]);
+                }
+        }
+        __syncthreads();
+    }
+
+    // writeback final state (bf16 -> f32)
+    float* S_out = state + ((long long)head * KD) * VD + bb0;
+    for (int i = t; i < KD * VC; i += GTC_THR) {
+        int r = i / VC, c = i % VC;
+        S_out[(long long)r * VD + c] = b2f(Sb[r * VD2 + c]);
+    }
+}
+
+
 // Template body: OLDSTAGE=false is the serving path (P0 dense-scratch staging from gdn_prep_b);
 // OLDSTAGE=true is a DIAGNOSTIC variant with the pre-P0 in-kernel staging (normalize + serial
 // dots from qkv/b_in/a_in, scratch args ignored) — selected by GB10_GDN_OLDSTAGE at load, used
@@ -2913,6 +3205,325 @@ extern "C" __global__ void attn_tile_init(float* O, float* mrun, float* lrun, in
     const long long nml = (long long)nh * Br;
     if (idx < nml) { mrun[idx] = -1e30f; lrun[idx] = 0.0f; }
 }
+
+// ---- attn_prefill_fa_b: fused flash-attention prefill (ONE launch replaces the QK^T/softmax/PV
+// tile walk of attn_prefill_tiled; no S/P global materialization, no per-tile init/finalize) ----
+//
+// Prefill ONLY — gated by GB10_FA_PREFILL=1 and n >= PF_MIN at the Rust call site; the tiled path
+// below it stays the default and the verify path is untouched (verify never reaches PF_MIN).
+//
+// Semantics = the attn_softmax_tile/attn_finalize numerics, one pass in registers:
+//   score = (Q[t,hh,:] . K[kvh,k,:]) * rsqrt(hd);  online softmax with running (m, l, O);
+//   Out = O / l.  Keys 0..pos_start+t inclusive (causal, chunked prefill — the prefix is already
+//   in the cache from earlier chunks + write_kv_prefill).
+//
+// Layouts (identical to the cuBLAS calls it replaces):
+//   Q  bf16 row-major  [N, nh*hd]        Q[t,hh,d]  = q + (t*nh+hh)*hd + d
+//   K,V bf16 head-major [nkv, stride, hd] K[h,k,d]  = kc + (h*stride+k)*hd + d
+//   Out bf16 [N, nh*hd]                  (same as Q)
+//
+// THIS BODY IS THE SCALAR REFERENCE ORACLE (warp-per-row), validated relL2 2.3e-05 vs a host
+// reference across (N,pos_start) = (256,0),(130,0),(256,512),(130,501) on .13. It is the
+// correctness fallback for geometries the tensor-core kernel does not cover.
+extern "C" __global__ void attn_prefill_fa_sc_b(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V, __nv_bfloat16* __restrict__ Out,
+    int N, int nh, int nkv, int hd, int stride, int pos_start)
+{
+    const int WARPS = 8;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int gqa = nh / nkv;
+    const int qhead = blockIdx.y;
+    const int kvh  = qhead / gqa;
+    const int t = blockIdx.x * WARPS + warp;
+    if (t >= N) return;
+    const int qpos = pos_start + t;
+    const int dpl = hd / 32;                       // dims per lane (8 at hd=256)
+    const __nv_bfloat16* Qp = Q + ((long long)t * nh + qhead) * hd;
+    float qv[8];
+    for (int i = 0; i < dpl; i++) qv[i] = b2f(Qp[lane * dpl + i]);
+    float m = -1e30f, l = 0.0f;
+    float ov[8];
+    for (int i = 0; i < dpl; i++) ov[i] = 0.0f;
+    const float inv_sqrt_hd = rsqrtf((float)hd);
+    const __nv_bfloat16* Kb = K + (long long)kvh * stride * hd;
+    const __nv_bfloat16* Vb = V + (long long)kvh * stride * hd;
+    for (int k = 0; k <= qpos; k++) {
+        const __nv_bfloat16* Kp = Kb + (long long)k * hd;
+        const __nv_bfloat16* Vp = Vb + (long long)k * hd;
+        float kv[8], vv[8];
+        for (int i = 0; i < dpl; i++) { kv[i] = b2f(Kp[lane * dpl + i]); vv[i] = b2f(Vp[lane * dpl + i]); }
+        float dot = 0.f;
+        for (int i = 0; i < dpl; i++) dot += qv[i] * kv[i];
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        float score = dot * inv_sqrt_hd;
+        float m_new = fmaxf(m, score);
+        float alpha = __expf(m - m_new);
+        float p = __expf(score - m_new);
+        l = l * alpha + p;
+        for (int i = 0; i < dpl; i++) ov[i] = ov[i] * alpha + p * vv[i];
+        m = m_new;
+    }
+    for (int i = 0; i < dpl; i++) {
+        const int d = lane * dpl + i;
+        if (d < hd)
+            Out[((long long)t * nh + qhead) * hd + d] = f2b(l > 0.0f ? ov[i] / l : 0.0f);
+    }
+}
+
+// ---- attn_prefill_fa_b: FUSED FLASH-ATTENTION PREFILL, TENSOR-CORE BODY ----
+// Implements PLAN/FA_KERNEL_EXPERT_REPORT.md (measured on .13: 15.3/44.7/74.0/103.5 ms at
+// N=8192, pc=8K/16K/24K/32K — 4.0x under the 3-kernel path's per-call bar at every geometry,
+// ~54 TF/s effective vs the ~75 TF/s bf16 mma ceiling).
+//
+// Config (report §0): block 192 thr (6 warps) x M=96 rows = 16 tokens x 6 GQA heads
+// (token-major; the g heads share the K/V smem tiles = guaranteed 6x reuse), Bc=32 keys
+// double-buffered via cp.async (64 KiB dynamic smem, opt-in from Rust), Q+O in registers
+// (~255 regs, 4 B spill at hd=256), K ldmatrix NO-transpose (K[key][d] IS B .col), V .trans,
+// P->A repack in-register (zero permutations — D-frag col pattern == A-frag k pattern).
+// Online-softmax guards replicate attn_softmax_tile exactly (sentinels, any-guard,
+// alpha==1.0f rescale skip, l>0 epilogue). P is rounded to bf16 before PV — the SAME rounding
+// point as the production tiled path's bf16 p_buf.
+//
+// Correctness (tool_probe/fa_tc.cu harness, .13): relL2 1.9e-3 vs an fp32 host ref = the bf16-P
+// quantization envelope (2^-9), verified by a peaky-softmax structural test (error collapses to
+// 1-output-ulp flips concentrated on few-key rows; hd=128 identical). Layouts identical to the
+// tiled path; hd must be 128 or 256 (host dispatches, other hd -> scalar/old path); g must
+// divide 96 (g=6 -> 16 tokens/block).
+__device__ __forceinline__ unsigned fa_cvt2(float lo, float hi) {
+    __nv_bfloat162 v = __float22bfloat162_rn(make_float2(lo, hi));
+    return *reinterpret_cast<unsigned*>(&v);
+}
+__device__ __forceinline__ void fa_mma_m16n8k16(float* d, const unsigned* a, const unsigned* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+__device__ __forceinline__ void fa_ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void fa_ldm_x4_trans(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void fa_cp16(__nv_bfloat16* dst, const __nv_bfloat16* src, bool full) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(dst);
+    const int sz = full ? 16 : 0;               // src-size 0 => 16 B zero-fill (cache bound)
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(s), "l"(src), "r"(sz));
+}
+
+#define FA_BC 32
+#define FA_THREADS 192
+
+template <int HD>
+__device__ __forceinline__ void fa_tc_body(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V, __nv_bfloat16* __restrict__ Out,
+    int N, int nh, int nkv, int stride, int pos_start, int g, __nv_bfloat16* smem)
+{
+    const int Br_t = 96 / g;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = (int)threadIdx.x;
+    const int kvh  = blockIdx.y;
+    const int t0   = (int)(gridDim.x - 1 - blockIdx.x) * Br_t;   // longest blocks first
+    const int pc   = pos_start + N;
+    const int kmax = min(pos_start + t0 + Br_t - 1, pc - 1);
+
+    const int rr0 = 16*warp + (lane >> 2), rr1 = rr0 + 8;
+    const int ttok0 = t0 + rr0 / g, ttok1 = t0 + rr1 / g;
+    const int hed0 = kvh*g + rr0 % g, hed1 = kvh*g + rr1 % g;
+    const int ctok0 = min(ttok0, N-1), ctok1 = min(ttok1, N-1);   // dead rows: safe loads, no stores
+    const long long qb0 = ((long long)ctok0 * nh + hed0) * HD;
+    const long long qb1 = ((long long)ctok1 * nh + hed1) * HD;
+    const int qpos0 = pos_start + ttok0, qpos1 = pos_start + ttok1;
+
+    unsigned qf[HD/16][4];
+    #pragma unroll
+    for (int ks = 0; ks < HD/16; ks++) {
+        const int doff = 16*ks + 2*(lane & 3);
+        qf[ks][0] = *(const unsigned*)(Q + qb0 + doff);
+        qf[ks][1] = *(const unsigned*)(Q + qb1 + doff);
+        qf[ks][2] = *(const unsigned*)(Q + qb0 + doff + 8);
+        qf[ks][3] = *(const unsigned*)(Q + qb1 + doff + 8);
+    }
+
+    float o[HD/8][4];
+    #pragma unroll
+    for (int j = 0; j < HD/8; j++) o[j][0]=o[j][1]=o[j][2]=o[j][3]=0.f;
+    float m0=-1e30f, m1=-1e30f, l0=0.f, l1=0.f;
+    const float rsqrt_hd = rsqrtf((float)HD);
+
+    auto load_tile = [&](int stage, int s0g) {
+        #pragma unroll 4
+        for (int c = tid; c < FA_BC * (HD >> 3); c += FA_THREADS) {
+            const int key = c / (HD >> 3), chunk = c % (HD >> 3);
+            const int gkey = s0g + key;
+            const bool valid = gkey < pc;
+            const int gk = min(gkey, pc - 1);
+            const int cs = (chunk & 24) | ((chunk & 7) ^ (key & 7));   // Swizzle<3,3,3>
+            __nv_bfloat16* kd = smem + (stage * FA_BC + key) * HD + (cs << 3);
+            __nv_bfloat16* vd = smem + ((2 + stage) * FA_BC + key) * HD + (cs << 3);
+            const __nv_bfloat16* gkP = K + ((long long)kvh * stride + gk) * HD + (chunk << 3);
+            const __nv_bfloat16* gvP = V + ((long long)kvh * stride + gk) * HD + (chunk << 3);
+            fa_cp16(kd, gkP, valid);
+            fa_cp16(vd, gvP, valid);
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+
+    load_tile(0, 0);
+    if (FA_BC <= kmax) load_tile(1, FA_BC);
+
+    for (int s0 = 0; s0 <= kmax; s0 += FA_BC) {
+        const int stage = (s0 / FA_BC) & 1;
+        if (s0 + FA_BC <= kmax) asm volatile("cp.async.wait_group 1;");   // retire tile s0's group
+        else                    asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+
+        // ===== QK^T =====
+        float s[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
+        {
+            const __nv_bfloat16* Kb = smem + stage * FA_BC * HD;
+            #pragma unroll
+            for (int ks = 0; ks < HD/16; ks++) {
+                #pragma unroll
+                for (int j2 = 0; j2 < 2; j2++) {
+                    int lkey, ldim;
+                    if (lane < 8)       { lkey = 16*j2 + lane;         ldim = 16*ks; }
+                    else if (lane < 16) { lkey = 16*j2 + lane - 8;     ldim = 16*ks + 8; }
+                    else if (lane < 24) { lkey = 16*j2 + 8 + lane-16;  ldim = 16*ks; }
+                    else                { lkey = 16*j2 + 8 + lane-24;  ldim = 16*ks + 8; }
+                    const int chunk = ldim >> 3;
+                    const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                    const unsigned addr = (unsigned)__cvta_generic_to_shared(Kb + lkey*HD + (cs << 3));
+                    unsigned r0, r1, r2, r3;
+                    fa_ldm_x4(r0, r1, r2, r3, addr);
+                    const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                    fa_mma_m16n8k16(s[2*j2],   qf[ks], ba);
+                    fa_mma_m16n8k16(s[2*j2+1], qf[ks], bb);
+                }
+            }
+        }
+
+        // ===== online softmax (attn_softmax_tile guards) =====
+        const bool masked_tile = (s0 + FA_BC > pos_start + t0);
+        float mx0 = -1e30f, mx1 = -1e30f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float v = s[j][e] * rsqrt_hd;
+                if (masked_tile) {
+                    const int key = s0 + 8*j + 2*(lane&3) + (e&1);
+                    if (key > (e < 2 ? qpos0 : qpos1)) v = -1e30f;
+                }
+                s[j][e] = v;
+                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+            }
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(~0u, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(~0u, mx1, 2));
+        const bool any0 = mx0 > -1e29f, any1 = mx1 > -1e29f;
+        const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
+        const float al0 = (any0 && m0 > -1e29f) ? __expf(m0 - mn0) : (any0 ? 0.f : 1.f);
+        const float al1 = (any1 && m1 > -1e29f) ? __expf(m1 - mn1) : (any1 ? 0.f : 1.f);
+        float su0 = 0.f, su1 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const float p = (s[j][e] > -1e29f) ? __expf(s[j][e] - (e < 2 ? mn0 : mn1)) : 0.f;
+                s[j][e] = p;
+                if (e < 2) su0 += p; else su1 += p;
+            }
+        }
+        su0 += __shfl_xor_sync(~0u, su0, 1); su0 += __shfl_xor_sync(~0u, su0, 2);
+        su1 += __shfl_xor_sync(~0u, su1, 1); su1 += __shfl_xor_sync(~0u, su1, 2);
+        l0 = l0*al0 + su0;  m0 = mn0;
+        l1 = l1*al1 + su1;  m1 = mn1;
+
+        if (al0 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD/8; j++) { o[j][0] *= al0; o[j][1] *= al0; }
+        }
+        if (al1 != 1.0f) {
+            #pragma unroll
+            for (int j = 0; j < HD/8; j++) { o[j][2] *= al1; o[j][3] *= al1; }
+        }
+
+        // ===== P->A in-register repack + PV =====
+        unsigned pa[2][4];
+        #pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            pa[ks][0] = fa_cvt2(s[2*ks  ][0], s[2*ks  ][1]);
+            pa[ks][1] = fa_cvt2(s[2*ks  ][2], s[2*ks  ][3]);
+            pa[ks][2] = fa_cvt2(s[2*ks+1][0], s[2*ks+1][1]);
+            pa[ks][3] = fa_cvt2(s[2*ks+1][2], s[2*ks+1][3]);
+        }
+        {
+            const __nv_bfloat16* Vb = smem + (2 + stage) * FA_BC * HD;
+            #pragma unroll
+            for (int ks = 0; ks < 2; ks++) {
+                #pragma unroll
+                for (int jn = 0; jn < HD/16; jn++) {
+                    int lkey, ldim;
+                    if (lane < 8)       { lkey = 16*ks + lane;         ldim = 16*jn; }
+                    else if (lane < 16) { lkey = 16*ks + 8 + lane - 8; ldim = 16*jn; }
+                    else if (lane < 24) { lkey = 16*ks + lane - 16;    ldim = 16*jn + 8; }
+                    else                { lkey = 16*ks + 8 + lane-24;  ldim = 16*jn + 8; }
+                    const int chunk = ldim >> 3;
+                    const int cs = (chunk & 24) | ((chunk & 7) ^ (lkey & 7));
+                    const unsigned addr = (unsigned)__cvta_generic_to_shared(Vb + lkey*HD + (cs << 3));
+                    unsigned r0, r1, r2, r3;
+                    fa_ldm_x4_trans(r0, r1, r2, r3, addr);
+                    const unsigned ba[2] = {r0, r1}, bb[2] = {r2, r3};
+                    fa_mma_m16n8k16(o[2*jn],   pa[ks], ba);
+                    fa_mma_m16n8k16(o[2*jn+1], pa[ks], bb);
+                }
+            }
+        }
+
+        __syncthreads();                                  // warps done reading buf[stage]
+        if (s0 + 2*FA_BC <= kmax) load_tile(stage, s0 + 2*FA_BC);
+    }
+
+    const float il0 = (l0 > 0.f) ? 1.f/l0 : 0.f;
+    const float il1 = (l1 > 0.f) ? 1.f/l1 : 0.f;
+    if (ttok0 < N) {
+        const long long ob = ((long long)ttok0 * nh + hed0) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD/8; j++)
+            *(__nv_bfloat162*)(Out + ob + 8*j + 2*(lane&3)) =
+                __float22bfloat162_rn(make_float2(o[j][0]*il0, o[j][1]*il0));
+    }
+    if (ttok1 < N) {
+        const long long ob = ((long long)ttok1 * nh + hed1) * HD;
+        #pragma unroll
+        for (int j = 0; j < HD/8; j++)
+            *(__nv_bfloat162*)(Out + ob + 8*j + 2*(lane&3)) =
+                __float22bfloat162_rn(make_float2(o[j][2]*il1, o[j][3]*il1));
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(FA_THREADS, 1) attn_prefill_fa_b(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V, __nv_bfloat16* __restrict__ Out,
+    int N, int nh, int nkv, int hd, int stride, int pos_start, int g)
+{
+    extern __shared__ __nv_bfloat16 fa_smem[];    // K[2][32][hd] then V[2][32][hd], opt-in >48 KiB
+    if (hd == 256)      fa_tc_body<256>(Q, K, V, Out, N, nh, nkv, stride, pos_start, g, fa_smem);
+    else if (hd == 128) fa_tc_body<128>(Q, K, V, Out, N, nh, nkv, stride, pos_start, g, fa_smem);
+    // other hd: caller must route to attn_prefill_fa_sc_b / the tiled path
+}
+
+
 
 // ---- conv1d prefill: FULLY PARALLEL over (channel, position) ----
 // in: [conv_dim, N] bf16 col-major; out: [conv_dim, N] bf16; state: [conv_dim, k] f32; w: [conv_dim, k] f32

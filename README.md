@@ -161,7 +161,8 @@ required files, launch commands, and expected output) are in
 **[HY3_SETUP.md](HY3_SETUP.md)**. Managing the engine's TP model cache is documented in
 **[MANAGING_CACHE.md](MANAGING_CACHE.md)**. If you want to see how the stack holds up under a long
 run, there's an **8-hour endurance report** — throughput, latency, determinism, and thermals over a
-mixed workload — in **[ENDURANCE_REPORT.md](ENDURANCE_REPORT.md)**.
+mixed workload — in **[ENDURANCE_REPORT.md](ENDURANCE_REPORT.md)**. Release-by-release highlights are
+in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ### Notes
 
@@ -170,10 +171,8 @@ mixed workload — in **[ENDURANCE_REPORT.md](ENDURANCE_REPORT.md)**.
   the head** and about **20 GB on each node**, so each GB10 still has plenty of headroom to run other
   processes. On a fully idle DGX Spark (~113 GB available) the steady-state estimate for the model is
   far under the machine's total memory.
-- **Vision is NOT supported yet on any model.** Image/video input is in the pipeline and will be
-  released as soon as it is ready, but current artifacts are text-only. The Qwen3.8 27B checkpoint
-  ships a vision tower, but it is not yet validated end-to-end — see the model card for the exact
-  status.
+- **Vision is supported.** Image input runs on the GPU vision tower, with a `--vision-cpu` escape
+  to the CPU reference path. PNG/JPEG/WebP/GIF images are supported.
 
 ---
 
@@ -266,12 +265,15 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 
 ## What it does today
 
-- **OpenAI-compatible server** — streaming, tool calling (with schema-aware argument coercion),
-  seedable sampling, continuous batching, prefix caching.
+- **OpenAI-compatible server** — streaming, tool calling (schema-aware argument coercion, with a
+  single canonical serializer across streaming and non-streaming), seedable sampling, continuous
+  batching, prefix caching.
+- **Vision** — image input on a GPU vision tower (`--vision-cpu` for the CPU reference path);
+  PNG/JPEG/WebP/GIF.
 - **MTP speculative decoding** — native multi-token prediction heads with an auto-depth policy
   that measures its own cost/acceptance trade-off live and re-picks depth (or disables itself)
   per workload. No configuration required.
-- **Two-node TP=2 serving** — see below.
+- **Two-node / four-node TP serving** — see below.
 - **NVFP4 / FP8 mixed-precision quantization** — offline quantizer producing HF-compatible
   compressed-tensors artifacts; NVFP4 tensor-core GEMMs for the serving path.
 - **Long context** — chunked prefill; 32K-class envelopes validated end-to-end on TP=2;
@@ -418,6 +420,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 | `--max-batch <N>` | 8 | Max concurrent sequences (lanes) |
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
+| `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
@@ -455,7 +458,10 @@ TP environment variables (read on the head, shipped to the node at sync; a node 
 Other single-node env vars: `GB10_RDMA_DEV` (device override), `RUST_INFER_ZERO_KV=1` (restore
 cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
 `GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
-`GB10_TP_TRACE=1` (per-barrier timing histograms at exit).
+`GB10_TP_TRACE=1` (per-barrier timing histograms at exit). Opt-in prefill levers (default off):
+`GB10_FA_PREFILL=1` (tensor-core flash-attention prefill), `GB10_MXFP4_PREFILL=1` (v2 W4A4 prefill
+GEMM), `GB10_GDN_CHUNK=1` / `GB10_GDN_CHUNK2=1` (GDN tensor-core chunked scan); these change the
+prefill path and are on by default only where the gates hold.
 
 ### Probes (diagnostics)
 
@@ -550,7 +556,7 @@ This project does not link extensively against any other project (other than the
 Areas that are in flight or planned. These are tracked openly — progress and timelines are as honest as I can make them, and this list changes as work lands.
 
 - **Fix Tencent Hy3 support.** Hy3 regressed over the last few weeks as the engine evolved; restoring it to a fully working, gated state is a priority.
-- **Vision support for all Qwen models.** Image/video input is not supported yet on any model. It's in the pipeline and will ship once it's validated end-to-end.
+- **Broaden vision coverage.** Vision is supported; work remains to bring it to the full set of Qwen models and harden it further.
 - **Qwen3.5 397B MoE (incl. Ornith 1.5).** Large-model port; the engine already serves this architecture at 122B, so the work is the TP=2/TP=4 capacity bring-up (large weight footprint) plus the correctness gates at that size.
 - **DeepSeek V4 Flash DSpark.** Work has started but it's far from complete or optimized. The goal is to beat all competition on decode speed across 2× and 4× GB10.
 - **Other Qwen 3.8 variants.** If a 122B or other Qwen 3.8-size model fits on 1×, 2×, or 4× Spark, it's likely to be picked up next.

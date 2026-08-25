@@ -700,3 +700,244 @@ extern "C" __global__ void mxfp4_repack_rm_b(
         Srm[si] = Sct[((long long)(row >> 4) * nblk + blk) * 16 + (row & 15)];
     }
 }
+
+// ---------------------------------------------------------------------------
+// P4 TTFT (2026-08-25): OMMA-native PREFILL GEMM v2 + batched act quantizer.
+// Champion lineage: tool_probe/mxf4_gemm_v2b_champ.cu — MATCH relL2 1.654e-3 vs f64
+// oracle, 213-253 TF/s (old W4A4 path: 94.6 @2048; nvjet bf16: 100). Key facts
+// (measured, PLAN/13):
+//   * OMMA mxf4nvf4 issue latency ~45-90 cyc/warp: 8 warps/SM cap ~150 TF/s. 16 warps
+//     (2 blocks x 8, acc 64 = 32x64 warp tile) reach 230-287 compute-only.
+//   * LDGSTS returns 16 B/cyc/SM on L2 hits; first-touch Wt misses cap fill at ~4.7 B/cyc
+//     unless the token-fastest raster makes 8 co-resident blocks share each Wt tile.
+//   * ptxas sm_121f can DROP mma D-fragment stores under acc-128 full-unroll pressure —
+//     acc-64 configs have not shown it; the engine-side CHECK mode + xchain gates watch.
+//   * SFB lane packing: word (q,ks,lane) is read at every lane but only t==0 lanes are
+//     consumed (token g = lane>>2); quantizer writes real bytes on t==0, 0 elsewhere.
+// A = weights (m = feature, Aimg/SFAw/gs); B = acts (n = token, Bp/SFB). Out token-major.
+// Constraints: Mf%128==0, K%256==0, Nt%128==0 (caller pads Nt to 128).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void mxfp4_quant_pack_prefill_b(
+    const bf16* __restrict__ X, int K, int M, int Mpad,
+    uint32_t* __restrict__ Bp, uint32_t* __restrict__ SFB)
+{
+    // Batched port of mxfp4_quant_pack_b (decode-proven arithmetic, statement-identical):
+    // grid (nks, Mpad/8); block 256 = 8 token rows x 32 lanes; rows >= M zero-fill
+    // (padded rows produce zero nibbles + zero scales -> exact 0 contributions).
+    const int ks = blockIdx.x, q = blockIdx.y;
+    const int nks = gridDim.x;
+    const int n = threadIdx.x >> 5;          // token 0..7 within the group
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int row = q * 8 + n;
+    __shared__ float sh[8][64];
+    if (row < M) {
+        const bf16* xr = X + (long long)row * K + (long long)ks * 64;
+#pragma unroll
+        for (int i = 0; i < 2; i++) sh[n][lane * 2 + i] = b2f(xr[lane * 2 + i]);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; i++) sh[n][lane * 2 + i] = 0.0f;
+    }
+    __syncthreads();
+    __shared__ float sc[8][4];
+    if (lane < 4) {
+        float amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(sh[n][lane * 16 + i]));
+        sc[n][lane] = e4m3_ceil(amax / 6.0f);
+    }
+    __syncthreads();
+    uint32_t b0 = 0, b1 = 0;
+    const float inv0 = sc[g][t >> 1] == 0.f ? 0.f : 1.0f / ue4m3_f((unsigned char)sc[g][t >> 1]);
+    const float inv1 = sc[g][2 + (t >> 1)] == 0.f ? 0.f : 1.0f / ue4m3_f((unsigned char)sc[g][2 + (t >> 1)]);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        unsigned cb = (unsigned)cvt_e2m1x2(sh[g][8 * t + 2 * j] * inv0, sh[g][8 * t + 2 * j + 1] * inv0);
+        b0 |= cb << (8 * j);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        unsigned cb = (unsigned)cvt_e2m1x2(sh[g][32 + 8 * t + 2 * j] * inv1, sh[g][32 + 8 * t + 2 * j + 1] * inv1);
+        b1 |= cb << (8 * j);
+    }
+    Bp[((size_t)q * nks + ks) * 64 + lane * 2 + 0] = b0;
+    Bp[((size_t)q * nks + ks) * 64 + lane * 2 + 1] = b1;
+    uint32_t sfb = 0;
+    if (t == 0) {
+        unsigned char b0c = (unsigned char)sc[g][0], b1c = (unsigned char)sc[g][1];
+        unsigned char b2c = (unsigned char)sc[g][2], b3c = (unsigned char)sc[g][3];
+        sfb = (uint32_t)b0c | ((uint32_t)b1c << 8) | ((uint32_t)b2c << 16) | ((uint32_t)b3c << 24);
+    }
+    SFB[((size_t)q * nks + ks) * 32 + lane] = sfb;
+}
+
+#define PF2_BM 128
+#define PF2_BN 128
+#define PF2_STAGE_A 4096
+#define PF2_STAGE_B 4096
+#define PF2_STAGE_SFA 512
+#define PF2_STAGE_SFB 2048
+#define PF2_STAGE_BYTES (PF2_STAGE_A + PF2_STAGE_B + PF2_STAGE_SFA + PF2_STAGE_SFB)  // 10752
+#define PF2_NSTAGES 4
+
+extern "C" __global__ __launch_bounds__(256, 2) void mxfp4_gemm_prefill_v2_b(
+    const uint8_t* __restrict__ Wt8,     // Aimg: [(Mf/16)*nks][128] u32 lane-major
+    const uint8_t* __restrict__ SFAw8,   // [(Mf/16)*nks][16] u32
+    const uint32_t* __restrict__ Bp,     // [(Nt/8)*nks][64]
+    const uint32_t* __restrict__ SFBw,   // [(Nt/8)*nks][32]
+    const float* __restrict__ gs,        // [Mf/16]
+    bf16* __restrict__ Out,              // token-major [Nt][Mf]
+    int Mf, int Nt, int K)
+{
+    const uint32_t* Wt = reinterpret_cast<const uint32_t*>(Wt8);
+    const uint32_t* SFAw = reinterpret_cast<const uint32_t*>(SFAw8);
+    const int nks = K >> 6;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int warp = tid >> 5;
+    const int wm = warp >> 1, wn = warp & 1;        // 4m x 2n warp tiles, 32x64 each
+
+    // token-fastest raster, group width 8: 8 co-resident blocks share each Wt tile (L2)
+    const int tm = (Mf + PF2_BM - 1) / PF2_BM, tn = (Nt + PF2_BN - 1) / PF2_BN;
+    const int gw = 8;
+    const int per_ng = tm * gw;
+    const int ng = blockIdx.x / per_ng, rem = blockIdx.x % per_ng;
+    const int bm = (rem / gw) * PF2_BM;
+    const int bn = (ng * gw + rem % gw) * PF2_BN;
+
+    extern __shared__ uint8_t smem[];
+    auto load_stage = [&](int s, int ks) {
+        uint8_t* base = smem + s * PF2_STAGE_BYTES;
+        // flat chunk map: [0,256) A | [256,512) B | [512,544) SFA | [544,672) SFB
+#pragma unroll
+        for (int i = 0; i < 3; i++) {
+            int idx = tid + i * 256;
+            if (idx >= 672) break;
+            if (idx < 256) {                                    // A: 8 slices x 512B
+                int sl = idx >> 5, ch = idx & 31;
+                int mt = (bm >> 4) + sl;
+                if (mt * 16 < Mf)
+                    cp16(base + sl * 512 + ch * 16, Wt + ((size_t)mt * nks + ks) * 128 + ch * 4);
+                else
+                    *(uint4*)(base + sl * 512 + ch * 16) = make_uint4(0u, 0u, 0u, 0u);
+            } else if (idx < 512) {                             // B: 16 slices x 256B
+                int j = idx - 256, q = j >> 4, ch = j & 15;
+                int qg = (bn >> 3) + q;
+                if (qg * 8 < Nt)
+                    cp16(base + PF2_STAGE_A + q * 256 + ch * 16, Bp + ((size_t)qg * nks + ks) * 64 + ch * 4);
+                else
+                    *(uint4*)(base + PF2_STAGE_A + q * 256 + ch * 16) = make_uint4(0u, 0u, 0u, 0u);
+            } else if (idx < 544) {                             // SFA: 8 slices x 64B
+                int j = idx - 512, sl = j >> 2, ch = j & 3;
+                int mt = (bm >> 4) + sl;
+                if (mt * 16 < Mf)
+                    cp16(base + PF2_STAGE_A + PF2_STAGE_B + sl * 64 + ch * 16,
+                         SFAw + ((size_t)mt * nks + ks) * 16 + ch * 4);
+                else
+                    *(uint4*)(base + PF2_STAGE_A + PF2_STAGE_B + sl * 64 + ch * 16) = make_uint4(0u, 0u, 0u, 0u);
+            } else {                                            // SFB: 16 slices x 128B
+                int j = idx - 544, q = j >> 3, ch = j & 7;
+                int qg = (bn >> 3) + q;
+                if (qg * 8 < Nt)
+                    cp16(base + PF2_STAGE_A + PF2_STAGE_B + PF2_STAGE_SFA + q * 128 + ch * 16,
+                         SFBw + ((size_t)qg * nks + ks) * 32 + ch * 4);
+                else
+                    *(uint4*)(base + PF2_STAGE_A + PF2_STAGE_B + PF2_STAGE_SFA + q * 128 + ch * 16) =
+                        make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        cp_commit();
+    };
+
+    load_stage(0, 0);
+    if (nks > 1) load_stage(1, 1);
+    if (nks > 2) load_stage(2, 2);
+
+    float acc[2][8][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[i][j][c] = 0.f;
+
+    for (int kt = 0; kt < nks; kt++) {
+        const int s = kt % PF2_NSTAGES;
+        const int committed = (kt + 3 < nks) ? (kt + 3) : nks;
+        const int need = committed - kt - 1;
+        if (need <= 0) cp_wait<0>();
+        else if (need == 1) cp_wait<1>();
+        else cp_wait<2>();
+        __syncthreads();
+        if (kt + 3 < nks) load_stage((kt + 3) % PF2_NSTAGES, kt + 3);
+
+        const uint8_t* st = smem + s * PF2_STAGE_BYTES;
+        const uint32_t* sfa_s = (const uint32_t*)(st + PF2_STAGE_A + PF2_STAGE_B);
+        const uint32_t* sfb_s = (const uint32_t*)(st + PF2_STAGE_A + PF2_STAGE_B + PF2_STAGE_SFA);
+
+        uint32_t a[2][4], b[8][2], sfa[2], sfb[8];
+#pragma unroll
+        for (int ma = 0; ma < 2; ma++) {
+            const uint4* p = (const uint4*)(st + ((wm * 2 + ma) * 128 + lane * 4) * 4);
+            a[ma][0] = p->x; a[ma][1] = p->y; a[ma][2] = p->z; a[ma][3] = p->w;
+        }
+#pragma unroll
+        for (int na = 0; na < 8; na++) {
+            const uint2* p = (const uint2*)(st + PF2_STAGE_A + ((wn * 8 + na) * 32 + lane) * 8);
+            b[na][0] = p->x; b[na][1] = p->y;
+        }
+#pragma unroll
+        for (int ma = 0; ma < 2; ma++)
+            sfa[ma] = (t <= 1) ? sfa_s[(wm * 2 + ma) * 16 + g * 2 + t] : 0u;
+#pragma unroll
+        for (int na = 0; na < 8; na++)
+            sfb[na] = sfb_s[(wn * 8 + na) * 32 + lane];
+#pragma unroll
+        for (int ma = 0; ma < 2; ma++)
+#pragma unroll
+            for (int na = 0; na < 8; na++)
+                mxf4_mma(a[ma][0], a[ma][1], a[ma][2], a[ma][3],
+                         b[na][0], b[na][1], sfa[ma], sfb[na],
+                         acc[ma][na][0], acc[ma][na][1], acc[ma][na][2], acc[ma][na][3]);
+    }
+
+    // smem-transpose epilogue: alias the dead stage smem; token-major tile, 8-feat pad;
+    // 16-B vector Out stores (the raw fragment store pattern is 2-B token-strided).
+    __syncthreads();
+    bf16* tile = (bf16*)smem;                 // [128 tok][136 feat] = 34,816 B <= 43,008
+    const int TSTRIDE = 136;
+#pragma unroll
+    for (int ma = 0; ma < 2; ma++) {
+#pragma unroll
+        for (int na = 0; na < 8; na++) {
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                int fl = wm * 32 + ma * 16 + g + 8 * (c >= 2);
+                int tl = wn * 64 + na * 8 + 2 * t + (c & 1);
+                // clamp for the ragged-M tail: pad columns would index gs one row past its
+                // [Mf/16] end (OOB read); their tile values are never stored anyway
+                const int gi = (bm + fl) < Mf ? ((bm + fl) >> 4) : ((Mf - 1) >> 4);
+                tile[tl * TSTRIDE + fl] = f2b(acc[ma][na][c] * gs[gi]);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; i++) {             // 2048 chunks / 256 threads
+        int idx = tid + i * 256;
+        int tl = idx >> 4, f8 = (idx & 15) * 8;
+        int tok = bn + tl, feat = bm + f8;
+        if (tok >= Nt) continue;
+        if (feat + 7 < Mf) {
+            *(uint4*)(Out + (size_t)tok * Mf + feat) = *(const uint4*)(tile + tl * TSTRIDE + f8);
+        } else {
+            // ragged M tail (mixer projections: e.g. GDN fused mtot=16480 = 128*128+96) —
+            // element stores for the final partial 8-feat chunk
+#pragma unroll
+            for (int e = 0; e < 8; e++)
+                if (feat + e < Mf)
+                    Out[(size_t)tok * Mf + feat + e] = tile[tl * TSTRIDE + f8 + e];
+        }
+    }
+}

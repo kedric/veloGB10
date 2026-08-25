@@ -1,6 +1,10 @@
 pub mod memory;
 pub mod model;
 pub mod qwen;
+pub mod vision_preproc;
+pub mod vision_tower;
+pub mod vision_encoder;
+pub mod vision_gpu;
 pub mod gpu;
 pub mod quant;
 pub mod mxfp4;
@@ -13,6 +17,7 @@ pub mod engine;
 pub mod tokenizer;
 pub mod server;
 pub mod net;
+pub mod pp;
 pub mod cluster;
 pub mod tp;
 pub mod tp_serve;

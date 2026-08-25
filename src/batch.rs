@@ -77,6 +77,10 @@ pub struct BatchRequest {
     /// it at into_request). Feeds the `[req] ttft=` log line — the server-side TTFT truth the
     /// measurement protocol asserts.
     pub received_at: std::time::Instant,
+    /// V3 vision: merged image embeddings (concatenated, [sum(num_tokens), 5120] f32) + the spans
+    /// (absolute positions in the EXPANDED prompt). None/empty for text-only traffic (unchanged).
+    pub image_embeds: Option<Vec<f32>>,
+    pub image_spans: Vec<crate::vision_encoder::ImageSpan>,
 }
 
 struct Lane {
@@ -1351,6 +1355,8 @@ impl BatchScheduler {
                 ckpt_at: None,
                 domain: job.domain,
                 received_at: std::time::Instant::now(),
+                image_embeds: None,
+                image_spans: Vec::new(),
             });
             // The prefill filled the prime sink — copy the prompt's tap rows into the dump.
             if let Some(d) = self.step_dump.as_mut() {
@@ -1607,6 +1613,16 @@ impl BatchScheduler {
                 self.gpu.set_df2_prime_sink(ps.clone());
             }
         }
+        // V3 vision: upload the merged image embeddings and arm the prefill splice (state is
+        // cleared after the window loop).
+        if let Some(emb) = req.image_embeds {
+            if !req.image_spans.is_empty() && !emb.is_empty() {
+                let hb: Vec<half::bf16> = emb.iter().map(|&x| half::bf16::from_f32(x)).collect();
+                let buf = self.gpu.dev().htod_sync_copy(&hb).expect("vision htod");
+                self.state.vision_embeds = Some(buf);
+                self.state.vision_spans = req.image_spans.clone();
+            }
+        }
         while w0 < plen {
             let mut w1 = (w0 + PREFILL_CHUNK).min(plen);
             if let Some(c) = ckpt_at { if w0 < c && c < w1 { w1 = c; } }   // stop at the boundary
@@ -1669,6 +1685,9 @@ impl BatchScheduler {
             }
             w0 = w1;
         }
+
+        self.state.vision_embeds = None;
+        self.state.vision_spans.clear();
 
         if self.prefix_cache && ckpt_at.is_none() {
             // No boundary inside the suffix (a raw/non-chat request, or one whose whole prompt was

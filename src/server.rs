@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Json, State},
+    extract::{DefaultBodyLimit, Json, State},
     http::StatusCode,
     response::{IntoResponse, Response, Sse},
     response::sse::Event,
@@ -39,6 +39,14 @@ pub struct AppState {
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
     /// template work on every request when the cache is off (TTFT fix (e)).
     pub prefix_cache: bool,
+    /// Vision tower (visual trunk) loaded at server start, for image requests. `None` if the
+    /// build/model has no vision (text-only server behaves exactly as before).
+    pub vision_tower: Option<std::sync::Arc<crate::vision_tower::VisualTower>>,
+    /// GPU vision tower (the fast path). When `Some` and `vision_cpu` is false, image requests run
+    /// the forward on the GPU; `None` + `vision_cpu: true` (or both unset) keeps the CPU tower.
+    pub vision_gpu: Option<std::sync::Arc<std::sync::Mutex<crate::vision_gpu::GpuVisualTower>>>,
+    /// Force the CPU vision tower (--vision-cpu), as a diagnostic/escape hatch.
+    pub vision_cpu: bool,
 }
 
 #[derive(Serialize)]
@@ -84,6 +92,27 @@ async fn get_model(State(state): State<AppState>, axum::extract::Path(id): axum:
         )
             .into_response()
     }
+}
+
+/// The model's PUBLIC id for /v1/models and response `model` fields: the model card's
+/// frontmatter `base_model:` line (every model dir ships one, e.g. `base_model: Qwen/Qwen3.8-27B`),
+/// falling back to the directory name when the card or the line is absent. Before this, the
+/// server reported the lab directory fragment (`"model": "3.8-27b-nvfp4-full-all"`) — an
+/// internal path name that no client or catalog can resolve. `--model-name` still overrides.
+pub fn model_id_from_dir(model_path: &str) -> String {
+    let dir = std::path::Path::new(model_path.trim_end_matches('/'));
+    if let Ok(card) = std::fs::read_to_string(dir.join("README.md")) {
+        for line in card.lines() {
+            let l = line.trim();
+            if let Some(v) = l.strip_prefix("base_model:") {
+                let v = v.trim().trim_matches('"').trim_matches('\'').trim();
+                if !v.is_empty() { return v.to_string(); }
+            }
+        }
+    }
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn esc(t: &str) -> String {
@@ -288,7 +317,7 @@ async fn chat_completions(
     }
 
     let t_encode = std::time::Instant::now();
-    let prompt_tokens = match state.tokenizer.encode(&prompt, true) {
+    let mut prompt_tokens = match state.tokenizer.encode(&prompt, true) {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -296,6 +325,42 @@ async fn chat_completions(
     // TTFT fix 0 attribution (GB10_PREFILL_TRACE): the request-path pre-model costs.
     if crate::env_knob("GB10_PREFILL_TRACE", "DSV4_PREFILL_TRACE").is_some() {
         eprintln!("[pf] server render={render_ms:.3}ms encode={encode_ms:.3}ms");
+    }
+
+    // V3 vision dispatch: if any message carries images (and the server has a vision tower),
+    // decode+preprocess+run the tower, expand the image_pad span in the token stream, and carry the
+    // merged embeddings + spans for the model prefill splice. Text-only traffic is unchanged.
+    let mut image_embeds: Option<Vec<f32>> = None;
+    let mut image_spans: Vec<crate::vision_encoder::ImageSpan> = Vec::new();
+    let urls: Vec<String> = req.messages.iter()
+        .flat_map(|m| m.images.iter().filter_map(|i| i.url.clone()))
+        .collect();
+    if !urls.is_empty() {
+        let vt0 = std::time::Instant::now();
+        // Prefer the GPU tower (fast path) unless --vision-cpu forces the CPU reference.
+        let prep = if let Some(g) = state.vision_gpu.clone() {
+            if !state.vision_cpu {
+                let mut gvt = g.lock().expect("vision_gpu lock");
+                crate::vision_encoder::prepare_vision_request_gpu(&mut gvt, &urls, &prompt_tokens)
+            } else {
+                state.vision_tower.as_ref().map(|t| crate::vision_encoder::prepare_vision_request(t, &urls, &prompt_tokens)).unwrap_or_else(|| Err(anyhow::anyhow!("vision_gpu forced but no CPU tower")))
+            }
+        } else if let Some(tower) = state.vision_tower.clone() {
+            crate::vision_encoder::prepare_vision_request(&tower, &urls, &prompt_tokens)
+        } else {
+            Err(anyhow::anyhow!("no vision tower loaded"))
+        };
+        eprintln!("[vision] dispatch {} images, prepare took {} ms, len={}",
+            urls.len(), vt0.elapsed().as_millis(), prep.as_ref().map(|p| p.image_embeds.len()).unwrap_or(0));
+        match prep {
+            Ok(prep) => {
+                prompt_tokens = prep.expanded_tokens;
+                image_embeds = Some(prep.image_embeds);
+                image_spans = prep.spans;
+            }
+            Err(e) => return (StatusCode::BAD_REQUEST,
+                format!("vision preprocessing failed: {e}")).into_response(),
+        }
     }
 
     let prompt_len = prompt_tokens.len();
@@ -360,6 +425,8 @@ async fn chat_completions(
         seed: req.seed,
         ckpt_at,
         domain: crate::batch::classify_domain(&prompt),
+        image_embeds,
+        image_spans,
     };
     let _ = state.scheduler.send(request);
 
@@ -440,10 +507,20 @@ async fn chat_completions(
                                             let mut lead = cs;
                                             while lead < acc.len() && matches!(acc.as_bytes()[lead], b'\n' | b'\r' | b' ' | b'\t') { lead += 1; }
                                             content_start = Some(lead);
-                                            if lead < acc.len() {
-                                                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[lead..acc.len()])));
+                                            // Same hold-back as the steady-state content branch
+                                            // below: if a tool-call marker arrived in the same
+                                            // decode chunk as the think close, it must NOT be
+                                            // forwarded as content.
+                                            let region = &acc[lead..];
+                                            let safe_end = match region.find(TOOL_OPEN) {
+                                                Some(i) => lead + i,
+                                                None => acc.len() - partial_overlap(region, TOOL_OPEN)
+                                                    .max(partial_overlap(region, think_open)),
+                                            };
+                                            if safe_end > lead {
+                                                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, &acc[lead..safe_end])));
                                             }
-                                            content_emitted = acc.len();
+                                            content_emitted = safe_end;
                                         } else {
                                             let overlap = partial_think_overlap(&acc, think_close);
                                             let safe = acc.len() - overlap;
@@ -497,8 +574,12 @@ async fn chat_completions(
                     TokEvent::Finish { reason } => { finish = reason; break; }
                 }
             }
-            // The call was buffered, not streamed (see the hold-back above). Emit it as one
-            // tool_calls delta and flip finish_reason -- that is the flag every harness branches on.
+            // The call was buffered, not streamed (see the hold-back above). The DECISION is
+            // crate::tools::finalize_parsed — the one canonical serializer shared with the
+            // non-streaming mode — and the held-back text is surfaced by
+            // tools::held_back_remainder, so streaming can never silently drop text the JSON
+            // mode returns (2026-08-27 user report: a malformed `function=NAME>` block with the
+            // `<` missing vanished from the SSE stream while the JSON response leaked it).
             let (_, done_content) = split_think(&acc, think_open, think_close);
             let parsed = crate::tools::parse(&done_content, req_tools.as_deref());
             if req_tools.is_some() {
@@ -508,15 +589,21 @@ async fn chat_completions(
                               done_content.chars().take(1200).collect::<String>());
                 }
             }
-            if !parsed.tool_calls.is_empty() {
+            let (_, tool_calls, fin) = crate::tools::finalize_parsed(&done_content, parsed, &finish);
+            if !tool_calls.is_empty() {
                 // Log the ARGUMENTS, not just the names — see the note on the non-streaming path.
                 // Agent harnesses stream, so this is the branch that actually gets used, and it was the
                 // one printing a bare `tool_calls 1: ["write"]` while a file silently failed to appear.
-                for t in &parsed.tool_calls {
+                for t in &tool_calls {
                     eprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
                 }
-                yield Ok(Event::default().data(tool_calls_chunk(&completion_id, created, &model_name, &parsed.tool_calls)));
-                finish = "tool_calls".to_string();
+                yield Ok(Event::default().data(tool_calls_chunk(&completion_id, created, &model_name, &tool_calls)));
+                finish = fin;
+            } else if let Some(held) = crate::tools::held_back_remainder(&acc, content_emitted) {
+                // A tool-call marker was held back but nothing parsed: surface the buffered text
+                // as content, exactly what the non-streaming mode returns for the same output.
+                yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, held)));
+                content_emitted = acc.len();
             }
             let final_chunk = format!("{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
                 completion_id, created, model_name, spec_finish_reason(&finish));
@@ -579,6 +666,9 @@ async fn chat_completions(
         // The model emits calls as <tool_call><function=..><parameter=..>..  -- NOT as JSON. Turn them
         // into OpenAI tool_calls, or the harness just sees XML in the content and never invokes
         // anything. finish_reason MUST become "tool_calls": that is the flag every harness branches on.
+        // The (content, tool_calls, finish) DECISION is crate::tools::finalize_parsed — the one
+        // canonical serializer shared with the streaming mode, so the two can never diverge again
+        // (2026-08-27 user report: a malformed call block vanished in streaming and leaked in JSON).
         // With tools offered, the model's LITERAL output is the only artifact that settles a "the tool
         // ran but nothing happened" report. Log it when asked (RUST_INFER_DUMP_TOOLS=1), and ALWAYS log
         // it when tools were offered and we parsed nothing — that combination means either the model
@@ -591,19 +681,17 @@ async fn chat_completions(
                           content.chars().take(1200).collect::<String>());
             }
         }
-        let (content, tool_calls, finish) = if parsed.tool_calls.is_empty() {
-            (Some(content), None, finish)
-        } else {
+        let (content, tool_calls, finish) = crate::tools::finalize_parsed(&content, parsed, &finish);
+        if !tool_calls.is_empty() {
             // Log the ARGUMENTS, not just the names. When opencode reported a write as successful and
             // no file appeared, the log said `tool_calls 1: ["write"]` — which is exactly enough to
             // know a tool was called and not nearly enough to know what it was told to do. The path the
             // model chose is the whole question.
-            for t in &parsed.tool_calls {
+            for t in &tool_calls {
                 eprintln!("[req] tool_call  {} {}({})", t.id, t.function.name, t.function.arguments);
             }
-            let c = if parsed.content.is_empty() { None } else { Some(parsed.content) };
-            (c, Some(parsed.tool_calls), "tool_calls".to_string())
-        };
+        }
+        let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
 
         let response = ChatCompletionResponse {
             id: completion_id,
@@ -639,5 +727,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models/:id", get(get_model))
         .route("/health", get(health))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        // Base64 image bodies inflate ~4/3x; a high-res PNG at ~2-4 MB exceeds axum's 2 MB default
+        // (""Failed to buffer the request body: length limit exceeded"" on image requests). Raise it
+        // so images that other engines accept also arrive here.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }

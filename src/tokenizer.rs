@@ -264,14 +264,20 @@ where
 {
     use serde::Deserialize;
     let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+    Ok(parse_content_text(&v))
+}
+
+/// Parse a `content` value (string|array|null) into the TEXT portion, preserving the hotfix's
+/// behavior exactly: string verbatim; null -> None; array -> text parts (verbatim single, joined
+/// "\n" multiple, lenient bare-string); non-text (image) parts are now CAPTURED, not rejected.
+fn parse_content_text(v: &serde_json::Value) -> Option<String> {
     match v {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(parts) => {
             let mut texts: Vec<String> = Vec::new();
-            for part in &parts {
+            for part in parts {
                 match part {
-                    // Lenient: a bare string element in the array counts as a text part.
                     serde_json::Value::String(s) => texts.push(s.clone()),
                     serde_json::Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
                         Some("text") => {
@@ -279,14 +285,9 @@ where
                                 texts.push(t.to_string());
                             }
                         }
-                        Some(_) => {
-                            // Any non-text part (image_url, input_image, ...). Vision entry point:
-                            // swap this rejection for the image path when the tower lands.
-                            return Err(serde::de::Error::custom(
-                                "image content parts are not supported by this build"));
-                        }
+                        // image_url / input_image / ... : captured (not rejected); no text.
+                        Some(_) => {}
                         None => {
-                            // No `type` field: leniently accept a `text` field if present.
                             if let Some(t) = o.get("text").and_then(|t| t.as_str()) {
                                 texts.push(t.to_string());
                             }
@@ -295,11 +296,38 @@ where
                     _ => {}
                 }
             }
-            if texts.is_empty() { Ok(None) } else { Ok(Some(texts.join("\n"))) }
+            if texts.is_empty() { None } else { Some(texts.join("\n")) }
         }
-        _ => Err(serde::de::Error::custom(
-            "content must be a string or an array of content parts")),
+        _ => None,
     }
+}
+
+/// Extract image parts from a `content` array into `Vec<ImageInput>`.
+fn parse_content_images(v: &serde_json::Value) -> Vec<ImageInput> {
+    let mut imgs = Vec::new();
+    if let serde_json::Value::Array(parts) = v {
+        for part in parts {
+            if let serde_json::Value::Object(o) = part {
+                let is_img = o.get("type").and_then(|t| t.as_str())
+                    .map(|t| t == "image_url" || t == "image" || t == "input_image").unwrap_or(false);
+                if is_img {
+                    let url = o.get("image_url")
+                        .and_then(|u| u.get("url").or(Some(u)))
+                        .and_then(|u| u.as_str());
+                    imgs.push(ImageInput { url: url.map(String::from) });
+                }
+            }
+        }
+    }
+    imgs
+}
+
+/// An image content part captured from a vision request (`{"type":"image_url",...}`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ImageInput {
+    /// `image_url.url` — a `data:` URL (base64 image) or a remote URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// One message of the conversation, in the shape agent harnesses actually send.
@@ -308,13 +336,16 @@ where
 /// carries `tool_calls`. It used to be a bare `String`, so that request failed to deserialize and the
 /// server answered **HTTP 422** the moment any harness tried to return a tool result. That single line
 /// is most of why tool calling appeared broken.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
     pub role: String,
     /// Spec allows a STRING or an ARRAY of content parts. `content: Option<String>` alone
     /// rejected the array form → 422. See `deserialize_content` for the resolution steps.
-    #[serde(default, deserialize_with = "deserialize_content")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Captured image parts (`image_url`) from a vision request. Empty for text-only traffic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
     /// Assistant turn: the calls the model previously made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -327,9 +358,44 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
 }
 
+impl<'de> serde::Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            role: String,
+            #[serde(default)]
+            content: Option<serde_json::Value>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            tool_calls: Option<Vec<ToolCall>>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            tool_call_id: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            name: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            reasoning_content: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let content_owned = raw.content.clone();
+        let content = content_owned.as_ref().and_then(|v| parse_content_text(v));
+        let images = content_owned.as_ref().map(parse_content_images).unwrap_or_default();
+        Ok(ChatMessage {
+            role: raw.role,
+            content,
+            images,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            name: raw.name,
+            reasoning_content: raw.reasoning_content,
+        })
+    }
+}
+
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: Some(content.into()),
+        Self { role: "user".into(), content: Some(content.into()), images: vec![],
                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None }
     }
 
@@ -342,10 +408,28 @@ impl ChatMessage {
     fn to_template_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         m.insert("role".into(), serde_json::Value::String(self.role.clone()));
-        m.insert("content".into(), match &self.content {
-            Some(c) => serde_json::Value::String(c.clone()),
-            None => serde_json::Value::Null,          // the template's render_content maps none -> ""
-        });
+        let content = match &self.content {
+            Some(c) => c.clone(),
+            None => String::new(),
+        };
+        if !self.images.is_empty() {
+            // Vision: render as a content ARRAY of parts so the model's Jinja template turns each
+            // image into `<|vision_start|><|image_pad|><|vision_end|>` and keeps the text.
+            let mut parts = Vec::new();
+            for _ in &self.images {
+                parts.push(serde_json::json!({"type": "image"}));
+            }
+            if !content.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": content}));
+            }
+            m.insert("content".into(), serde_json::Value::Array(parts));
+        } else {
+            // Text-only: keep the string (or null) — byte-identical to the hotfix/text path.
+            m.insert("content".into(), match &self.content {
+                Some(c) => serde_json::Value::String(c.clone()),
+                None => serde_json::Value::Null,
+            });
+        }
         if let Some(r) = &self.reasoning_content {
             m.insert("reasoning_content".into(), serde_json::Value::String(r.clone()));
         }
@@ -394,6 +478,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
+                images: vec![],
                 tool_calls: Some(vec![ToolCall {
                     id: "call_0".into(),
                     kind: "function".into(),
@@ -407,7 +492,7 @@ mod tests {
             ChatMessage {
                 role: "tool".into(),
                 content: Some("line one\nline two".into()),
-                tool_calls: None, tool_call_id: Some("call_0".into()), name: Some("read".into()),
+                images: vec![], tool_calls: None, tool_call_id: Some("call_0".into()), name: Some("read".into()),
                 reasoning_content: None,
             },
         ];
@@ -442,11 +527,20 @@ mod tests {
         assert_eq!(m.content, None);
         assert!(m.tool_calls.is_some(), "tool_calls must still deserialize");
 
-        // (e) an array containing an image_url part -> the CLEAR 422 message, not a serde type error.
-        let e = serde_json::from_str::<ChatMessage>(
-            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}"#).unwrap_err();
-        assert!(e.to_string().contains("image content parts are not supported by this build"),
-            "got: {e}");
+        // (e) an array containing an image_url part -> CAPTURED into `images` (vision entry point);
+        //     no 422, content is None (no text part).
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}"#).unwrap();
+        assert_eq!(m.content, None);
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(m.images[0].url.as_deref(), Some("data:image/png;base64,AAAA"));
+
+        // (e2) mixed: an image part + a text part -> text captured in content, image in images.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}},{"type":"text","text":"what is this?"}]}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some("what is this?"));
+        assert_eq!(m.images.len(), 1);
+        assert_eq!(m.images[0].url.as_deref(), Some("data:image/png;base64,BBBB"));
 
         // (f) realistic agent conversation: system + user + assistant(tool_calls,null) + tool result.
         let msgs: Vec<ChatMessage> = serde_json::from_str(
@@ -514,7 +608,7 @@ mod tests {
                 role: "assistant".into(),
                 // Simulate what round-trips from a client: reasoning + answer.
                 content: Some("<think>\nI should keep it short.\n</think>\n\nThe beacon awoke, and so did something else.\n".into()),
-                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
+                images: vec![], tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
             },
             ChatMessage::user("Continue it for another 1000 words."),
         ];

@@ -119,6 +119,8 @@ impl WireRequest {
             ckpt_at: self.ckpt_at,
             domain: self.domain,
             received_at: std::time::Instant::now(),
+            image_embeds: None,
+            image_spans: Vec::new(),
         }
     }
 }

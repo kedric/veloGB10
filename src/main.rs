@@ -383,6 +383,37 @@ fn main() {
         return;
     }
 
+    // PP-prefill (PLAN/14) two-box roles: layer-split pipeline prefill across 2 GB10s.
+    if args.iter().any(|a| a == "--pp-node") {
+        let dir = parse_arg(&args, "--model-dir").expect("--pp-node requires --model-dir");
+        gb10_inference::pp::pp_node(&dir).expect("pp-node");
+        return;
+    }
+    if args.iter().any(|a| a == "--pp-bench-prefill") {
+        let dir = parse_arg(&args, "--model-dir").expect("--pp-bench-prefill requires --model-dir");
+        let seq_len: usize = parse_arg(&args, "--seq-len").and_then(|s| s.parse().ok()).unwrap_or(32768);
+        let reps: usize = parse_arg(&args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(3);
+        let split: usize = parse_arg(&args, "--split").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let verify = args.iter().any(|a| a == "--verify");
+        // Window-size sweep, e.g. --pp-chunk-list 8192,4096,2048 (default: PREFILL_CHUNK).
+        let chunks: Vec<usize> = parse_arg(&args, "--pp-chunk-list")
+            .map(|v| v.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect())
+            .unwrap_or_default();
+        // split == 0 = "half", resolved INSIDE pp_bench_head after its model load — do NOT
+        // pre-load here just to count layers (that delays the listener by a whole model load).
+        gb10_inference::pp::pp_bench_head(&dir, seq_len, reps, split, verify, &chunks).expect("pp-bench-head");
+        return;
+    }
+
+    // PP-prefill (PLAN/14) on-box split validation: layers [0,split) then [split,64) continuing
+    // from the returned residual must be BYTE-IDENTICAL to the monolithic prefill (token, final
+    // hidden, and full post-prefill KV/GDN/conv state). The exactness that licenses the 2-box
+    // pipeline (the only cross-box artifact is the bf16 residual itself).
+    if args.iter().any(|a| a == "--probe-ppsplit") {
+        run_probe_ppsplit(&args);
+        return;
+    }
+
     // DSV4 single-process isolated prefill bench (R2.2): loads the full trunk single-process and
     // times `forward` (auto-chunked at PREFILL_CHUNK) over a synthetic prompt. This is the
     // isolated-prefill measurement the audit lacks (the --head path is wall-derived). Set
@@ -1344,6 +1375,21 @@ fn run_bench_prefill(args: &[String]) {
     gpu.sync_stream();
     let ms = t0.elapsed().as_secs_f32() * 1e3 / reps as f32;
     println!("prefill N={seq_len}  {ms:.1} ms  ({:.0} tok/s)", seq_len as f32 / ms * 1e3);
+}
+
+fn run_probe_ppsplit(args: &[String]) {
+    let dir = parse_arg(args, "--model-dir").expect("--probe-ppsplit requires --model-dir");
+    let seq_len: usize = parse_arg(args, "--seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
+    let split: usize = parse_arg(args, "--split").and_then(|s| s.parse().ok()).unwrap_or(32);
+    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let prompt: Vec<u32> = (0..seq_len).map(|i| ((i * 2654435761usize) % 30000 + 5) as u32).collect();
+    let max_seq_len = (seq_len + 128).next_power_of_two();
+    let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+    let state_slots = 2usize;
+    let mut state = gpu.new_batch_state(state_slots, state_slots, max_seq_len);
+    let kv_stride = max_seq_len;
+    let ok = gpu.probe_ppsplit(&mut pool, &mut state, &prompt, kv_stride, split, state_slots);
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 /// DSV4 single-process isolated prefill bench (R2.2). Loads the full trunk (43 layers)
@@ -3938,7 +3984,7 @@ fn run_bench_df2_matrix(args: &[String]) {
         if !domains.contains(&dom.as_str()) { continue; }
         let ptoks = if thinking.is_some() && dom == "math" {
             let msgs = vec![gb10_inference::tokenizer::ChatMessage {
-                role: "user".to_string(), content: Some(text.to_string()),
+                role: "user".to_string(), content: Some(text.to_string()), images: vec![],
                 tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
             }];
             tokenizer.apply_chat_template(&msgs, None, thinking.as_deref())
@@ -11456,12 +11502,10 @@ fn run_server(args: &[String]) {
         return;
     }
     // Model name for /v1/models: just the directory name.
-    let model_name = parse_arg(args, "--model-name").map(|s| s.to_string()).unwrap_or_else(|| {
-        std::path::Path::new(model_path.trim_end_matches('/'))
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    });
+    // Public model id: the model card's `base_model:` (e.g. Qwen/Qwen3.8-27B), dir name as
+    // fallback — see server::model_id_from_dir. --model-name still overrides both.
+    let model_name = parse_arg(args, "--model-name").map(|s| s.to_string())
+        .unwrap_or_else(|| gb10_inference::server::model_id_from_dir(&model_path));
     let default_max_tokens = parse_arg(args, "--max-tokens").and_then(|s| s.parse::<usize>().ok()).unwrap_or(8192);
     // Model-card presence-penalty default varies by model size (2B: 2.0, 4B+: 1.5). Temperature
     // and top_p defaults are applied per-request via serde defaults in server.rs.
@@ -11956,6 +12000,23 @@ fn run_server(args: &[String]) {
             }
         }
 
+        let vision_tower = gb10_inference::vision_tower::VisualTower::load(&model_path).ok().map(std::sync::Arc::new);
+        let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
+        // GPU vision fast path: build on the shared device (same primary context as the serving model).
+        // Soft-fail — a GPU-less / PTX-less box keeps the CPU tower (or text-only behavior).
+        let vision_gpu = if vision_cpu { None } else {
+            vision_tower.as_ref().and_then(|t| {
+                let dev = match cudarc::driver::CudaDevice::new(0) {
+                    Ok(d) => d,
+                    Err(e) => { eprintln!("[vision] no CUDA device ({e}); image requests use the CPU path."); return None; }
+                };
+                match gb10_inference::vision_gpu::GpuVisualTower::new(dev, t) {
+                    Ok(v) => Some(std::sync::Arc::new(std::sync::Mutex::new(v))),
+                    Err(e) => { eprintln!("[vision] GPU tower unavailable ({e}); image requests use the CPU path."); None }
+                }
+            })
+        };
+
         let state = AppState {
             scheduler: stx,
             tokenizer: Arc::new(tokenizer),
@@ -11977,6 +12038,12 @@ fn run_server(args: &[String]) {
                 }),
             max_seq_len,
             prefix_cache,
+            // Vision tower(s) (v3): load the 333 model.visual.* tensors, and build the GPU fast path
+            // on the shared device. Fails softly — a text-only / GPU-less server keeps its exact
+            // behavior. --vision-cpu forces the CPU reference tower (diagnostic escape hatch).
+            vision_tower: vision_tower.clone(),
+            vision_gpu: vision_gpu.clone(),
+            vision_cpu,
         };
 
         let app = create_router(state);

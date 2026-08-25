@@ -151,10 +151,40 @@ fn parse_one_hy3(body: &str, tools: Option<&[Value]>) -> Option<ToolCall> {
     })
 }
 
+/// Locate the function tag inside one `<tool_call>` body.
+///
+/// The well-formed tag is `<function=NAME>`. In live serving (2026-08-27, 2 of 38 sampled
+/// tool requests) the model SOMETIMES DROPS THE `<` and emits `<tool_call>\nfunction=NAME>`.
+/// That used to fail `parse_one` entirely, and the two response modes then diverged: streaming
+/// (which had already held the block back from the content stream) dropped the text, while
+/// non-streaming leaked the raw block into `content`. Inside a `<tool_call>` block a `function=`
+/// at the start of a line is unambiguous, so accept the bare form as a repair — the well-formed
+/// match always wins when both are present. Returns `(byte offset, tag length)`.
+fn find_function_tag(body: &str) -> Option<(usize, usize)> {
+    const WF: &str = "<function=";
+    const BARE: &str = "function=";
+    if let Some(i) = body.find(WF) {
+        return Some((i, WF.len()));
+    }
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(BARE) {
+        let i = from + rel;
+        let boundary_ok = match body[..i].chars().next_back() {
+            None | Some('\n') | Some('\r') | Some(' ') | Some('\t') => true,
+            _ => false,
+        };
+        if boundary_ok {
+            return Some((i, BARE.len()));
+        }
+        from = i + BARE.len();
+    }
+    None
+}
+
 /// Parse the inside of one `<tool_call>…</tool_call>`.
 fn parse_one(body: &str, tools: Option<&[Value]>, idx: usize) -> Option<ToolCall> {
-    let fopen = body.find("<function=")?;
-    let after = &body[fopen + "<function=".len()..];
+    let (fopen, tlen) = find_function_tag(body)?;
+    let after = &body[fopen + tlen..];
     let gt = after.find('>')?;
     let name = after[..gt].trim().to_string();
     if name.is_empty() { return None; }
@@ -193,6 +223,61 @@ fn param_schema<'a>(tools: &'a [Value], name: &str) -> Option<&'a serde_json::Ma
         .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name))
         .and_then(|t| t.pointer("/function/parameters/properties"))
         .and_then(Value::as_object)
+}
+
+/// The ONE final (content, tool_calls, finish_reason) decision for a completed generation,
+/// shared by BOTH response modes — streaming SSE and non-streaming JSON.
+///
+/// This exists because the modes used to decide independently and could diverge (the
+/// 2026-08-27 user report): with a call the parser could not read, streaming dropped the
+/// block's text entirely while non-streaming returned it verbatim. Both modes now call this
+/// on the same post-think-split answer text, so they can only ever agree.
+///
+/// Rules (the exact old non-streaming behavior, now canonical for both):
+///  - at least one call parsed  -> content becomes the prose outside the calls (`None` when
+///    empty) and finish becomes `"tool_calls"` — the flag every harness branches on;
+///  - no call parsed            -> content is the model's literal answer text UNCHANGED
+///    (recoverable by the operator) and `finish` passes through.
+pub fn finalize(raw: &str, tools: Option<&[Value]>, finish: &str) -> (Option<String>, Vec<ToolCall>, String) {
+    let parsed = parse(raw, tools);
+    finalize_parsed(raw, parsed, finish)
+}
+
+/// Decision half of [`finalize`] for callers that already ran `parse` (e.g. to log the raw
+/// output). Takes the parse result by value so call ids are minted exactly once.
+pub fn finalize_parsed(
+    raw: &str,
+    parsed: ParsedOutput,
+    finish: &str,
+) -> (Option<String>, Vec<ToolCall>, String) {
+    if parsed.tool_calls.is_empty() {
+        (Some(raw.to_string()), Vec::new(), finish.to_string())
+    } else {
+        let c = if parsed.content.is_empty() { None } else { Some(parsed.content) };
+        (c, parsed.tool_calls, "tool_calls".to_string())
+    }
+}
+
+/// What the STREAMING mode must still surface after its incremental emission, so it never
+/// silently drops text the non-streaming mode returns. `acc` is the full generated text and
+/// `emitted` the byte offset already sent as content chunks (the hold-back in server.rs stops
+/// at the first `<tool_call`, so everything after it sits in the remainder).
+///
+/// `None` when nothing is held back. Some(text) only when the held-back span actually contains
+/// a tool-call marker: if the parser read the calls, the block is represented by the
+/// `tool_calls` delta instead (and unparsed block text is dropped by BOTH modes identically —
+/// that is `finalize_parsed`'s rule); if the parser read NOTHING from a block that looked like
+/// a call, the raw text is surfaced as a final content chunk, exactly what non-streaming does.
+pub fn held_back_remainder<'a>(acc: &'a str, emitted: usize) -> Option<&'a str> {
+    if emitted >= acc.len() {
+        return None;
+    }
+    let rest = &acc[emitted..];
+    if rest.contains(CALL_OPEN) || rest.contains(HY_CALL_OPEN) || rest.contains("<tool_calls") {
+        Some(rest)
+    } else {
+        None
+    }
 }
 
 /// Coerce one text value to the type its schema declares. Unknown/absent schema, or a value that does

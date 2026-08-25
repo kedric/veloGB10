@@ -71,6 +71,11 @@ pub struct Mxfp4State {
     /// between passes; Phase B's sensitive-site allowlist extension needs it too). Production
     /// costs one read lock per GEMM (~ns, semantics unchanged).
     pub allow_bf16: RwLock<HashSet<u64>>,
+    /// Mixer projections cleared for the W4A4 v2 PREFILL GEMM despite being on the bf16
+    /// chain for decode/verify (GB10_PF_MIXER4 at load: 'safe' = out_proj/o_proj/qkv_proj,
+    /// 'all' = + in_proj; unset = none). Gate-arbitrated 2026-08-26: 'all' MISMATCHes the
+    /// losslessness fuzz at ctx 7418 (same seed GREEN without it) — R4's ruling holds.
+    pub mixer4: RwLock<HashSet<u64>>,
     /// Activation-pack scratch: Bp/SFB for MXFP4_GROUPS eight-token groups at the max K.
     pub bp: CudaSlice<u32>,
     pub sfb: CudaSlice<u32>,
@@ -111,6 +116,11 @@ pub struct Mxfp4State {
     /// rows at MXFP4_MAX_K.
     pub pf_quant: CudaFunction,      // mxfp4_quant_prefill_b
     pub pf_gemm: CudaFunction,       // mxfp4_gemm_prefill_b
+    /// v2 (2026-08-25, PLAN/13): OMMA-native fragment-order prefill pair at 213-253 TF/s.
+    /// Reads the RESIDENT Aimg/SFAw directly (no repack); acts via the batched OMMA packer
+    /// (arithmetic statement-identical to the decode packer). Same env flag, same gates.
+    pub pf_quant2: CudaFunction,     // mxfp4_quant_pack_prefill_b
+    pub pf_gemm2: CudaFunction,      // mxfp4_gemm_prefill_v2_b
     pub pf_repack: CudaFunction,     // mxfp4_repack_rm_b (tiled -> row-major, once per tensor)
     pub pf_bq: CudaSlice<u8>,
     pub pf_sb: CudaSlice<u8>,
@@ -134,7 +144,7 @@ impl Mxfp4State {
     /// sm_121), runs the KERNEL_BUILD_ID handshake (new kernels join the manifest, never
     /// weakened), allocates the pack scratch, and adopts the per-tensor repacks.
     pub fn build(on: bool, omma_map: HashMap<u64, OmmaEntry>,
-                 allow_bf16: HashSet<u64>,
+                 allow_bf16: HashSet<u64>, mixer4: HashSet<u64>,
                  dev: &Arc<CudaDevice>,
                  cfg: &crate::qwen::Config) -> anyhow::Result<Option<Self>> {
         if !on {
@@ -146,6 +156,7 @@ impl Mxfp4State {
                                          "mxfp4_gemv_native_fused_b16",
                                          "mxfp4_dequant_tiled_b", "mxfp4_embed_gather_tiled_b",
                                          "mxfp4_quant_prefill_b", "mxfp4_gemm_prefill_b", "mxfp4_repack_rm_b",
+                                         "mxfp4_quant_pack_prefill_b", "mxfp4_gemm_prefill_v2_b",
                                          "kernel_build_id"])?;
         crate::gpu::GpuModel::assert_kernel_build_id(dev, "gpu_mxfp4")?;
         let nks_max = MXFP4_MAX_K / 64;
@@ -172,7 +183,13 @@ impl Mxfp4State {
         // P4 B2 prefill scratch: Bq/SB for PREFILL_CHUNK rows at max K.
         let pf_rows = crate::batch::PREFILL_CHUNK;
         let pf_bq = dev.htod_sync_copy(&vec![0xFFu8; pf_rows * (MXFP4_MAX_K / 2)]).unwrap();
-        let pf_sb = dev.htod_sync_copy(&vec![0xFFu8; pf_rows * (MXFP4_MAX_K / 16)]).unwrap();
+        // SFB layout (mxfp4_quant_pack_prefill_b): [(q*nks + ks)*32 + lane] u32 = 32 u32 per
+        // (8-row group, 64-col chunk) = nks*128 B per group = nks*16 B PER ROW. The old
+        // rows*(MAX_K/16) sizing (2048 B/row) only covered nks <= 128 (K <= 8192): the 27B
+        // down_proj (K=17408, nks=272, 4352 B/row) scribbled ~19MB past the buffer on every
+        // prefill quant — the 2026-08-26 flake (allocation-dependent corruption of neighbors,
+        // memcheck: 264 invalid global writes at mxfp4_quant_pack_prefill_b+0x1560).
+        let pf_sb = dev.htod_sync_copy(&vec![0xFFu8; pf_rows * (MXFP4_MAX_K / 64) * 16]).unwrap();
         // Poison the fast-path scratch (expert R3 decisive test): alloc_zeros does NOT zero
         // (AGENTS §2.2); fill with 0xFF so any GEMM read of never-quantized rows changes
         // the output deterministically instead of silently reading stale bytes.
@@ -187,12 +204,17 @@ impl Mxfp4State {
         Ok(Some(Mxfp4State {
             w: omma_map,
             allow_bf16: RwLock::new(allow_bf16),
+            mixer4: RwLock::new(mixer4),
             bp,
             sfb,
             gemv: dev.get_func("gpu_mxfp4", "mxfp4_gemv_native_b")
                 .expect("mxfp4_gemv_native_b not in gpu_mxfp4 module"),
             quant: dev.get_func("gpu_mxfp4", "mxfp4_quant_pack_b")
                 .expect("mxfp4_quant_pack_b not in gpu_mxfp4 module"),
+            pf_quant2: dev.get_func("gpu_mxfp4", "mxfp4_quant_pack_prefill_b")
+                .expect("mxfp4_quant_pack_prefill_b not in gpu_mxfp4 module"),
+            pf_gemm2: dev.get_func("gpu_mxfp4", "mxfp4_gemm_prefill_v2_b")
+                .expect("mxfp4_gemm_prefill_v2_b not in gpu_mxfp4 module"),
             dequant: dev.get_func("gpu_mxfp4", "mxfp4_dequant_tiled_b")
                 .expect("mxfp4_dequant_tiled_b not in gpu_mxfp4 module"),
             embed: dev.get_func("gpu_mxfp4", "mxfp4_embed_gather_tiled_b")
