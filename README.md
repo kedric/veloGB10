@@ -433,7 +433,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 every request may override in its JSON body. There are no MTP env vars; speculation is auto-tuned
 per request.
 
-### TP=2 flags (head) and node mode
+### TP=2/TP=4 flags (head) and node mode
 
 | Flag | Default | Meaning |
 |---|---|---|
