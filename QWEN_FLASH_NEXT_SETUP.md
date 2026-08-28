@@ -1,0 +1,133 @@
+# Qwen3.8-Flash-Next (qwen4_exp) NVFP4 — setup
+
+Qwen3.8-Flash-Next is a 176B-parameter hybrid MoE (48 layers: 36 GatedDeltaNet + 12 gated GQA
+attention, 512 experts top-10 + shared expert) with three things no other supported family has:
+
+- **hyper-connections** — the residual stream is 4 copies of the hidden (`hc_count: 4`, 10240
+  wide); every sublayer reads a gated mix of the 4 streams and writes back a per-stream weighted
+  injection. There are no layer norms; the hc norms play that role;
+- a **PLE n-gram table** — a 320M-row × 160 embedding table (51 GB in FP8, 102 GB bf16) hashed by
+  the token's 2-gram / 3-gram context and injected once, at layer 1;
+- a **QSA sparse-attention indexer** on the attention layers: past 2051 visible tokens each query
+  attends only to the 512 best-scoring 4-token blocks (+ the tail) — see §3.
+
+veloGB10 serves it as `Family::Qwen4Exp` inside the regular engine (same server, batching,
+speculative verify, TP transport). **Everything is NVFP4**, the PLE table included, in a
+row-record layout the engine can either keep on the GPU or stream from the SSD.
+
+## 1. Quantize (once, ~10 min)
+
+```bash
+./target/release/gb10_inference --quantize \
+    --model-dir ~/models/Qwen3.8-Flash-Next \
+    --out ~/models/Qwen3.8-Flash-Next-NVFP4-velo \
+    --recipe all
+```
+
+Output: 360 GB bf16 → ~97 GB:
+
+| Part | Format | Size |
+|---|---|---|
+| routed experts (48 × 512), MTP experts | NVFP4 (compressed-tensors `weight_packed`) | ~68 GB |
+| attention, GDN, shared experts, hyper-connections, PLE projections, router, embed, lm_head | NVFP4 | ~5 GB |
+| PLE n-gram table | NVFP4 row records, `ple_ngram_nvfp4.bin` (96 B/row) + `ple_ngram_nvfp4.json` | 30.7 GB |
+| norms, conv1d, `block_inject_weight` (M=4), vision tower | bf16 / f32 copy-through | ~1.4 GB |
+
+Recipe groups specific to this family: `hc` (hyper-connection mixers), `ple` (PLE key/value
+projections), `pletable` (the n-gram table). `all` includes them. `all,gdn:bf16` keeps the GDN
+projections in bf16 if you want to trade ~4 GB for GDN precision (the earlier SGLang bring-up on
+this box measured the GDN as the quantization-sensitive block — see `scripts/qwen4exp/README.md`).
+
+Shards are written at 4 GB (`GB10_QUANT_SHARD_GB`): the loader holds a whole shard plus its
+parts in host memory while it repacks, and 12 GB shards pushed a 128 GB box over the edge.
+
+## 2. Serve
+
+### Single GB10 — recommended: PLE table on the SSD
+
+```bash
+./target/release/gb10_inference --server \
+    --model-dir ~/models/Qwen3.8-Flash-Next-NVFP4-velo \
+    --ple-offload ssd \
+    --port 9000 --max-seq-len 2048 --max-batch 2 --prefix-cache on
+```
+
+Device-resident footprint ≈ 70 GB + KV. The 16 PLE rows a token needs (16 × 96 B) are read from
+`ple_ngram_nvfp4.bin` with `pread` on a thread fan-out (`GB10_PLE_SSD_THREADS`, default 32) at
+the point of the forward where layer 1 consumes them; an application-level row cache
+(`GB10_PLE_SSD_CACHE_ROWS`, default 262144) and the OS page cache keep a conversation's hot
+n-grams in memory. Cost: one host round-trip per forward (CUDA decode graphs are disabled in this
+mode). The logits are bit-identical to the resident mode.
+
+### Single GB10 — PLE table on the GPU
+
+Omit `--ple-offload`. The table is uploaded at load (~30 s); footprint ≈ 100 GB + KV: it fits, but
+leaves **no room for anything else** on the box. The load-time guard refuses if the measured
+budget (`[mem] qwen4_exp footprint: ...` line) does not fit in `MemAvailable`; do not force it.
+
+### Memory safety
+
+Two host hangs happened during the bring-up (unified memory exhausted → the kernel's OOM path
+cannot reclaim device pages → no SSH). Root causes, both fixed: (a) the server used to load the
+**vision tower** after the model, reading the 97 GB artifact's shards into host RAM to find
+`model.visual.*` (+1.2 GB/s of RSS until OOM) — the tower is now skipped on this family; (b) a
+GPU-resident PLE table forced past the memory guard left no headroom. Three defenses now exist,
+keep all of them:
+
+1. the load guard above (`GB10_LOAD_FORCE` is ignored on this family; only
+   `GB10_LOAD_FORCE=unsafe` bypasses it);
+2. a host-memory watchdog in every mode: if `MemAvailable` stays under `GB10_MEM_WATCHDOG_GB`
+   (default 5 GB) for 400 ms the process prints a line and **exits** — losing the process frees
+   the memory, hanging the box does not;
+3. `scripts/memlog.sh /var/tmp/memlog.txt &` — a 1 Hz memory trace that survives a crash.
+
+And a rule: while the model loads or serves, do not start other GPU jobs (probes, docker images
+with torch, ollama models) on the same box.
+
+## 3. What works, what does not (yet)
+
+| | Status |
+|---|---|
+| prefill, greedy / sampled decode, continuous batching, prefix cache, OpenAI server, tool calls | works (validated against the HF reference on a synthetic model: logits cos ≥ 0.9999, argmax identical) |
+| PLE on SSD (`--ple-offload ssd`) | works, bit-identical to resident |
+| MTP speculative decoding (`--mtp auto`) | works, greedy output byte-identical to `--mtp off` (lossless); acceptance 64–78 %, ~3.1 tokens per verify forward, 27.8 → 47.5 tok/s end-to-end on a code answer (single GB10, PLE on SSD) |
+| context > 2048 (QSA sparse attention) | works — `--max-seq-len` up to the model max; selection lists identical to the HF reference on the synthetic model (7/8 positions; the 8th is a score tie within bf16 noise), argmax 8/8. Real model, 7.3K-token needle prompt (`--max-seq-len 8192`, server): needle found, TTFT 10.2 s (~715 tok/s prefill), decode unchanged (~30 tok/s; 47 tok/s with `--mtp auto`, 71 % acceptance), output byte-identical with and without MTP, min 37 GB host memory free — see §3 |
+| TP=2 / TP=4 | not brought up for this family yet |
+| vision input | not supported for this family (the tower is copied through the quantizer, unused) |
+
+### QSA sparse attention (long context)
+
+`Qwen4ExpTextQSAIndexer`: on every full-attention layer (and the MTP head's), a small projection
+gives each token 4 query heads and one raw key (128-d). A query's visible tokens are cut into
+blocks of 4; a block's key is the k-layernorm of the mean of its raw keys, roped at the block start;
+score = Σ_heads relu(q·k)/√128; the 512 best blocks plus the tail (visible mod 4) are the only keys
+the attention sees. Below 2051 visible tokens every block is selected, so dense attention is exact
+there and the engine keeps its dense kernels: **with `--max-seq-len <= 2051` nothing changes**
+(graphs included). Above it the indexer is live:
+
+- raw keys are cached per position like the KV (`[slot][pos][128]` bf16, ~1 KB/token over the 12
+  layers); block keys are recomputed on the fly, so MTP rollbacks, prefix-cache reuse and tree
+  compaction need no extra bookkeeping — whatever holds for the KV cache holds here;
+- selection runs in the same rank space as the verify kernels (`path`-aware), so a verify column
+  selects exactly what the decode at that position would: MTP stays lossless;
+- the top-k is a deterministic radix select (ties → lowest block), the selected keys are visited in
+  ascending order by a copy of the dense split-K kernel with one address indirection;
+- prefill scores every query of a window against precomputed block keys (custom scalar kernel: on
+  the 7.3K-token prompt the indexer adds ~2.3 s to a 7.9 s dense prefill — a cuBLAS score GEMM is
+  the obvious next optimization); decode adds one small kernel chain per attention layer (no
+  measurable tok/s change).
+
+Flags / env: `--max-seq-len N` (KV + raw keys sized to N; the RoPE tables cap it at the model's
+262144); `GB10_Q4_DENSE_ATTN=1` forces dense attention at any length (A/B only — NOT the reference
+model past 2051); `GB10_QSA_DUMP=1` prints every selection list and score row (validation, syncs).
+The sparse kernels read a bf16 KV cache: `--kv-cache q4|tq|k8v4` is refused when the indexer is live.
+
+## 4. Probes
+
+```bash
+# prefill + greedy decode without the server; --chat renders the chat template
+./target/release/gb10_inference --probe-q4 --model-dir <dir> --ple-offload ssd --chat \
+    --prompt "Bonjour" --max-new-tokens 64 --max-seq-len 2048
+# reference-oracle comparison (tiny synthetic model): scripts/qwen4exp/README.md
+# long context: the same probe with a long --prompt and --max-seq-len 8192 (QSA live past 2051 tokens)
+```

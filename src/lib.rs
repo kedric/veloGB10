@@ -7,6 +7,8 @@ pub mod vision_encoder;
 pub mod vision_gpu;
 pub mod gpu;
 pub mod quant;
+pub mod ple;
+pub mod memwatch;
 pub mod mxfp4;
 pub mod batch;
 pub mod kernels;

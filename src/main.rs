@@ -290,7 +290,9 @@ fn print_help() {
     println!("  --net-test               Transport + FP32-partial audit, 2 procs (--rank 0|1 --peer)");
     println!("  --sweep-gemm             GEMM shape sweep");
     println!("  --perplexity             PPL on held-out text (--text <file> --window N --max-windows N)");
+    println!("  --ple-offload <ssd|none> qwen4_exp (Qwen3.8-Flash-Next): keep the PLE n-gram table on SSD [none = GPU-resident]");
     println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> --recipe <r>)");
+    println!("                           groups: mlp attn gdn lmhead embed mtp router expert hc ple pletable; `all` = every group");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
@@ -351,6 +353,9 @@ fn print_help() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     cli_env_bridge(&args);
+    // Host-memory watchdog (see src/memwatch.rs): a process that exits under memory pressure
+    // keeps the unified-memory box (and its SSH session) alive; the kernel OOM path does not.
+    gb10_inference::memwatch::start();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
@@ -1022,6 +1027,10 @@ fn main() {
     }
 
     // Offline quantizer: bf16 model dir -> NVFP4/FP8 compressed-tensors artifact.
+    if args.iter().any(|a| a == "--probe-q4") {
+        run_probe_q4(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--quantize") {
         run_quantize(&args);
         return;
@@ -1171,6 +1180,15 @@ fn cli_env_bridge(args: &[String]) {
     set(args, "--cpu-sample", "RUST_INFER_CPU_SAMPLE");
     set(args, "--prefill-scalar", "RUST_INFER_PREFILL_SCALAR");
     set(args, "--zero-kv", "RUST_INFER_ZERO_KV");
+    // qwen4_exp (Qwen3.8-Flash-Next): `--ple-offload ssd` keeps the 31 GB PLE n-gram table on
+    // disk and reads rows per forward; `none`/absent = device-resident. Internal env transport.
+    if let Some(v) = parse_arg(args, "--ple-offload") {
+        match v {
+            "ssd" => std::env::set_var("GB10_PLE_OFFLOAD", "ssd"),
+            "none" | "off" | "gpu" => std::env::remove_var("GB10_PLE_OFFLOAD"),
+            other => { eprintln!("--ple-offload: expected ssd|none, got {other:?}"); std::process::exit(2); }
+        }
+    }
     // Item 2.5: tolerance-class fast paths are DEFAULT ON (wo_a fp8 einsum + compressor pair);
     // --exact-gemm selects the locked bit-exact kernels. The bridge makes it a CLI-only
     // user-facing knob (AGENTS.md §7); the env var is internal transport that rides TpConfig
@@ -1353,6 +1371,89 @@ fn run_cli(args: &[String]) {
     match result {
         Ok(_) => println!("Done"),
         Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+    }
+}
+
+/// `--probe-q4 --model-dir <d> [--prompt <text>] [--max-new-tokens N] [--max-seq-len N] [--chat]`
+/// The smallest end-to-end generation on the GpuModel path: tokenize, prefill, greedy decode,
+/// print. Family-agnostic (used to bring up qwen4_exp, works on any GpuModel model). `--chat`
+/// renders the prompt through the model's chat template.
+fn run_probe_q4(args: &[String]) {
+    let dir = parse_arg(args, "--model-dir").expect("--probe-q4 requires --model-dir <DIR>");
+    let prompt_text = parse_arg(args, "--prompt").unwrap_or("The capital of France is");
+    let max_new: usize = parse_arg(args, "--max-new-tokens").and_then(|s| s.parse().ok()).unwrap_or(32);
+    let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let chat = args.iter().any(|a| a == "--chat");
+    let t0 = std::time::Instant::now();
+    let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    eprintln!("[probe-q4] loaded in {:.1}s (family {:?}, layers {}, rw {})", t0.elapsed().as_secs_f32(), cfg.family, cfg.num_layers, cfg.resid_width());
+    // `--tokens 1,2,3` feeds raw ids (synthetic models have no tokenizer).
+    let raw_tokens: Option<Vec<u32>> = parse_arg(args, "--tokens").map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+    let tok = if raw_tokens.is_some() { None } else {
+        Some(gb10_inference::tokenizer::QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/'))).expect("tokenizer"))
+    };
+    let prompt: Vec<u32> = if let Some(t) = raw_tokens { t } else {
+        let text = if chat {
+            let msgs = vec![gb10_inference::tokenizer::ChatMessage::user(prompt_text)];
+            tok.as_ref().unwrap().apply_chat_template(&msgs, None, None).expect("chat template")
+        } else { prompt_text.to_string() };
+        tok.as_ref().unwrap().encode(&text, false).expect("encode")
+    };
+    eprintln!("[probe-q4] prompt {} tokens: {:?}", prompt.len(), &prompt[..prompt.len().min(24)]);
+    assert!(prompt.len() + max_new + 1 <= max_seq_len, "prompt+gen exceeds --max-seq-len");
+    let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, max_seq_len);
+    let kv_stride = max_seq_len;
+    let mut bufs = gpu.new_decode_buffers(1);
+    let tp = std::time::Instant::now();
+    let (first, hout) = gpu.prefill_batch(&mut pool, &prompt, &mut state, 0, kv_stride, 0);
+    gpu.sync_stream();
+    pool.release_bf16(hout, cfg.resid_width() * prompt.len());
+    eprintln!("[probe-q4] prefill {} tok in {:.0} ms ({:.0} tok/s)", prompt.len(), tp.elapsed().as_secs_f32() * 1e3, prompt.len() as f32 / tp.elapsed().as_secs_f32());
+    // `--dump-logits <dir>`: write prompt/generated tokens (JSON) and the per-step f32 logits
+    // (prefill last column + every decode step) for the reference-oracle comparison.
+    let dump: Option<String> = parse_arg(args, "--dump-logits").map(|s| s.to_string());
+    let mut logit_steps: Vec<Vec<f32>> = Vec::new();
+    if dump.is_some() {
+        // Re-run the prefill on a fresh slot to read the last column's logits (the first one
+        // consumed hout above).
+        gpu.zero_slot_state(&mut state, 0, kv_stride);
+        let (_, hout2) = gpu.prefill_batch(&mut pool, &prompt, &mut state, 0, kv_stride, 0);
+        logit_steps.push(gpu.probe_logits_of_hidden_col(&mut pool, &hout2, prompt.len() - 1));
+        pool.release_bf16(hout2, cfg.resid_width() * prompt.len());
+    }
+    let mut out = vec![first];
+    let mut pos = prompt.len();
+    let td = std::time::Instant::now();
+    for _ in 1..max_new {
+        if *out.last().unwrap() == cfg.eos_token_id && dump.is_none() { break; }
+        let toks_i32 = vec![*out.last().unwrap() as i32];
+        let pos_i32 = vec![pos as i32];
+        gpu.dev().htod_sync_copy_into(&toks_i32, &mut bufs.tokens_dev).unwrap();
+        gpu.dev().htod_sync_copy_into(&pos_i32, &mut bufs.pos_dev).unwrap();
+        gpu.dev().synchronize().unwrap();
+        let next = if dump.is_some() {
+            let (lg, t) = gpu.probe_decode_logits(&mut pool, &mut bufs, &mut state, kv_stride, pos + 1);
+            logit_steps.push(lg);
+            t
+        } else {
+            gpu.forward_decode(&mut pool, &mut bufs, &mut state, kv_stride, pos + 1, 1)[0]
+        };
+        out.push(next);
+        pos += 1;
+    }
+    let dt = td.elapsed().as_secs_f32();
+    eprintln!("[probe-q4] decode {} tok in {:.2}s ({:.1} tok/s)", out.len() - 1, dt, (out.len() - 1) as f32 / dt.max(1e-6));
+    println!("TOKENS: {:?}", out);
+    if let Some(t) = &tok { println!("TEXT: {}", t.decode(&out, false).unwrap_or_default()); }
+    if let Some(dir) = dump {
+        std::fs::create_dir_all(&dir).expect("dump dir");
+        let meta = serde_json::json!({ "prompt": prompt, "generated": out, "vocab": cfg.vocab_size, "steps": logit_steps.len() });
+        std::fs::write(format!("{dir}/tokens.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        let mut raw: Vec<u8> = Vec::with_capacity(logit_steps.len() * cfg.vocab_size * 4);
+        for st in &logit_steps { for x in st { raw.extend_from_slice(&x.to_le_bytes()); } }
+        std::fs::write(format!("{dir}/logits.f32"), raw).unwrap();
+        eprintln!("[probe-q4] dumped {} logit steps to {dir}", logit_steps.len());
     }
 }
 
@@ -6005,7 +6106,12 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
     } else { 0.0 };
     let pools = 3.0 * gb as f64;
     let (gf) = gb as f64;
-    let steady = weights as f64 + kv + mirror + pools;
+    // qwen4_exp: the PLE n-gram table lives outside the safetensors (`ple_ngram_nvfp4.bin`) and is
+    // device-resident unless --ple-offload ssd.
+    let ple_bytes: f64 = if cfg.is_q4() && !gb10_inference::gpu::GpuModel::ple_offload_ssd() {
+        std::fs::metadata(dir.join("ple_ngram_nvfp4.bin")).map(|m| m.len() as f64).unwrap_or(0.0)
+    } else { 0.0 };
+    let steady = weights as f64 + kv + mirror + pools + ple_bytes;
     let peak = steady + calib;
     let phys = std::fs::read_to_string("/proc/meminfo").ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
@@ -6021,6 +6127,10 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
               std::path::Path::new(model_dir).file_name().unwrap_or_default().to_string_lossy(),
               if tp { "TP=2, rank-local" } else { "single node" }, kv_label);
     eprintln!("  weights (per rank)     ~{} GB", fmt(weights as f64 / gf));
+    if cfg.is_q4() {
+        eprintln!("  PLE n-gram table       ~{} GB ({})", fmt(ple_bytes / gf),
+                  if ple_bytes > 0.0 { "device-resident; --ple-offload ssd keeps it on disk" } else { "SSD-resident, read per forward" });
+    }
     eprintln!("  KV cache (~{slots} slots)  ~{} GB", fmt(kv / gf));
     eprintln!("  calibration transient  ~{} GB (startup only, freed)", fmt(calib / gf));
     if quantized { eprintln!("  packed-KV mirror (<=32K) ~{} GB", fmt(mirror / gf)); }
@@ -10212,7 +10322,14 @@ fn run_quantize(args: &[String]) {
     // STREAM the output to disk in ~12 GB shards as we go, so peak RAM is ~one shard + one input shard.
     // A 397B's ~220 GB of quantized output can't be buffered in 128 GB host RAM (the old accumulate-then-
     // shard path OOM'd past ~100 GB). Small models still collapse to one `model.safetensors` at the end.
-    const SHARD_BYTES: usize = 12 * 1024 * 1024 * 1024;
+    // Output shard size. The LOADER reads a whole shard into host memory (plus a copy of its
+    // parts and a read-ahead of the next), so a 12 GB shard costs ~36 GB of load-time transient
+    // on top of the device copy — enough to exhaust a 128 GB unified box on a 100 GB model
+    // (2026-08-28). 4 GB shards bound that transient at ~12 GB. GB10_QUANT_SHARD_GB overrides.
+    let shard_gb: usize = std::env::var("GB10_QUANT_SHARD_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let shard_bytes: usize = shard_gb * 1024 * 1024 * 1024;
+    #[allow(non_snake_case)]
+    let SHARD_BYTES = shard_bytes;
     let meta = std::collections::HashMap::from([
         ("format".to_string(), "pt".to_string()),
         ("quant_recipe".to_string(), recipe_s.to_string()),
@@ -10235,7 +10352,27 @@ fn run_quantize(args: &[String]) {
         outs.clear();
     };
 
+    // qwen4_exp PLE n-gram table (`...ple.ple_embedding.ngram_embedding.shard_<i>.weight`, 128 x
+    // [2500012, 160] bf16 in the source checkpoint): NOT a GEMM weight — an embedding gathered by
+    // row. Under `pletable:nvfp4` (part of `all`) it goes to the row-record codec
+    // (`quant::quantize_ple_rows`, 96 B/row) and is written with pwrite at `shard_idx * rows * 96`
+    // into ONE flat file `ple_ngram_nvfp4.bin` (shards arrive in file order, not index order), plus
+    // a `ple_ngram_nvfp4.json` sidecar carrying the per-shard global scales. Under `pletable:bf16`
+    // it is copied through like any other tensor (102 GB — allowed, not recommended).
+    use std::io::{Seek, SeekFrom, Write as _};
+    let ple_bin_path = outd.join("ple_ngram_nvfp4.bin");
+    let mut ple_file: Option<std::fs::File> = None;
+    let mut ple_shards: std::collections::BTreeMap<usize, (usize, f32, String)> = std::collections::BTreeMap::new();
+    let parse_ple_shard = |name: &str| -> Option<usize> {
+        let stem = name.strip_suffix(".weight")?;
+        let (_, tail) = stem.rsplit_once(".ngram_embedding.shard_")?;
+        tail.parse().ok()
+    };
+    // Debug knob (smoke runs): stop after N input shards. The output is then INCOMPLETE by design.
+    let shard_limit: Option<usize> = std::env::var("GB10_QUANT_SHARD_LIMIT").ok().and_then(|v| v.parse().ok());
+
     for (i, sf) in shards.iter().enumerate() {
+        if let Some(lim) = shard_limit { if i >= lim { println!("  GB10_QUANT_SHARD_LIMIT={lim}: stopping early (INCOMPLETE output)"); break; } }
         println!("  shard {}/{}: {}", i + 1, shards.len(),
                  sf.file_name().unwrap_or_default().to_string_lossy());
         let raw = std::fs::read(sf).expect("read shard");
@@ -10243,6 +10380,25 @@ fn run_quantize(args: &[String]) {
         for (name, view) in st.tensors() {
             let data = view.data();
             bytes_in += data.len() as u64;
+            if let Some(sidx) = parse_ple_shard(&name) {
+                if quant::fmt_for(&recipe, &name) == Fmt::Nvfp4 {
+                    let shape = view.shape();
+                    assert!(shape.len() == 2 && shape[1] == quant::PLE_DIM && view.dtype() == Dtype::BF16,
+                            "{name}: PLE shard must be bf16 [rows, {}], got {:?} {:?}", quant::PLE_DIM, view.dtype(), shape);
+                    let rows = shape[0];
+                    let w: &[half::bf16] = bytemuck::cast_slice(data);
+                    let (rec, gs) = quant::quantize_ple_rows(w, rows);
+                    let f = ple_file.get_or_insert_with(|| std::fs::OpenOptions::new()
+                        .create(true).write(true).truncate(true).open(&ple_bin_path).expect("create ple bin"));
+                    f.seek(SeekFrom::Start((sidx * rows * quant::PLE_REC_BYTES) as u64)).expect("seek ple bin");
+                    f.write_all(&rec).expect("write ple bin");
+                    bytes_out += rec.len() as u64;
+                    n_q4 += 1;
+                    println!("  PLE shard {sidx}: {rows} rows -> {} MB records (gs={gs:.4})", rec.len() / 1_000_000);
+                    ple_shards.insert(sidx, (rows, gs, name.clone()));
+                    continue;
+                }
+            }
             // Un-fused expert weight? stash for fusion, don't emit yet. Fuse ON-COMPLETE (a full
             // contiguous 0..E set for all three projections) so the stash stays ~1 layer deep in RAM.
             if let Some((base, proj, idx)) = parse_expert(&name) {
@@ -10291,9 +10447,43 @@ fn run_quantize(args: &[String]) {
         println!("  wrote {} shards + index (streamed to disk; peak RAM ~one shard)", shard_idx);
     }
 
+    // PLE table sidecar: shard geometry + per-shard global scales (the loader / SSD reader validate
+    // contiguity and row counts against config.json before serving).
+    if let Some(mut f) = ple_file.take() {
+        f.flush().expect("flush ple bin");
+        let n = ple_shards.len();
+        let idxs: Vec<usize> = ple_shards.keys().copied().collect();
+        let contiguous = idxs.iter().enumerate().all(|(i, &k)| i == k);
+        let rows0 = ple_shards[&idxs[0]].0;
+        let uniform = ple_shards.values().all(|(r, _, _)| *r == rows0);
+        if shard_limit.is_none() {
+            assert!(contiguous, "PLE shards are not contiguous 0..{n}: {idxs:?}");
+        }
+        assert!(uniform, "PLE shards must all have the same row count (record offset = shard * rows * 96)");
+        let total_rows: usize = ple_shards.values().map(|(r, _, _)| *r).sum();
+        let scales: Vec<f32> = ple_shards.values().map(|(_, g, _)| *g).collect();
+        let prefix = ple_shards.values().next().map(|(_, _, nm)| nm.rsplit_once(".shard_").unwrap().0.to_string()).unwrap();
+        let side = serde_json::json!({
+            "format": "ple-rows-nvfp4-v1",
+            "file": "ple_ngram_nvfp4.bin",
+            "tensor_prefix": prefix,
+            "dim": quant::PLE_DIM,
+            "record_bytes": quant::PLE_REC_BYTES,
+            "layout": "e2m1x160 | e4m3x10 | pad6",
+            "global_scale_convention": "reciprocal: w = e2m1 * e4m3 / global_scale",
+            "num_shards": n, "rows_per_shard": rows0, "total_rows": total_rows,
+            "complete": contiguous && shard_limit.is_none(),
+            "shard_global_scales": scales,
+        });
+        std::fs::write(outd.join("ple_ngram_nvfp4.json"), serde_json::to_string_pretty(&side).unwrap()).expect("write ple json");
+        println!("  PLE table: {n} shards, {total_rows} rows, {:.2} GB -> ple_ngram_nvfp4.bin (+ .json)",
+                 (total_rows * quant::PLE_REC_BYTES) as f64 / 1e9);
+    }
+
     // Carry the sidecars across, and record the recipe in config.json so the loader can self-detect.
     for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
-              "chat_template.jinja", "merges.txt", "vocab.json", "preprocessor_config.json"] {
+              "chat_template.jinja", "merges.txt", "vocab.json", "preprocessor_config.json",
+              "video_preprocessor_config.json"] {
         let src = ind.join(f);
         if src.exists() { let _ = std::fs::copy(&src, outd.join(f)); }
     }
@@ -10305,6 +10495,9 @@ fn run_quantize(args: &[String]) {
                 "format": "nvfp4-pack-quantized",
                 "recipe": recipe_s,
             });
+            if !ple_shards.is_empty() {
+                cfg["quantization_config"]["ple_table"] = serde_json::json!("ple_ngram_nvfp4.json");
+            }
             let _ = std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap());
         }
     }
@@ -11672,6 +11865,22 @@ fn run_server(args: &[String]) {
                       max_seq_len, model_max, model_max);
             model_max
         } else { max_seq_len };
+        // qwen4_exp: past indexer_budget + compress_ratio - 1 visible tokens the full-attention layers
+        // run the QSA sparse-attention indexer (top-k blocks + tail); below it every block is selected
+        // and the dense kernels are exact. GB10_Q4_DENSE_ATTN=1 forces dense at any length (A/B only —
+        // NOT the reference model past the limit).
+        if cfg.has_indexer() {
+            let limit = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
+            if max_seq_len > limit {
+                if std::env::var("GB10_Q4_DENSE_ATTN").is_ok() {
+                    eprintln!("[warn] GB10_Q4_DENSE_ATTN: dense attention beyond {limit} visible tokens — NOT the reference model.");
+                } else {
+                    println!("QSA sparse attention: live beyond {limit} visible tokens (budget {} over {}-token blocks, {} attention layers + MTP head).",
+                             cfg.indexer_budget, cfg.indexer_compress_ratio,
+                             cfg.layer_types.iter().filter(|t| matches!(t, gb10_inference::qwen::LayerType::FullAttention)).count());
+                }
+            }
+        }
         println!("Context: --max-seq-len {} (model max {}). KV cache ~{:.1} GB at batch {}.",
                  max_seq_len, model_max,
                  {
@@ -12000,7 +12209,16 @@ fn run_server(args: &[String]) {
             }
         }
 
-        let vision_tower = gb10_inference::vision_tower::VisualTower::load(&model_path).ok().map(std::sync::Arc::new);
+        // qwen4_exp: vision is not supported for this family, and VisualTower::load reads the
+        // artifact's shards into host memory to find `model.visual.*` — on the 97 GB
+        // Qwen3.8-Flash-Next artifact that read (~1.2 GB/s of RSS growth after the model was
+        // already resident) is what exhausted the box on 2026-08-28. Skip it outright.
+        let vision_tower = if cfg.is_q4() {
+            println!("Vision: not supported on qwen4_exp — tower not loaded (text-only server).");
+            None
+        } else {
+            gb10_inference::vision_tower::VisualTower::load(&model_path).ok().map(std::sync::Arc::new)
+        };
         let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
         // GPU vision fast path: build on the shared device (same primary context as the serving model).
         // Soft-fail — a GPU-less / PTX-less box keeps the CPU tower (or text-only behavior).

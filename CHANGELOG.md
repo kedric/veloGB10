@@ -3,6 +3,27 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## Unreleased — Qwen3.8-Flash-Next (qwen4_exp)
+
+- **Qwen3.8-Flash-Next support** (`model_type: qwen4_exp`, 176B-A10B): hyper-connection residual
+  streams, PLE n-gram injection, sigmoid-gated GatedDeltaNet, MoE 512×10 + shared expert, and its
+  MTP head — served by the regular `GpuModel` engine (server, batching, prefix cache, verify).
+- **Everything NVFP4**, including the 320M-row PLE n-gram table, quantized by `--quantize --recipe
+  all` into 96-byte row records (`ple_ngram_nvfp4.bin`) that the engine keeps on the GPU or
+  streams from the SSD (`--ple-offload ssd`, bit-identical).
+- New quantizer groups `hc`, `ple`, `pletable`; 4 GB output shards (`GB10_QUANT_SHARD_GB`).
+- Host-memory watchdog (`GB10_MEM_WATCHDOG_GB`) and an exact load-time memory guard for this
+  family; `GB10_LOAD_FORCE` no longer bypasses it (`=unsafe` does).
+- `--probe-q4` (prefill + greedy decode, optional logits dump) and `scripts/qwen4exp/` (HF
+  reference oracle on a synthetic model, quantization round-trip check).
+- **QSA sparse attention** (`Qwen4ExpTextQSAIndexer`): past 2051 visible tokens every attention
+  layer (and the MTP head) attends to the 512 best-scoring 4-token blocks + tail, selected by a
+  deterministic radix top-k in the verify kernels' rank space — MTP stays lossless. Raw indexer
+  keys are cached per position like the KV; below the limit the dense kernels are unchanged.
+  `GB10_Q4_DENSE_ATTN=1` (A/B) forces dense; `GB10_QSA_DUMP=1` dumps selections for the oracle
+  check (`scripts/qwen4exp/compare_qsa.py`).
+- Limits: no TP, no vision for this family; QSA needs a bf16 KV cache.
+
 ## v0.5.0 — Vision support
 
 - **Vision support.** Image input is now supported end-to-end on a GPU vision tower

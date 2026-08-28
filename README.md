@@ -292,6 +292,7 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   | Qwen3.5 122B MoE | [doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED) / [GDN4](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-GDN4) | MoE hybrid, `nvfp4-mixed` or `gdn4` |
   | Tencent Hy3 | [doth4580/Tencent-Hy3-295B-A21B-NVFP4](https://huggingface.co/doth4580/Tencent-Hy3-295B-A21B-NVFP4) | 295B-A21B pure-GQA MoE |
   | KAT-Coder-V2.5-Dev | [doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED](https://huggingface.co/doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED) | 35B-A3B MoE hybrid, code specialist, `nvfp4-mixed` |
+  | Qwen3.8-Flash-Next | quantize locally from [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (`--recipe all`, see [QWEN_FLASH_NEXT_SETUP.md](QWEN_FLASH_NEXT_SETUP.md)) | 176B-A10B MoE hybrid with hyper-connections + PLE n-gram table, **all NVFP4** incl. the PLE table (GPU-resident or `--ple-offload ssd`); QSA sparse attention past 2051 tokens (`--max-seq-len` up to 262144) |
 
 ## Unique aspects
 
@@ -421,6 +422,7 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch |
+| `--ple-offload <ssd\|none>` | none | Qwen3.8-Flash-Next only: keep the 31 GB PLE n-gram table on the SSD and read the rows each forward needs (bit-identical to resident; decode graphs off) |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |
