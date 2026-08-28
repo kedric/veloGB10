@@ -12209,15 +12209,13 @@ fn run_server(args: &[String]) {
             }
         }
 
-        // qwen4_exp: vision is not supported for this family, and VisualTower::load reads the
-        // artifact's shards into host memory to find `model.visual.*` — on the 97 GB
-        // Qwen3.8-Flash-Next artifact that read (~1.2 GB/s of RSS growth after the model was
-        // already resident) is what exhausted the box on 2026-08-28. Skip it outright.
-        let vision_tower = if cfg.is_q4() {
-            println!("Vision: not supported on qwen4_exp — tower not loaded (text-only server).");
-            None
-        } else {
-            gb10_inference::vision_tower::VisualTower::load(&model_path).ok().map(std::sync::Arc::new)
+        // The tower loader reads ONLY the shards holding `model.visual.*` (reading every shard of
+        // the 97 GB Qwen3.8-Flash-Next artifact into host memory is what exhausted the box on
+        // 2026-08-28). qwen4_exp uses the same tower as Qwen3.5 with a 2560-wide merger.
+        let vt0 = std::time::Instant::now();
+        let vision_tower = match gb10_inference::vision_tower::VisualTower::load(&model_path) {
+            Ok(t) => { println!("Vision tower loaded in {:.1}s (merger out {}).", vt0.elapsed().as_secs_f32(), t.out_hidden); Some(std::sync::Arc::new(t)) }
+            Err(e) => { println!("Vision: tower not loaded ({e}) — text-only server."); None }
         };
         let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
         // GPU vision fast path: build on the shared device (same primary context as the serving model).

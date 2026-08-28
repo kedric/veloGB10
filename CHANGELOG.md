@@ -22,7 +22,11 @@ generic language where they aren't individually notable.
   keys are cached per position like the KV; below the limit the dense kernels are unchanged.
   `GB10_Q4_DENSE_ATTN=1` (A/B) forces dense; `GB10_QSA_DUMP=1` dumps selections for the oracle
   check (`scripts/qwen4exp/compare_qsa.py`).
-- Limits: no TP, no vision for this family; QSA needs a bf16 KV cache.
+- **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
+  read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
+  `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).
+- Limits: no TP for this family; QSA needs a bf16 KV cache; image tokens use 1-D positions (no
+  MRoPE — as on Qwen3.5).
 
 ## v0.5.0 — Vision support
 

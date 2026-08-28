@@ -77,7 +77,7 @@ pub struct BatchRequest {
     /// it at into_request). Feeds the `[req] ttft=` log line — the server-side TTFT truth the
     /// measurement protocol asserts.
     pub received_at: std::time::Instant,
-    /// V3 vision: merged image embeddings (concatenated, [sum(num_tokens), 5120] f32) + the spans
+    /// V3 vision: merged image embeddings (concatenated, [sum(num_tokens), hidden] f32) + the spans
     /// (absolute positions in the EXPANDED prompt). None/empty for text-only traffic (unchanged).
     pub image_embeds: Option<Vec<f32>>,
     pub image_spans: Vec<crate::vision_encoder::ImageSpan>,

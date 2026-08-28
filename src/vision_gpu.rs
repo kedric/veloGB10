@@ -14,7 +14,7 @@
 
 use crate::gpu::{fork_blocking_stream, Pool, S};
 use crate::vision_tower::{
-    HIDDEN, HEADS, HEAD_DIM, INTER, MERGE, OUT_HIDDEN, MERGE_INTER, NUM_POS, IN_CH, PATCH, TEMPORAL,
+    HIDDEN, HEADS, HEAD_DIM, INTER, MERGE, MERGE_INTER, NUM_POS, IN_CH, PATCH, TEMPORAL,
     VisualBlock, VisualTower,
 };
 use anyhow::Result;
@@ -269,11 +269,12 @@ impl GpuVisualTower {
         self.gemm(&self.merger_fc1_w, &ln, &mut mfc1, MERGE_INTER, MERGE_INTER, tn);
         self.bias_add(&mut mfc1, &self.merger_fc1_b, tn, MERGE_INTER);
         self.gelu(&mut mfc1, tn * MERGE_INTER);
-        let mut out = self.pool.get(tn * OUT_HIDDEN);
-        self.gemm(&self.merger_fc2_w, &mfc1, &mut out, MERGE_INTER, OUT_HIDDEN, tn);
-        self.bias_add(&mut out, &self.merger_fc2_b, tn, OUT_HIDDEN);
+        let out_hidden = self.host.out_hidden;
+        let mut out = self.pool.get(tn * out_hidden);
+        self.gemm(&self.merger_fc2_w, &mfc1, &mut out, MERGE_INTER, out_hidden, tn);
+        self.bias_add(&mut out, &self.merger_fc2_b, tn, out_hidden);
 
-        let merged = self.to_host(&out, tn * OUT_HIDDEN);
+        let merged = self.to_host(&out, tn * out_hidden);
         self.dev.synchronize().unwrap();
         Ok((merged, states))
     }

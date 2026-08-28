@@ -20,6 +20,9 @@ pub const HEAD_DIM: usize = HIDDEN / HEADS; // 72
 pub const INTER: usize = 4304;
 pub const NUM_BLOCKS: usize = 27;
 pub const NUM_POS: usize = 2304;
+/// Merger output width of the Qwen3.5-class towers (= text hidden 5120). qwen4_exp's tower is the
+/// same network with a 2560-wide merger output: the width is read from the checkpoint
+/// (`VisualTower::out_hidden`), this constant only names the historical default.
 pub const OUT_HIDDEN: usize = 5120;
 pub const MERGE_INTER: usize = HIDDEN * MERGE * MERGE; // 4608
 
@@ -51,8 +54,10 @@ pub struct VisualTower {
     pub merger_norm_b: Vec<f32>, // [HIDDEN]
     pub merger_fc1_w: Vec<f32>,  // [MERGE_INTER, MERGE_INTER] = [4608, 4608]
     pub merger_fc1_b: Vec<f32>,  // [MERGE_INTER]
-    pub merger_fc2_w: Vec<f32>,  // [OUT_HIDDEN, MERGE_INTER] = [5120, 4608]
-    pub merger_fc2_b: Vec<f32>,  // [OUT_HIDDEN]
+    pub merger_fc2_w: Vec<f32>,  // [out_hidden, MERGE_INTER] = [5120|2560, 4608]
+    pub merger_fc2_b: Vec<f32>,  // [out_hidden]
+    /// Merger output width = the language model's hidden size (5120 Qwen3.5 27B, 2560 qwen4_exp).
+    pub out_hidden: usize,
 }
 
 struct Map<'a> {
@@ -76,6 +81,12 @@ impl<'a> Map<'a> {
             }
         }
         Ok(Map { m })
+    }
+
+    /// Element count of a tensor (by its byte length and dtype).
+    fn len(&self, name: &str) -> Result<usize> {
+        let (dt, data) = self.m.get(name).ok_or_else(|| anyhow!("missing tensor: {}", name))?;
+        Ok(match *dt { "F32" => data.len() / 4, _ => data.len() / 2 })
     }
 
     fn get(&self, name: &str, n: usize) -> Result<Vec<f32>> {
@@ -128,8 +139,12 @@ impl VisualTower {
             let raw = std::fs::read_to_string(&index)?;
             let j: serde_json::Value = serde_json::from_str(&raw)?;
             if let Some(wm) = j["weight_map"].as_object() {
+                // Only the shards that hold `model.visual.*`. Reading every shard into host memory
+                // to find them is what pushed the box into the kernel's OOM path on a 97 GB
+                // artifact (2026-08-28): the tower is ~1.3 GB and lives in one 4 GB shard.
                 let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for (_, v) in wm {
+                for (k, v) in wm {
+                    if !k.starts_with("model.visual.") { continue; }
                     if let Some(s) = v.as_str() {
                         set.insert(s.to_string());
                     }
@@ -195,6 +210,7 @@ impl VisualTower {
             consumed.insert(b.clone());
         }
 
+        let out_hidden = map.len("model.visual.merger.linear_fc2.bias")?;
         let tower = VisualTower {
             patch_embed_w: map.get("model.visual.patch_embed.proj.weight", HIDDEN * IN_CH * TEMPORAL * PATCH * PATCH)?,
             patch_embed_b: map.get("model.visual.patch_embed.proj.bias", HIDDEN)?,
@@ -204,8 +220,9 @@ impl VisualTower {
             merger_norm_b: map.get("model.visual.merger.norm.bias", HIDDEN)?,
             merger_fc1_w: map.get("model.visual.merger.linear_fc1.weight", MERGE_INTER * MERGE_INTER)?,
             merger_fc1_b: map.get("model.visual.merger.linear_fc1.bias", MERGE_INTER)?,
-            merger_fc2_w: map.get("model.visual.merger.linear_fc2.weight", OUT_HIDDEN * MERGE_INTER)?,
-            merger_fc2_b: map.get("model.visual.merger.linear_fc2.bias", OUT_HIDDEN)?,
+            merger_fc2_w: map.get("model.visual.merger.linear_fc2.weight", out_hidden * MERGE_INTER)?,
+            merger_fc2_b: map.get("model.visual.merger.linear_fc2.bias", out_hidden)?,
+            out_hidden,
         };
 
         // Strict "unexpected tensor" check: every model.visual.* key must have been consumed.
@@ -249,6 +266,6 @@ mod tests {
         assert_eq!(t.blocks.len(), 27);
         assert_eq!(t.patch_embed_w.len(), 1152 * 3 * 2 * 16 * 16);
         assert_eq!(t.pos_embed_w.len(), 2304 * 1152);
-        assert_eq!(t.merger_fc2_w.len(), 5120 * 4608);
+        assert_eq!(t.merger_fc2_w.len(), t.out_hidden * 4608);
     }
 }

@@ -11118,3 +11118,118 @@ extern "C" __global__ void qsa_compact_b(__nv_bfloat16* keys, __nv_bfloat16* scr
     long long soff = (long long)k * hd + dv;
     if (dir == 0) scratch[soff] = keys[coff]; else keys[coff] = scratch[soff];
 }
+
+// 4b. prefill score combine after the cuBLAS head GEMMs: G[h][t*nblk + j] = (q_{t,h} · K_j)/√hd
+//     (alpha folded in), scores[t*nblk + j] = Σ_h relu(G) for j < (pos_start+t+1)/ratio.
+extern "C" __global__ void qsa_score_combine_b(float* scores, const float* G, const QsaParams* p,
+                                               int pos_start, int nch, int nblk) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)nch * nblk) return;
+    const int t = (int)(idx / nblk), j = (int)(idx % nblk);
+    if (j >= (pos_start + t + 1) / p->ratio) return;
+    const long long hs = (long long)nch * nblk;
+    float s = 0.0f;
+    for (int h = 0; h < p->heads; h++) s += fmaxf(G[h * hs + idx], 0.0f);
+    if (s == 0.0f) s = 0.0f;
+    scores[idx] = s;
+}
+
+// 7b. gqa_attn_sel_prefill2 — the selected-list prefill attention, restructured for gathered rows:
+//     one warp per (query, kv head, group of SEL_GS query heads) so a K/V row is fetched once per
+//     group instead of once per head, and SEL_KU keys in flight per iteration (the selected rows have
+//     no locality — the one-key loop of gqa_attn_sel_prefill was latency-bound: 250 ms/layer on a
+//     7.3K prompt). Per-query arithmetic and order are unchanged (keys ascending, same lane dot /
+//     xor-tree / online softmax), so the output is bit-identical to gqa_attn_sel_prefill.
+//     hd <= 256. grid (ceil(N/8) * nkv * ngroups), block 256.
+#define SEL_GS 4
+#define SEL_KU 4
+extern "C" __global__ void __launch_bounds__(256) gqa_attn_sel_prefill2(__nv_bfloat16* out, const __nv_bfloat16* q,
+    const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, int stride, int nh_packed, float scale,
+    int N, const int* sel, const int* pos_sel, int sel_max) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int nkv = nh_packed & 0x3FF;
+    const int G = nh / nkv;
+    const int ngroups = (G + SEL_GS - 1) / SEL_GS;
+    const int QT = blockDim.x >> 5;
+    const int blk = blockIdx.x;
+    const int tile = blk / (nkv * ngroups);
+    const int rem = blk % (nkv * ngroups);
+    const int kvh = rem / ngroups, grp = rem % ngroups;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int DPL = hd >> 5;                    // <= 8
+    const int t = tile * QT + warp;
+    if (t >= N) return;
+    const int pc = pos_sel[t] + 1;
+    const int* srow = sel + (long long)t * sel_max;
+    const int h0 = grp * SEL_GS;
+    const int nhg = min(SEL_GS, G - h0);
+
+    float qv[SEL_GS][8];
+    #pragma unroll
+    for (int g = 0; g < SEL_GS; g++) {
+        const int qh = kvh * G + h0 + g;
+        const __nv_bfloat16* qrow = q + (long long)t * (nh * hd) + (long long)qh * hd + lane * DPL;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) qv[g][i] = (g < nhg && i < DPL) ? b2f(qrow[i]) : 0.0f;
+    }
+    float m[SEL_GS], l[SEL_GS], acc[SEL_GS][8];
+    #pragma unroll
+    for (int g = 0; g < SEL_GS; g++) { m[g] = -1e30f; l[g] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) acc[g][i] = 0.0f; }
+
+    const long long kvbase = (long long)kvh * stride;
+    const __nv_bfloat16* kb = k_cache + kvbase * hd + lane * DPL;
+    const __nv_bfloat16* vb = v_cache + kvbase * hd + lane * DPL;
+    for (int r0 = 0; r0 < pc; r0 += SEL_KU) {
+        float kr[SEL_KU][8], vr[SEL_KU][8];
+        #pragma unroll
+        for (int u = 0; u < SEL_KU; u++) {
+            const int r = min(r0 + u, pc - 1);          // clamp: surplus lanes recompute the last key, masked below
+            const int tt = srow[r];
+            const __nv_bfloat16* krow = kb + (long long)tt * hd;
+            const __nv_bfloat16* vrow = vb + (long long)tt * hd;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) { kr[u][i] = (i < DPL) ? b2f(krow[i]) : 0.0f; vr[u][i] = (i < DPL) ? b2f(vrow[i]) : 0.0f; }
+        }
+        float s[SEL_KU][SEL_GS];
+        #pragma unroll
+        for (int u = 0; u < SEL_KU; u++)
+            #pragma unroll
+            for (int g = 0; g < SEL_GS; g++) {
+                float d = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) d += qv[g][i] * kr[u][i];
+                s[u][g] = d;
+            }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            #pragma unroll
+            for (int u = 0; u < SEL_KU; u++)
+                #pragma unroll
+                for (int g = 0; g < SEL_GS; g++) s[u][g] += __shfl_xor_sync(0xffffffffu, s[u][g], off);
+        #pragma unroll
+        for (int u = 0; u < SEL_KU; u++) {
+            if (r0 + u >= pc) break;
+            #pragma unroll
+            for (int g = 0; g < SEL_GS; g++) {
+                const float sc = s[u][g] * scale;
+                const float m_new = fmaxf(m[g], sc);
+                const float a_old = __expf(m[g] - m_new), a_cur = __expf(sc - m_new);
+                #pragma unroll
+                for (int i = 0; i < 8; i++) acc[g][i] = acc[g][i] * a_old + a_cur * vr[u][i];
+                m[g] = m_new;
+                l[g] = l[g] * a_old + a_cur;
+            }
+        }
+    }
+    #pragma unroll
+    for (int g = 0; g < SEL_GS; g++) {
+        if (g >= nhg) break;
+        const int qh = kvh * G + h0 + g;
+        __nv_bfloat16* orow = out + (long long)t * (nh * hd) + (long long)qh * hd + lane * DPL;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) if (i < DPL) orow[i] = f2b(l[g] > 0.0f ? acc[g][i] / l[g] : 0.0f);
+    }
+}

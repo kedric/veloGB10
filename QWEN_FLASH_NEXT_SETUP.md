@@ -91,9 +91,15 @@ with torch, ollama models) on the same box.
 | prefill, greedy / sampled decode, continuous batching, prefix cache, OpenAI server, tool calls | works (validated against the HF reference on a synthetic model: logits cos ≥ 0.9999, argmax identical) |
 | PLE on SSD (`--ple-offload ssd`) | works, bit-identical to resident |
 | MTP speculative decoding (`--mtp auto`) | works, greedy output byte-identical to `--mtp off` (lossless); acceptance 64–78 %, ~3.1 tokens per verify forward, 27.8 → 47.5 tok/s end-to-end on a code answer (single GB10, PLE on SSD) |
-| context > 2048 (QSA sparse attention) | works — `--max-seq-len` up to the model max; selection lists identical to the HF reference on the synthetic model (7/8 positions; the 8th is a score tie within bf16 noise), argmax 8/8. Real model, 7.3K-token needle prompt (`--max-seq-len 8192`, server): needle found, TTFT 10.2 s (~715 tok/s prefill), decode unchanged (~30 tok/s; 47 tok/s with `--mtp auto`, 71 % acceptance), output byte-identical with and without MTP, min 37 GB host memory free — see §3 |
+| context > 2048 (QSA sparse attention) | works — `--max-seq-len` up to the model max; selection lists identical to the HF reference on the synthetic model (7/8 positions; the 8th is a score tie within bf16 noise), argmax 8/8. Real model, 7.3K-token needle prompt (`--max-seq-len 8192`, server): needle found, TTFT 8.2 s (~890 tok/s prefill; 7.9 s with dense attention forced), decode unchanged (~30 tok/s; 47 tok/s with `--mtp auto`, 71 % acceptance), output byte-identical with and without MTP, min 37 GB host memory free — see §3 |
 | TP=2 / TP=4 | not brought up for this family yet |
-| vision input | not supported for this family (the tower is copied through the quantizer, unused) |
+
+Vision: `--vision-cpu` forces the CPU reference tower. Positions: the engine assigns sequential 1-D
+positions to image tokens (the reference uses interleaved 3-D MRoPE: (t, h, w) per image patch and
+`max(h, w)/2` positions per image for the following text). This is the existing behaviour on
+Qwen3.5 as well; implementing MRoPE (3-D rope gather in the attention and QSA-indexer kernels,
+per-lane position deltas after images) is the remaining fidelity item for image input.
+| vision input (OpenAI `image_url`, PNG/JPEG/WebP/GIF) | works — same tower as Qwen3.5 (identical HF code, 2560-wide merger), GPU tower, loaded from the one shard that holds `model.visual.*` (6 s, ~1.3 GB); image embeddings spliced before the hyper-connection expansion. Same limitation as the other families: image tokens use 1-D positions (no 3-D MRoPE) — see §3 |
 
 ### QSA sparse attention (long context)
 
@@ -112,10 +118,15 @@ there and the engine keeps its dense kernels: **with `--max-seq-len <= 2051` not
   selects exactly what the decode at that position would: MTP stays lossless;
 - the top-k is a deterministic radix select (ties → lowest block), the selected keys are visited in
   ascending order by a copy of the dense split-K kernel with one address indirection;
-- prefill scores every query of a window against precomputed block keys (custom scalar kernel: on
-  the 7.3K-token prompt the indexer adds ~2.3 s to a 7.9 s dense prefill — a cuBLAS score GEMM is
-  the obvious next optimization); decode adds one small kernel chain per attention layer (no
-  measurable tok/s change).
+- prefill: a window whose queries all see ≤ 2051 tokens stays on the dense tensor-core path (raw
+  keys are still cached); past that, scores are one cuBLAS GEMM batched over the indexer heads
+  (bf16 in, f32 out, 1/√hd in alpha) + a relu-sum/causal combine (~4 ms per layer on a 7.3K
+  prompt), and the attention over each query's list runs `gqa_attn_sel_prefill2` (one warp per
+  query × kv head × 4-head group, 4 gathered keys in flight: 86 ms per layer at 7.3K — the whole
+  sparse prefill costs 8.2 s vs 7.9 s with dense attention forced). A/B knobs: `GB10_QSA_SCALAR=1`
+  (scalar score kernel), `GB10_QSA_SEL_V1=1` (one-key-at-a-time attention, 250 ms/layer),
+  `GB10_QSA_TIME=1` (per-phase timing, syncs). Decode adds one small kernel chain per attention
+  layer (no measurable tok/s change).
 
 Flags / env: `--max-seq-len N` (KV + raw keys sized to N; the RoPE tables cap it at the model's
 262144); `GB10_Q4_DENSE_ATTN=1` forces dense attention at any length (A/B only — NOT the reference

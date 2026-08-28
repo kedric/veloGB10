@@ -4114,7 +4114,7 @@ impl GpuModel {
             "ple_hash_b","ple_ring_commit_b","ple_gather_rows_b","ple_dequant_rows_b","ple_gate_b",
             "ple_dconv_decode_b","ple_dconv_prefill_b","ple_dconv_state_b","ple_slot_copy_b","hc_add_bcast_b",
             "qsa_key_write_b","qsa_score_b","qsa_block_keys_b","qsa_score_prefill_b","qsa_topk_b",
-            "gqa_attn_sel_splitk","gqa_attn_sel_prefill","qsa_compact_b",
+            "gqa_attn_sel_splitk","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
             "kernel_build_id"];
         dev.load_ptx(bptx, module, &bfnames)?;
         Self::assert_kernel_build_id(dev, module)?;
@@ -8646,10 +8646,10 @@ impl GpuModel {
         let (h, hd, rdim) = (cfg.hidden_size, cfg.head_dim, cfg.rotary_dim);
         // qwen4_exp QSA: raw-key write + per-column selection lists (reads the same normed input as
         // the qkv projection). None => dense attention, the pre-indexer path byte for byte.
-        let qsa_sel: Option<(S, S)> = qsa.as_ref().map(|qs| match prefill_pos_start {
+        let qsa_sel: Option<(S, S)> = qsa.as_ref().and_then(|qs| match prefill_pos_start {
             Some(ps) => self.qsa_select_prefill(pool, qs.idx, hidden, qs.keys_ptr, kv_stride, ps, batch, cos, sin),
-            None => self.qsa_select_cols(pool, qs.idx, hidden, qs.keys_ptr, kv_stride, *pos_dev.device_ptr() as u64,
-                                         qs.logical_ptr, slot_ids_ptr, qs.path_ptr, qs.cps_ptr, cos, sin, batch, max_pc),
+            None => Some(self.qsa_select_cols(pool, qs.idx, hidden, qs.keys_ptr, kv_stride, *pos_dev.device_ptr() as u64,
+                                              qs.logical_ptr, slot_ids_ptr, qs.path_ptr, qs.cps_ptr, cos, sin, batch, max_pc)),
         });
         let qsa_sel_ptrs: Option<(u64, u64)> = qsa_sel.as_ref().map(|(a, b)| (d(a), d(b)));
         // TP=2: each box owns half the heads (12Q/2KV). Weights + KV cache are sharded to match, so the
@@ -10144,13 +10144,11 @@ impl GpuModel {
         let inj: Option<S> = if q4 { Some(pool.get(hcn * n)) } else { None };
         let residual = if lo == 0 {
             if xchain_active() { xchain_new(n); }
-            let r = self.embed_batch_resid(prompt);
             // V3 vision-embed splice: overwrite the image_pad span rows of the embedded hidden with the
-            // merged image embeddings (width == text hidden 5120). Must run BEFORE the layer loop.
-            if let Some(ve) = &state.vision_embeds {
-                self.splice_vision(ve, &state.vision_spans, &r, pos_start, n);
-            }
-            r
+            // merged image embeddings (width == text hidden). Must run BEFORE the layer loop — and, on
+            // qwen4_exp, before the hyper-connection expansion (inside embed_batch_resid_vision).
+            let vision = state.vision_embeds.as_ref().map(|ve| (ve, state.vision_spans.as_slice()));
+            self.embed_batch_resid_vision(prompt, vision, pos_start)
         } else {
             // PP-prefill: continue from the lower range's residual stream (bf16, value-exact).
             incoming.expect("prefill_batch_range: lo > 0 requires the incoming hidden")
@@ -10611,12 +10609,14 @@ impl GpuModel {
                     } else {
                     blaunch!(self, "write_kv_prefill", grid(n*nkv*hd), (256,1,1), 0, (kc_ptr, vc_ptr, d(&k), d(&v), kv_stride as i32, nkv as i32, hd as i32, n as i32, pos_start as i32));
                     // qwen4_exp QSA: raw keys → the slot's cache, then per-query block selection.
-                    let qsa_sel: Option<(S, S)> = self.qsa_in(state, fa, li, kv_stride, 0, 0, 0).map(|qs| {
+                    let qsa_sel: Option<(S, S)> = self.qsa_in(state, fa, li, kv_stride, 0, 0, 0).and_then(|qs| {
                         let keys_ptr = qs.keys_ptr + (slot * kv_stride * cfg.indexer_head_dim * 2) as u64;
                         self.qsa_select_prefill(pool, qs.idx, &normed, keys_ptr, kv_stride, pos_start, n, &cos, &sin)
                     });
                     if let Some((sel, pos_sel)) = &qsa_sel {
+                        let ta = std::time::Instant::now();
                         self.qsa_attn_prefill_ptrs(&mut attn, &q, kc_ptr, vc_ptr, kv_stride, nh, nkv, hd, scale, n, d(sel), d(pos_sel));
+                        if std::env::var("GB10_QSA_TIME").is_ok() { self.sync_stream(); eprintln!("[qsa-time] prefill n={n}: selected attention {:.2} ms", ta.elapsed().as_secs_f32()*1e3); }
                     } else if n >= PF_MIN && !prefill_scalar() {
                         self.attn_prefill_tiled(pool, &q, kc_ptr, vc_ptr, kv_stride, nh, nkv, n, pos_start, &mut attn);
                     } else {
@@ -18787,6 +18787,10 @@ mod shard_factor_tests {
            lin_k: usize, lin_v: usize, vocab: usize, num_experts: usize, si: usize) -> Config {
         Config {
             family: crate::qwen::Family::Qwen35,
+            hc_count: 1, hc_lowrank: 0, gdn_gate_sigmoid: false, ple_layer: None, ple_ngram_size: 0,
+            ple_heads_per_ngram: 0, ple_vocab_base: 0, ple_embed_dim: 0, ple_conv_kernel: 0,
+            ple_vocab_divisor: 128, ple_seed: 1234, indexer_n_heads: 0, indexer_head_dim: 0,
+            indexer_budget: 0, indexer_compress_ratio: 1,
             hidden_size: 5120,
             intermediate_size,
             num_layers: 64,
@@ -19308,14 +19312,24 @@ impl GpuModel {
     }
 
     /// `embed_batch` in the residual layout (see `embed_gather_resid`).
-    pub fn embed_batch_resid(&self, tokens: &[u32]) -> B {
-        if !self.cfg.is_q4() { return self.embed_batch(tokens); }
+    pub fn embed_batch_resid(&self, tokens: &[u32]) -> B { self.embed_batch_resid_vision(tokens, None, 0) }
+
+    /// `embed_batch_resid` with the V3 image-embed splice applied to the token embeddings BEFORE
+    /// the hyper-connection expansion (the residual is `[hc*h, n]`; the spans are h-wide rows of
+    /// the embedding, exactly what `splice_vision` overwrites on the other families).
+    pub fn embed_batch_resid_vision(&self, tokens: &[u32], vision: Option<(&B, &[crate::vision_encoder::ImageSpan])>, pos_start: usize) -> B {
+        if !self.cfg.is_q4() {
+            let r = self.embed_batch(tokens);
+            if let Some((ve, spans)) = vision { self.splice_vision(ve, spans, &r, pos_start, tokens.len()); }
+            return r;
+        }
         let h = self.cfg.hidden_size; let rw = self.cfg.resid_width();
         let b = tokens.len();
         let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let toks_dev = self.dev.htod_sync_copy(&toks_i32).expect("htod tokens");
         let tmp = self.dev.alloc_zeros::<half::bf16>(h * b).unwrap();
         self.embed_gather(d(&tmp), *toks_dev.device_ptr() as u64, h, b);
+        if let Some((ve, spans)) = vision { self.splice_vision(ve, spans, &tmp, pos_start, b); }
         let hidden = self.dev.alloc_zeros::<half::bf16>(rw * b).unwrap();
         blaunch!(self, "hc_expand_b", grid(rw * b), (256,1,1), 0,
             (d(&hidden), d(&tmp), h as i32, self.cfg.hc_count as i32, b as i32));
@@ -19646,12 +19660,21 @@ impl GpuModel {
     /// = that slot's raw-key base): block keys are built once from the committed raw keys, then every
     /// query is scored against the blocks it can see. Same return contract as `qsa_select_cols`.
     pub(crate) fn qsa_select_prefill(&self, pool: &mut Pool, idx: &GpuIndexer, hidden: &B, keys_ptr: u64, stride: usize,
-                                     pos_start: usize, n: usize, cos: &S, sin: &S) -> (S, S) {
+                                     pos_start: usize, n: usize, cos: &S, sin: &S) -> Option<(S, S)> {
         let cfg = &self.cfg;
         let (hdx, heads, ratio) = (cfg.indexer_head_dim, cfg.indexer_n_heads, cfg.indexer_compress_ratio);
+        let timing = std::env::var("GB10_QSA_TIME").is_ok();
+        let t0 = std::time::Instant::now();
         let (qk, qk_dim) = self.qsa_qk(pool, idx, hidden, cos, sin, n);
         blaunch!(self, "qsa_key_write_b", grid(n*hdx), (256,1,1), 0,
             (keys_ptr, d(&qk), 0u64, 0u64, stride as i32, pos_start as i32, qk_dim as i32, (heads*hdx) as i32, hdx as i32, n as i32));
+        if pos_start + n <= self.qsa_limit() {
+            // Every query of this window sees at most `limit` tokens: the indexer would select every
+            // block. Raw keys are cached (later windows need them); the attention stays on the dense
+            // tensor-core path.
+            pool.release_bf16(qk, qk_dim * n);
+            return None;
+        }
         let sel_max = self.qsa_limit();
         let sel = pool.get(n * sel_max);
         let pos_sel = pool.get(n);
@@ -19664,27 +19687,58 @@ impl GpuModel {
             let blocks = pool.get_bf16(nblk * hdx);
             blaunch!(self, "qsa_block_keys_b", (nblk.div_ceil(8) as u32,1,1), (256,1,1), 0,
                 (d(&blocks), keys_ptr, d(&idx.params), nblk as i32));
-            const QCH: usize = 1024;             // query chunk: bounds the [QCH][nblk] f32 score scratch
+            if timing { self.sync_stream(); eprintln!("[qsa-time] prefill n={n} pos_start={pos_start}: qk+keys+blocks {:.2} ms", t0.elapsed().as_secs_f32()*1e3); }
+            // Scores: one tensor-core GEMM batched over the heads (A = the block keys, shared across
+            // the batch via strideA = 0; B = head h of the roped q at offset h*hd, ld = qk_dim;
+            // 1/√hd folded into alpha — relu commutes with a positive scale), then a relu-sum +
+            // causal-mask combine. GB10_QSA_SCALAR=1 keeps the scalar kernel (A/B; ~+30 % prefill
+            // time on a 7K prompt).
+            let scalar = std::env::var("GB10_QSA_SCALAR").is_ok();
+            const QCH: usize = 256;              // query chunk: bounds the [heads][QCH][nblk] f32 GEMM scratch
             const QT: usize = 8;                 // QSA_PF_QT
             let qch = n.min(QCH);
             let scores = pool.get(qch * nblk);
+            let gbuf = if scalar { None } else { Some(pool.get(heads * qch * nblk)) };
             let smem = (QT * heads * hdx * 4) as u32;
             for t0 in (0..n).step_by(QCH) {
                 let nch = (n - t0).min(QCH);
+                if let Some(g) = &gbuf {
+                    use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t as OP};
+                    let alpha: f32 = 1.0 / (hdx as f32).sqrt();
+                    let zero: f32 = 0.0;
+                    unsafe {
+                        cudarc::cublas::result::gemm_strided_batched_ex(
+                            *self.blas.handle(),
+                            OP::CUBLAS_OP_T, OP::CUBLAS_OP_N,
+                            nblk as i32, nch as i32, hdx as i32,
+                            &alpha as *const f32 as *const _,
+                            *blocks.device_ptr() as *const _, cudaDataType::CUDA_R_16BF, hdx as i32, 0i64,
+                            (d(&qk) + (t0 * qk_dim * 2) as u64) as *const _, cudaDataType::CUDA_R_16BF, qk_dim as i32, hdx as i64,
+                            &zero as *const f32 as *const _,
+                            *g.device_ptr() as *mut _, cudaDataType::CUDA_R_32F, nblk as i32, (nch * nblk) as i64,
+                            heads as i32, cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        ).expect("qsa score GEMM");
+                    }
+                    blaunch!(self, "qsa_score_combine_b", grid(nch * nblk), (256,1,1), 0,
+                        (d(&scores), d(g), d(&idx.params), (pos_start + t0) as i32, nch as i32, nblk as i32));
+                } else {
                 blaunch!(self, "qsa_score_prefill_b", (nblk.div_ceil(256) as u32, nch.div_ceil(QT) as u32, 1), (256,1,1), smem,
                     (d(&scores), d(&qk) + (t0 * qk_dim * 2) as u64, d(&blocks), d(&idx.params),
                      (pos_start + t0) as i32, nch as i32, nblk as i32, qk_dim as i32));
+                }
                 blaunch!(self, "qsa_topk_b", (nch as u32,1,1), (1024,1,1), 0,
                     (d(&sel) + (t0 * sel_max * 4) as u64, d(&pos_sel) + (t0 * 4) as u64, d(&scores), 0u64, 0u64, 0u64,
                      d(&idx.params), nblk as i32, (pos_start + t0) as i32));
                 if std::env::var("GB10_QSA_DUMP").is_ok() && t0 + nch == n { self.qsa_dump_scores("prefill", &scores, nblk, nch - 1); }
             }
             pool.release(scores, qch * nblk);
+            if let Some(g) = gbuf { pool.release(g, heads * qch * nblk); }
             pool.release_bf16(blocks, nblk * hdx);
         }
         pool.release_bf16(qk, qk_dim * n);
+        if timing { self.sync_stream(); eprintln!("[qsa-time] prefill n={n}: scores+topk done at {:.2} ms", t0.elapsed().as_secs_f32()*1e3); }
         if std::env::var("GB10_QSA_DUMP").is_ok() { self.qsa_dump("prefill", keys_ptr, &sel, &pos_sel, n, Some(n - 1)); }
-        (sel, pos_sel)
+        Some((sel, pos_sel))
     }
 
     pub(crate) fn qsa_release(&self, pool: &mut Pool, sel: S, pos_sel: S, n: usize) {
@@ -19699,7 +19753,14 @@ impl GpuModel {
                                         nh: usize, nkv: usize, hd: usize, scale: f32, n: usize, sel_ptr: u64, pos_sel_ptr: u64) {
         debug_assert!(nh < 2048 && hd <= 1023 && nkv <= 1023, "nh_packed field overflow");
         let nh_packed = ((nh << 20) | (hd << 10) | nkv) as i32;
+        if hd <= 256 && std::env::var("GB10_QSA_SEL_V1").is_err() {
+            // v2: K/V rows fetched once per 4-head group, 4 keys in flight (bit-identical to v1).
+            let ngroups = (nh / nkv).div_ceil(4);
+            blaunch!(self, "gqa_attn_sel_prefill2", ((n.div_ceil(8) * nkv * ngroups) as u32,1,1), (256,1,1), 0,
+                (d(attn), d(q), kc_ptr, vc_ptr, stride as i32, nh_packed, fbits(scale), n as i32, sel_ptr, pos_sel_ptr, self.qsa_limit() as i32));
+        } else {
         blaunch!(self, "gqa_attn_sel_prefill", ((n.div_ceil(8) * nh) as u32,1,1), (256,1,1), 0,
             (d(attn), d(q), kc_ptr, vc_ptr, stride as i32, nh_packed, fbits(scale), n as i32, sel_ptr, pos_sel_ptr, self.qsa_limit() as i32));
+        }
     }
 }

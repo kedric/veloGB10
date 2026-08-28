@@ -292,7 +292,7 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
   | Qwen3.5 122B MoE | [doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-MIXED) / [GDN4](https://huggingface.co/doth4580/Qwen3.5-122B-A10B-NVFP4-GDN4) | MoE hybrid, `nvfp4-mixed` or `gdn4` |
   | Tencent Hy3 | [doth4580/Tencent-Hy3-295B-A21B-NVFP4](https://huggingface.co/doth4580/Tencent-Hy3-295B-A21B-NVFP4) | 295B-A21B pure-GQA MoE |
   | KAT-Coder-V2.5-Dev | [doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED](https://huggingface.co/doth4580/Kwaipilot-KAT-Coder-V2.5-Dev-NVFP4-MIXED) | 35B-A3B MoE hybrid, code specialist, `nvfp4-mixed` |
-  | Qwen3.8-Flash-Next | quantize locally from [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (`--recipe all`, see [QWEN_FLASH_NEXT_SETUP.md](QWEN_FLASH_NEXT_SETUP.md)) | 176B-A10B MoE hybrid with hyper-connections + PLE n-gram table, **all NVFP4** incl. the PLE table (GPU-resident or `--ple-offload ssd`); QSA sparse attention past 2051 tokens (`--max-seq-len` up to 262144) |
+  | Qwen3.8-Flash-Next | quantize locally from [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (`--recipe all`, see [QWEN_FLASH_NEXT_SETUP.md](QWEN_FLASH_NEXT_SETUP.md)) | 176B-A10B MoE hybrid with hyper-connections + PLE n-gram table, **all NVFP4** incl. the PLE table (GPU-resident or `--ple-offload ssd`); QSA sparse attention past 2051 tokens (`--max-seq-len` up to 262144); image input (same tower as Qwen3.5) |
 
 ## Unique aspects
 

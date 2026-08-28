@@ -10,7 +10,7 @@
 //! (correctity-first) vision serving path. The GPU port (V2) replaces the heavy matmuls.
 
 use base64::Engine;
-use crate::vision_tower::{VisualTower, HIDDEN, HEAD_DIM, INTER, MERGE, OUT_HIDDEN, PATCH, IN_CH, TEMPORAL};
+use crate::vision_tower::{VisualTower, HIDDEN, HEAD_DIM, INTER, MERGE, PATCH, IN_CH, TEMPORAL};
 
 /// Vision rotary: inv_freq length = (head_dim//2)/2 = 18 (mirrors Qwen3VLVisionRotaryEmbedding).
 fn vision_inv_freq() -> Vec<f64> {
@@ -235,8 +235,9 @@ impl VisualTower {
         for v in fc1.iter_mut() {
             *v = gelu(*v);
         }
-        let mut out = vec![0.0f32; tn * OUT_HIDDEN];
-        gemm_vec(&fc1, &self.merger_fc2_w, &self.merger_fc2_b, &mut out, 4608, OUT_HIDDEN, tn);
+        let out_hidden = self.out_hidden;
+        let mut out = vec![0.0f32; tn * out_hidden];
+        gemm_vec(&fc1, &self.merger_fc2_w, &self.merger_fc2_b, &mut out, 4608, out_hidden, tn);
         out
     }
 }
