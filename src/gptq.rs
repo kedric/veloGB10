@@ -625,6 +625,19 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         println!("[gptq] layer {li}/{nl} ({}): forward {:.1}s, quantize {:.1}s, {n_q} tensors quantized, total {:.1}s",
                  if is_attn { "attn" } else { "gdn" }, t_fwd, t_q, t_l.elapsed().as_secs_f32());
     }
+    // 6b. the LM head (group `lmhead` in --gptq-groups): its input is the final mixer / norm of the
+    //     residual streams the last layer left in `hidden` — Hessian over every calibration token.
+    let mut lm_rec: Option<Rec> = None;
+    if is_gptq("lm_head.weight") {
+        if let Some((ptr, rows)) = gpu.gptq_lm_head_bf16() {
+            let t0 = std::time::Instant::now();
+            let hess = gpu.gptq_hess_new(h);
+            for s in 0..ns { gpu.gptq_lm_head_hess_accum(&mut pool, hidden[s].as_ref().unwrap(), seqlen, &hess); }
+            let x_amax = gpu.gptq_amax(&hess);
+            lm_rec = Some(gptq_2d(&gpu, &mut cs, ptr, rows, h, &hess.h, &opts, None, x_amax)?);
+            println!("[gptq] lm_head [{rows}, {h}] GPTQ over {} tokens (activation amax {x_amax:.3}) in {:.1}s", ns * seqlen, t0.elapsed().as_secs_f32());
+        } else { println!("[gptq] warning: lm_head is not served in bf16 (tied / missing) — left as the source has it"); }
+    }
     drop(hidden);
     // 7. non-layer tensors: source verbatim (embed, final norm, mixer, vision, lm_head) with the
     //    RTN groups quantized; the MTP head and the PLE table straight from the base artifact.
@@ -632,6 +645,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         if name.starts_with(&format!("{lm}.layers.")) || name.starts_with("mtp.") { continue; }
         let stem = name.strip_suffix(".weight").unwrap_or(name).to_string();
         let quantizable = meta.dtype == "BF16" && meta.shape.len() == 2 && meta.shape[1] % 16 == 0 && meta.shape[0] % 16 == 0 && !name.contains(".visual.");
+        if name == "lm_head.weight" { if let Some(r) = lm_rec.take() { writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs); continue; } }
         if quantizable && is_rtn(name) {
             let (shape, v) = src.read_bf16(name)?; let r = rtn_2d(&v, shape[0], shape[1]);
             writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs); continue;

@@ -20411,6 +20411,22 @@ impl GpuModel {
         if let Some(p) = layer.ple.as_mut() { p.key_proj = dummy(); p.value_proj = dummy(); }
     }
     pub fn gptq_num_layers(&self) -> usize { self.layers.len() }
+    /// `--gptq lmhead`: fold one sample's LM-head input (the final mixer applied to the residual
+    /// stream `resid` [n, rw]) into `hess` (K = hidden) and its |x| max.
+    pub fn gptq_lm_head_hess_accum(&self, pool: &mut Pool, resid: &B, n: usize, hess: &GptqHess) {
+        let h = self.cfg.hidden_size;
+        let out = pool.get_bf16(h * n);
+        if let Some(m) = self.hc_mixer.as_ref() { self.hc_pre(pool, &out, None, d(resid), m, n); }
+        else { blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), 4096u32, (d(&out), d(resid), d(&self.final_norm), h as i32, n as i32, fbits(self.cfg.rms_eps))); }
+        self.gptq_hess_accum(d(&hess.h), h, d(&out), n);
+        blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0, (d(&hess.amax), d(&out), (h * n) as i64));
+        self.sync_stream();
+        pool.release_bf16(out, h * n);
+    }
+    /// The installed bf16 LM head (device pointer, rows) — Some only while the calibration serves it in bf16.
+    pub fn gptq_lm_head_bf16(&self) -> Option<(u64, usize)> {
+        match &self.lm_head { Some(W::Bf16(b)) => Some((*b.device_ptr() as u64, b.len() / self.cfg.hidden_size)), _ => None }
+    }
     /// `--gptq`: serve the non-layer tensors during calibration exactly as the artifact will carry
     /// them (source bf16 / the quantizer's own RTN or FP8), instead of the base artifact's copies.
     pub fn gptq_install_nonlayer(&mut self, embed: Option<W>, lm_head: Option<W>, mixer: Option<(W, W)>) {
