@@ -268,14 +268,32 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
     Ok(samples)
 }
 
+fn prepare_output_dir(out: &Path, inputs: &[&Path]) -> Result<()> {
+    let input_paths: Vec<PathBuf> = inputs.iter().map(|p| {
+        let resolved = std::fs::canonicalize(p).with_context(|| format!("resolve input {}", p.display()))?;
+        Ok(resolved)
+    }).collect::<Result<_>>()?;
+    if out.exists() {
+        let out_path = std::fs::canonicalize(out).with_context(|| format!("resolve output {}", out.display()))?;
+        anyhow::ensure!(!input_paths.iter().any(|p| p == &out_path),
+            "output directory {} must differ from every input directory", out.display());
+        anyhow::ensure!(std::fs::read_dir(out)?.next().is_none(),
+            "output directory {} already exists and is not empty", out.display());
+    } else {
+        std::fs::create_dir_all(out)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the driver
 pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts) -> Result<()> {
-    std::fs::create_dir_all(out)?;
+    prepare_output_dir(out, &[source, base])?;
     if std::env::var("GB10_PLE_OFFLOAD").is_err() { std::env::set_var("GB10_PLE_OFFLOAD", "ssd"); }
     let t_all = std::time::Instant::now();
     let src = ShardReader::open(source)?;
     let basr = ShardReader::open(base)?;
     let (mut gpu, cfg) = GpuModel::load_from_dir(&base.to_string_lossy())?;
+    gpu.gptq_reset_rotation();
     anyhow::ensure!(cfg.is_q4(), "--gptq is implemented for qwen4_exp");
     let samples = calib_tokens(base, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
     let ns = samples.len();
@@ -498,7 +516,11 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
         "rtn_groups": opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
         "fp8_groups": opts.fp8_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>() });
-    if opts.rotate { cj["quantization_config"]["transform"] = serde_json::json!({ "type": "hadamard16", "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>() }); }
+    if opts.rotate {
+        cj["quantization_config"]["transform"] = serde_json::json!({ "type": "hadamard16", "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>() });
+    } else if let Some(qc) = cj["quantization_config"].as_object_mut() {
+        qc.remove("transform");
+    }
     std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&cj)?)?;
     println!("[gptq] done in {:.1} min → {}", t_all.elapsed().as_secs_f32() / 60.0, out.display());
     Ok(())
@@ -549,7 +571,7 @@ pub fn parse_groups(s: &str) -> Result<Vec<Group>> {
 /// `fp8_groups` become row-scaled FP8 (`quant::quantize_fp8`), those of `nvfp4_groups` RTN NVFP4;
 /// every other tensor (packed triples included) is copied verbatim, the PLE files are linked.
 pub fn refmt(input: &Path, out: &Path, fp8_groups: &[Group], nvfp4_groups: &[Group]) -> Result<()> {
-    std::fs::create_dir_all(out)?;
+    prepare_output_dir(out, &[input])?;
     let rd = ShardReader::open(input)?;
     let mut writer = Writer::new(out, 4 * 1024 * 1024 * 1024);
     let (mut n8, mut n4, mut nc) = (0, 0, 0);
@@ -593,6 +615,24 @@ pub fn refmt(input: &Path, out: &Path, fp8_groups: &[Group], nvfp4_groups: &[Gro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_dir_must_be_distinct_and_empty() {
+        let root = std::env::temp_dir().join(format!("gptq-output-test-{}", std::process::id()));
+        let input = root.join("input");
+        let out = root.join("out");
+        std::fs::create_dir_all(&input).unwrap();
+        let err = prepare_output_dir(&input, &[&input]).unwrap_err().to_string();
+        assert!(err.contains("must differ"));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("partial.bin"), b"x").unwrap();
+        let err = prepare_output_dir(&out, &[&input]).unwrap_err().to_string();
+        assert!(err.contains("not empty"));
+        std::fs::remove_file(out.join("partial.bin")).unwrap();
+        prepare_output_dir(&out, &[&input]).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Families pushed around forced shard boundaries (tiny shard size) must never be split.
     #[test]
     fn writer_keeps_packed_families_in_one_shard() {

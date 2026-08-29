@@ -6784,9 +6784,18 @@ impl GpuModel {
             // FFN: gate/up column-parallel, down row-parallel (dense only; NOT gated on mixers).
             if ffn_factor > 1 {
                 if let Ffn::Dense(mlp) = &mut layer.mlp {
-                    mlp.gate = self.shard_mxfp4_col(&mlp.gate, rank, world);
-                    mlp.up   = self.shard_mxfp4_col(&mlp.up, rank, world);
-                    mlp.down = self.shard_mxfp4_row(&mlp.down, rank, world);
+                    let rg = self.take_rotation_marker(&mlp.gate);
+                    let gate = self.shard_mxfp4_col(&mlp.gate, rank, world);
+                    self.restore_rotation_marker(rg, &gate);
+                    mlp.gate = gate;
+                    let ru = self.take_rotation_marker(&mlp.up);
+                    let up = self.shard_mxfp4_col(&mlp.up, rank, world);
+                    self.restore_rotation_marker(ru, &up);
+                    mlp.up = up;
+                    let rd = self.take_rotation_marker(&mlp.down);
+                    let down = self.shard_mxfp4_row(&mlp.down, rank, world);
+                    self.restore_rotation_marker(rd, &down);
+                    mlp.down = down;
                 }
             }
             // MoE EXPERT sharding: the stacked experts are expert-major along M — expert e's 16-row
@@ -6797,8 +6806,14 @@ impl GpuModel {
             // (tp_shard_weights touches only self.layers): the draft head must stay barrier-free.
             if expert_factor > 1 {
                 if let Ffn::Moe(moe) = &mut layer.mlp {
-                    moe.gate_up = self.shard_mxfp4_col(&moe.gate_up, rank, world);
-                    moe.down    = self.shard_mxfp4_col(&moe.down, rank, world);
+                    let rg = self.take_rotation_marker(&moe.gate_up);
+                    let gate_up = self.shard_mxfp4_col(&moe.gate_up, rank, world);
+                    self.restore_rotation_marker(rg, &gate_up);
+                    moe.gate_up = gate_up;
+                    let rd = self.take_rotation_marker(&moe.down);
+                    let down = self.shard_mxfp4_col(&moe.down, rank, world);
+                    self.restore_rotation_marker(rd, &down);
+                    moe.down = down;
                     moe.experts_sharded = true;
                     // E8 (revised): shared expert — DOWN row-parallel (each rank computes 1/world of
                     // the shared output; moe_batch folds the partial into the routed all-reduce).
@@ -6819,9 +6834,15 @@ impl GpuModel {
             if attn_factor > 1 {
                 if let Some(fa) = &mut layer.fa {
                     if let AttnIn::Fused(w) = &fa.qkv {
-                        fa.qkv = AttnIn::Fused(self.shard_mxfp4_col_segs(w, &qkv_segs, rank, world));
+                        let rotated = self.take_rotation_marker(w);
+                        let sharded = self.shard_mxfp4_col_segs(w, &qkv_segs, rank, world);
+                        self.restore_rotation_marker(rotated, &sharded);
+                        fa.qkv = AttnIn::Fused(sharded);
                     }
-                    fa.o_proj = self.shard_mxfp4_row(&fa.o_proj, rank, world);
+                    let rotated = self.take_rotation_marker(&fa.o_proj);
+                    let sharded = self.shard_mxfp4_row(&fa.o_proj, rank, world);
+                    self.restore_rotation_marker(rotated, &sharded);
+                    fa.o_proj = sharded;
                 }
             }
             // GDN (head-parallel + divisibility): in_proj column-parallel per segment, conv/a_log/
@@ -6830,7 +6851,10 @@ impl GpuModel {
             if gdn_factor > 1 {
                 if let Some(la) = &mut layer.la {
                     if let GdnIn::Fused(w) = &la.in_proj {
-                        la.in_proj = GdnIn::Fused(self.shard_mxfp4_col_segs(w, &gdn_segs, rank, world));
+                        let rotated = self.take_rotation_marker(w);
+                        let sharded = self.shard_mxfp4_col_segs(w, &gdn_segs, rank, world);
+                        self.restore_rotation_marker(rotated, &sharded);
+                        la.in_proj = GdnIn::Fused(sharded);
                     } else {
                         panic!("tp GDN shard: expected a fused (quantized) in_proj; the Split path is unsharded");
                     }
@@ -6843,7 +6867,10 @@ impl GpuModel {
                         la.a_log   = self.pad_nan_redzone(&la.a_log, lin_nv);
                         la.dt_bias = self.pad_nan_redzone(&la.dt_bias, lin_nv);
                     }
-                    la.out_proj = self.shard_mxfp4_row(&la.out_proj, rank, world);
+                    let rotated = self.take_rotation_marker(&la.out_proj);
+                    let sharded = self.shard_mxfp4_row(&la.out_proj, rank, world);
+                    self.restore_rotation_marker(rotated, &sharded);
+                    la.out_proj = sharded;
                 }
             }
         }
@@ -6880,7 +6907,17 @@ impl GpuModel {
                     self.df2_full_head = Some(full);
                 }
                 let lh = self.lm_head.take().unwrap();
-                self.lm_head = Some(self.shard_mxfp4_col_segs(&lh, &[(0, m, true)], rank, world));
+                let rotated = self.take_rotation_marker(&lh);
+                let full_head_ptr = self.df2_full_head.as_ref().and_then(|w| match w {
+                    W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } => Some(*qweight.device_ptr() as u64),
+                    _ => None,
+                });
+                if rotated {
+                    if let Some(ptr) = full_head_ptr { self.rotated.insert(ptr); }
+                }
+                let sharded = self.shard_mxfp4_col_segs(&lh, &[(0, m, true)], rank, world);
+                self.restore_rotation_marker(rotated, &sharded);
+                self.lm_head = Some(sharded);
                 self.lm_head_sharded = true;
                 eprintln!("[tp] rank {rank} — lm_head vocab-sharded ({m} -> {} rows/rank)", m / world);
             }
@@ -20044,6 +20081,21 @@ impl GpuModel {
         if self.rotated.is_empty() { return false; }
         match w { W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } => self.rotated.contains(&(*qweight.device_ptr() as u64)), _ => false }
     }
+    fn take_rotation_marker(&mut self, w: &W) -> bool {
+        match w {
+            W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } => {
+                self.rotated.remove(&(*qweight.device_ptr() as u64))
+            }
+            _ => false,
+        }
+    }
+    fn restore_rotation_marker(&mut self, rotated: bool, w: &W) {
+        if rotated {
+            if let W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } = w {
+                self.rotated.insert(*qweight.device_ptr() as u64);
+            }
+        }
+    }
     /// x' = (H16/4)·x per 16-block of the feature dim, into the rotation scratch (grown lazily —
     /// the eager warmup covers every decode shape before a graph capture; prefill is not captured).
     fn rot_x(&self, x: &B, inn: usize, batch: usize) -> parking_lot::MappedMutexGuard<'_, B> {
@@ -20085,7 +20137,10 @@ impl GpuModel {
             if has("hc") { if let Some((a, b)) = &l.hc { mark(&a.down); mark(&a.up); mark(&b.down); mark(&b.up); } }
             if has("ple") { if let Some(p) = &l.ple { mark(&p.key_proj); mark(&p.value_proj); } }
         }
-        if has("lmhead") { if let Some(w) = &self.lm_head { mark(w); } }
+        if has("lmhead") {
+            if let Some(w) = &self.lm_head { mark(w); }
+            if let Some(w) = &self.df2_full_head { mark(w); }
+        }
         println!("MR-GPTQ transform: hadamard16 on groups {:?} — {} rotated weights.", groups, set.len());
         self.rotated = set;
         Ok(())
@@ -20145,4 +20200,9 @@ impl GpuModel {
     pub fn gptq_mark_rotated(&mut self, w: &W) {
         if let W::Nvfp4 { qweight, .. } | W::Nvfp4Raw { qweight, .. } = w { self.rotated.insert(*qweight.device_ptr() as u64); }
     }
+    /// Fresh bf16 layers must not inherit device-pointer markers from the base artifact.
+    pub fn gptq_reset_rotation(&mut self) {
+        self.rotated.clear();
+    }
+
 }
