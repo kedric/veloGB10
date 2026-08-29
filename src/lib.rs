@@ -39,6 +39,7 @@ pub mod dsv4_dspark;
 pub mod dflash;
 pub mod dspark;
 pub mod dflash2;
+pub mod w4a4;
 
 use serde::Serialize;
 

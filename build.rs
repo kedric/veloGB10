@@ -61,6 +61,7 @@ fn main() {
         ("mxfp4_bench.cu", "mxfp4_bench.ptx", "sm_121a"),
         ("gpu_mxfp4.cu", "gpu_mxfp4.ptx", "sm_121a"),
         ("gpu_mxfp4_moe.cu", "gpu_mxfp4_moe.ptx", "sm_121a"),
+        ("gpu_w4a4.cu", "gpu_w4a4.ptx", "sm_121a"),
     ];
 
     for (src_name, _, _) in &kernels {

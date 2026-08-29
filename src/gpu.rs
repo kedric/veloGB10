@@ -768,6 +768,10 @@ pub struct GpuModel {
     pub(crate) rotated: std::collections::HashSet<u64>,
     /// Rotation scratch for the decode-sized GEMMs (graph-capturable: fixed address).
     pub(crate) rot_small: parking_lot::Mutex<Option<B>>,
+    /// NVFP4 W4A4 prefill (src/w4a4.rs, GB10_W4A4_PREFILL): None unless requested.
+    pub(crate) w4a4: Option<crate::w4a4::W4a4State>,
+    /// `{stem}.input_global_scale` values read from the artifact (compressed-tensors), by stem.
+    pub(crate) igs_by_name: std::collections::HashMap<String, f32>,
     mtp: Option<GpuMtpLayer>,
     k: KernelTable,
     bk: HashMap<String, CudaFunction>,
@@ -2205,7 +2209,7 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         dev.synchronize()?;
-        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, hc_mixer: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None) })
+        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, hc_mixer: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name: Default::default() })
     }
 
     /// Stream-load from safetensors directly as bf16 — no f32 intermediate.
@@ -2213,6 +2217,7 @@ impl GpuModel {
     pub fn load_from_dir(model_dir: &str) -> anyhow::Result<(Self, crate::qwen::Config)> {
         let (mut m, cfg) = Self::load_from_dir_impl(model_dir, None, 1)?;
         m.apply_transform_config(model_dir)?;
+        m.init_w4a4()?;
         Ok((m, cfg))
     }
 
@@ -2224,6 +2229,7 @@ impl GpuModel {
     pub fn load_from_dir_tp(model_dir: &str, rank: i32, world: i32) -> anyhow::Result<(Self, crate::qwen::Config)> {
         let (mut m, cfg) = Self::load_from_dir_impl(model_dir, Some(rank), world)?;
         m.apply_transform_config(model_dir)?;
+        m.init_w4a4()?;
         Ok((m, cfg))
     }
 
@@ -2389,6 +2395,8 @@ impl GpuModel {
         dev.synchronize().unwrap();
 
         let mut gpu_bf16: std::collections::HashMap<String, B> = std::collections::HashMap::new();
+        // compressed-tensors `input_global_scale` (W4A4 activation scale) per packed stem, if present
+        let mut igs_by_name: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         let mut gpu_f32: std::collections::HashMap<String, S> = std::collections::HashMap::new();
 
         // Simulated NVFP4 (RUST_INFER_FAKE_QUANT). Round-trips a weight through the 4-bit codec and
@@ -3644,6 +3652,9 @@ impl GpuModel {
                 let gv = st.tensor(&format!("{}.weight_global_scale", stem))?;
                 let (m, k) = (pv.shape()[0], pv.shape()[1] * 2);
                 let gs = f32::from_le_bytes(gv.data()[..4].try_into().unwrap());
+                if let Ok(iv) = st.tensor(&format!("{}.input_global_scale", stem)) {
+                    igs_by_name.insert(stem.to_string(), f32::from_le_bytes(iv.data()[..4].try_into().unwrap()));
+                }
                 if dequant_at_load {
                     let q = crate::quant::Nvfp4Tensor {
                         qweight: pv.data().to_vec(), scales: sv.data().to_vec(),
@@ -3757,7 +3768,7 @@ impl GpuModel {
             for (name, view) in st.tensors() {
                 // Skip anything already handled as part of a quantized group.
                 if name.ends_with(".weight_packed") || name.ends_with(".weight_scale")
-                    || name.ends_with(".weight_global_scale") { continue; }
+                    || name.ends_with(".weight_global_scale") || name.ends_with(".input_global_scale") { continue; }
                 if view.dtype() == Dtype::F8_E4M3 { continue; }
                 let dt = match view.dtype() { Dtype::BF16 => "BF16", Dtype::F16 => "F16", Dtype::F32 => "F32", _ => "OTHER" };
                 let data = view.data();
@@ -4041,7 +4052,7 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         mem_probe("post-mxfp4-build");
-        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, hc_mixer, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None) }, cfg))
+        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, hc_mixer, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name }, cfg))
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
@@ -4573,6 +4584,16 @@ impl GpuModel {
     }
     /// P4 B2 dispatch + original dequant/cuBLAS path.
     fn gemm_quant_prefill_inner(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize, allow_pf4: bool) {
+        // NVFP4 W4A4 prefill (src/w4a4.rs): enabled tensors above the verify width run the
+        // block-scaled FP4 tensor-core GEMM on the standard tiled weights (no repack, no copy).
+        if let (Some(w4), W::Nvfp4 { qweight, scales, gs, m, k }) = (&self.w4a4, w) {
+            let ptr = *qweight.device_ptr() as u64;
+            if allow_pf4 && w4.on(ptr) && batch > MAX_VERIFY && *k == inn && *m == outn && inn % 64 == 0
+                && x.len() >= batch * inn && out.len() >= batch * outn {
+                self.w4a4_dense(w4, w, x, out, inn, outn, batch, w4.xgs(ptr));
+                return;
+            }
+        }
         // P4 B2 (2026-08-18): W4A4 OMMA prefill GEMM (kernels/gpu_mxfp4.cu). Env-gated
         // (GB10_MXFP4_PREFILL) — ships dark until the B2 gate (prefill >= 1000 tok/s) passes.
         // Constraints mirror the kernel: K % 256 == 0, outn % 128 == 0, batch % 128 == 0
@@ -6264,9 +6285,28 @@ impl GpuModel {
                     let wide_grouped = std::env::var("GB10_MOE_GROUPED_WIDE").map_or(true, |v| v != "0");
                     let ngroups_x4 = (ppad_cap / 32) as u32;
                     let gu_p = pool.get_bf16(ppad_cap * 2 * mi);
+                    // NVFP4 W4A4 prefill (src/w4a4.rs): both expert GEMMs of this layer on the
+                    // block-scaled FP4 tensor cores (x_perm / h_p quantized per 16-block).
+                    let pf_fused = Self::mxfp4_fused_on() && Self::mxfp4_fused_prefill_on();
+                    let w4_moe = self.w4a4.as_ref().filter(|w| w.on(*guq.device_ptr() as u64)
+                        && w.on(*dnq.device_ptr() as u64) && h % 64 == 0 && mi % 64 == 0);
+                    if let Some(w4) = w4_moe {
+                        self.w4a4_moe(w4, &x_perm, ppad_cap, h, *guq.device_ptr() as u64, *gus.device_ptr() as u64,
+                                      *gugs.device_ptr() as u64, 2 * mi, &gu_p, g, ne, e_base, true, w4.xgs(*guq.device_ptr() as u64));
+                        if crate::w4a4::check_on() {
+                            let r = pool.get_bf16(ppad_cap * 2 * mi);
+                            let xf = self.w4a4_fakequant(w4, &x_perm, ppad_cap, h, w4.xgs(*guq.device_ptr() as u64));
+                            blaunch!(self, "gemm_moe_grouped_mma_fp4_x4", (((2*mi/16) as u32), (ppad_cap / 32) as u32, 1), (256,1,1), 0,
+                                (d(&r), *guq.device_ptr() as u64, *gus.device_ptr() as u64, d(gugs), d(&xf),
+                                 *g.tile_e.device_ptr() as u64, (2*mi) as i32, h as i32, e_base,
+                                 *g.poff.device_ptr() as u64, ne as i32));
+                            let real = { let p: Vec<i32> = self.dev.dtoh_sync_copy(&g.poff).unwrap(); p[ne] as usize };
+                            self.w4a4_compare(&gu_p, &r, real, 2 * mi, &format!("moe gate_up rows={real}"));
+                            pool.release_bf16(r, ppad_cap * 2 * mi);
+                        }
+                    } else {
                     // GB10_MXFP4_FUSED_PREFILL=0 keeps the separate pair at the prefill windows
                     // (the §10 R3 L2-thrash escape); default fused.
-                    let pf_fused = Self::mxfp4_fused_on() && Self::mxfp4_fused_prefill_on();
                     if let Some(st) = &self.mxfp4 {
                         if !st.allow_bf16.read().unwrap().contains(&(*guq.device_ptr() as u64)) {
                             // MXFP4-native grouped-prefill: quant the window's x_perm (two 8-token
@@ -6327,6 +6367,7 @@ impl GpuModel {
                                  *g.poff.device_ptr() as u64, ne as i32));
                         }
                     }
+                    }
                     // Fused-quant path: the fused dn kernel computes silu in its stage from gu_p
                     // directly; h_p (and its silu launch) vanish on the fused path (§8).
                     let dn_native_fused = self.mxfp4.as_ref().map_or(false, |st| {
@@ -6342,6 +6383,21 @@ impl GpuModel {
                         assert!(!self.rotated.contains(&(*dnq.device_ptr() as u64)), "MR-GPTQ rotation is not supported on the fused-silu down path");
                     }
                     let dn_p = pool.get_bf16(ppad_cap * h);
+                    if let Some(w4) = w4_moe {
+                        self.w4a4_moe(w4, h_p.as_ref().unwrap(), ppad_cap, mi, *dnq.device_ptr() as u64, *dns.device_ptr() as u64,
+                                      *dngs.device_ptr() as u64, h, &dn_p, g, ne, e_base, false, w4.xgs(*dnq.device_ptr() as u64));
+                        if crate::w4a4::check_on() {
+                            let r = pool.get_bf16(ppad_cap * h);
+                            let xf = self.w4a4_fakequant(w4, h_p.as_ref().unwrap(), ppad_cap, mi, w4.xgs(*dnq.device_ptr() as u64));
+                            blaunch!(self, "gemm_moe_grouped_mma_fp4_x4", (((h/16) as u32), (ppad_cap / 32) as u32, 1), (256,1,1), 0,
+                                (d(&r), *dnq.device_ptr() as u64, *dns.device_ptr() as u64, d(dngs), d(&xf),
+                                 *g.tile_e.device_ptr() as u64, h as i32, mi as i32, e_base,
+                                 *g.poff.device_ptr() as u64, ne as i32));
+                            let real = { let p: Vec<i32> = self.dev.dtoh_sync_copy(&g.poff).unwrap(); p[ne] as usize };
+                            self.w4a4_compare(&dn_p, &r, real, h, &format!("moe down rows={real}"));
+                            pool.release_bf16(r, ppad_cap * h);
+                        }
+                    } else {
                     if let Some(st) = &self.mxfp4 {
                         if !st.allow_bf16.read().unwrap().contains(&(*dnq.device_ptr() as u64)) {
                             let nks_dn = (mi / 64) as i32;
@@ -6399,6 +6455,7 @@ impl GpuModel {
                                  *g.tile_e.device_ptr() as u64, h as i32, mi as i32, e_base,
                                  *g.poff.device_ptr() as u64, ne as i32));
                         }
+                    }
                     }
                     blaunch!(self, "moe_combine_grouped_b", grid(ns * h), (256,1,1), 0,
                         (out_s, d(&dn_p), *g.perm_wt.device_ptr() as u64, *g.inv_pos.device_ptr() as u64,
@@ -20205,4 +20262,170 @@ impl GpuModel {
         self.rotated.clear();
     }
 
+}
+
+// ---------------------------------------------------------------- NVFP4 W4A4 prefill (src/w4a4.rs)
+impl GpuModel {
+    /// GB10_W4A4_PREFILL: collect the NVFP4 weights of the requested groups (by qweight pointer),
+    /// their `input_global_scale` by name (a fused tensor takes the MIN of its parts = the largest
+    /// calibrated amax), size the packed-activation scratch, load the sm_121a module.
+    fn init_w4a4(&mut self) -> anyhow::Result<()> {
+        let Some(groups) = crate::w4a4::groups_from_env() else { return Ok(()); };
+        anyhow::ensure!(self.mxfp4.is_none(), "GB10_W4A4_PREFILL and GB10_MXFP4 are exclusive");
+        let has = |g: &str| groups.iter().any(|x| x == g);
+        let lm = "model.language_model";
+        let mut enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut x_gs: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
+        let mut k_max = 0usize;
+        {
+            let igs = &self.igs_by_name;
+            let mut add = |w: &W, names: &[String]| {
+                if let W::Nvfp4 { qweight, k, m, .. } = w {
+                    if *k % 64 != 0 || *m % 16 != 0 { return; }
+                    let ptr = *qweight.device_ptr() as u64;
+                    enabled.insert(ptr); k_max = k_max.max(*k);
+                    let gsx = names.iter().filter_map(|n| igs.get(n)).cloned().fold(f32::INFINITY, f32::min);
+                    if gsx.is_finite() && gsx > 0.0 { x_gs.insert(ptr, gsx); }
+                }
+            };
+            for (li, l) in self.layers.iter().enumerate() {
+                let lp = format!("{lm}.layers.{li}");
+                if has("attn") { if let Some(fa) = &l.fa {
+                    let (q, k, v) = (format!("{lp}.self_attn.q_proj"), format!("{lp}.self_attn.k_proj"), format!("{lp}.self_attn.v_proj"));
+                    match &fa.qkv { AttnIn::Fused(w) => add(w, &[q, k, v]),
+                                    AttnIn::Split { q: wq, k: wk, v: wv } => { add(wq, &[q]); add(wk, &[k]); add(wv, &[v]); } }
+                    add(&fa.o_proj, &[format!("{lp}.self_attn.o_proj")]);
+                    if let Some(ix) = &fa.indexer { add(&ix.qk_proj, &[format!("{lp}.self_attn.indexer.index_qk_proj")]); }
+                } }
+                if has("gdn") { if let Some(la) = &l.la {
+                    let n = |s: &str| format!("{lp}.linear_attn.{s}");
+                    match &la.in_proj {
+                        GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")]),
+                        GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")]); add(z, &[n("in_proj_z")]); add(b, &[n("in_proj_b")]); add(a, &[n("in_proj_a")]); }
+                    }
+                    add(&la.out_proj, &[n("out_proj")]);
+                } }
+                match &l.mlp {
+                    Ffn::Moe(m) => {
+                        if has("expert") { add(&m.gate_up, &[format!("{lp}.mlp.experts.gate_up_proj")]); add(&m.down, &[format!("{lp}.mlp.experts.down_proj")]); }
+                        if has("mlp") {
+                            let (sg, su, sd) = (format!("{lp}.mlp.shared_expert.gate_proj"), format!("{lp}.mlp.shared_expert.up_proj"), format!("{lp}.mlp.shared_expert.down_proj"));
+                            add(&m.shared.gate, &[sg.clone()]); add(&m.shared.up, &[su.clone()]); add(&m.shared.down, &[sd]);
+                            if let Some(w) = &m.shared_gate_up { add(w, &[sg, su]); }
+                        }
+                    }
+                    Ffn::Dense(m) => { if has("mlp") { add(&m.gate, &[format!("{lp}.mlp.gate_proj")]); add(&m.up, &[format!("{lp}.mlp.up_proj")]); add(&m.down, &[format!("{lp}.mlp.down_proj")]); } }
+                }
+                if has("hc") { if let Some((a, b)) = &l.hc {
+                    add(&a.down, &[format!("{lp}.attn_hyper_connection.input_mix_weight_down")]); add(&a.up, &[format!("{lp}.attn_hyper_connection.input_mix_weight_up")]);
+                    add(&b.down, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_down")]); add(&b.up, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_up")]);
+                } }
+                if has("ple") { if let Some(p) = &l.ple { add(&p.key_proj, &[format!("{lp}.ple.key_proj")]); add(&p.value_proj, &[format!("{lp}.ple.value_proj")]); } }
+            }
+            if has("lmhead") { if let Some(w) = &self.lm_head { add(w, &["lm_head".to_string()]); } }
+        }
+        if enabled.is_empty() { println!("W4A4 prefill: no NVFP4 weight in groups {groups:?} — off"); return Ok(()); }
+        let rows_max = crate::batch::PREFILL_CHUNK.max(self.moe_g_pf.ppad_max);
+        let tiles_max = self.moe_g_pf.ppad_max / crate::w4a4::W4_BN + self.cfg.num_experts + 2;
+        self.w4a4 = Some(crate::w4a4::W4a4State::build(&self.dev, groups, enabled, x_gs, rows_max, k_max, tiles_max)?);
+        Ok(())
+    }
+
+    /// Dense W4A4 prefill GEMM: x [batch][inn] row-major bf16 -> out [batch][outn], sub-batched by
+    /// PREFILL_CHUNK rows through the packed-activation scratch.
+    fn w4a4_dense(&self, w4: &crate::w4a4::W4a4State, w: &W, x: &B, out: &mut B,
+                  inn: usize, outn: usize, batch: usize, x_gs: f32) {
+        use cudarc::driver::{LaunchAsync, LaunchConfig};
+        let W::Nvfp4 { qweight, scales, gs, .. } = w else { unreachable!() };
+        let (wq, ws, gs) = (*qweight.device_ptr() as u64, *scales.device_ptr() as u64, *gs.device_ptr() as u64);
+        assert!(inn <= w4.k_max, "W4A4: K {inn} exceeds the scratch K {}", w4.k_max);
+        const SUB: usize = crate::batch::PREFILL_CHUNK;
+        let (bq, sb) = (*w4.bq.device_ptr() as u64, *w4.sb.device_ptr() as u64);
+        let (xq, oq) = (*x.device_ptr() as u64, *out.device_ptr() as u64);
+        let mut off = 0usize;
+        while off < batch {
+            let rows = SUB.min(batch - off);
+            let pad8 = rows.div_ceil(8) * 8;
+            unsafe {
+                w4.quant.clone().launch_on_stream(&self.stream,
+                    LaunchConfig { grid_dim: ((inn / 64) as u32, (pad8 / 8) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                    (xq + (off * inn * 2) as u64, inn as i32, rows as i32, pad8 as i32, bq, sb, x_gs))
+                    .expect("w4a4_quant_pack_b launch");
+                w4.gemm.clone().launch_on_stream(&self.stream,
+                    LaunchConfig { grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM },
+                    (wq, ws, bq, sb, gs, oq + (off * outn * 2) as u64, outn as i32, rows as i32, inn as i32, 1.0f32 / x_gs))
+                    .expect("w4a4_gemm_b launch");
+            }
+            off += rows;
+        }
+        if w4.trace { eprintln!("[w4a4] dense outn={outn} inn={inn} batch={batch} x_gs={x_gs}"); }
+        if crate::w4a4::check_on() {
+            // GB10_W4A4_CHECK: recompute through the bf16 chain (dequant + cuBLAS) and compare per row.
+            let mut r = unsafe { self.dev.alloc::<half::bf16>(out.len()).unwrap() };
+            let xf = self.w4a4_fakequant(w4, x, batch, inn, x_gs);
+            self.gemm_quant_prefill_slow(w, &xf, &mut r, inn, outn, batch);
+            self.w4a4_compare(out, &r, batch, outn, &format!("dense outn={outn} inn={inn}"));
+        }
+    }
+
+    /// GB10_W4A4_CHECK helper: Y = dequant(quant(X)) with the packer's recipe, [rows][k] bf16.
+    fn w4a4_fakequant(&self, w4: &crate::w4a4::W4a4State, x: &B, rows: usize, k: usize, x_gs: f32) -> B {
+        use cudarc::driver::{LaunchAsync, LaunchConfig};
+        let y = self.dev.alloc_zeros::<half::bf16>(rows * k).unwrap();
+        unsafe {
+            w4.fakequant.clone().launch_on_stream(&self.stream,
+                LaunchConfig { grid_dim: ((k / 64) as u32, rows.div_ceil(8) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                (*x.device_ptr() as u64, *y.device_ptr() as u64, k as i32, rows as i32, x_gs)).expect("w4a4_fakequant_b launch");
+        }
+        y
+    }
+
+    /// Per-row relative L2 of `got` vs `want` ([rows][cols] bf16, row-major) over the first `rows`
+    /// rows; rows whose reference is all-zero (padding) are skipped.
+    fn w4a4_compare(&self, got: &B, want: &B, rows: usize, cols: usize, what: &str) {
+        self.sync_stream();
+        let a: Vec<half::bf16> = unsafe { self.dev.dtoh_sync_copy(got).unwrap() };
+        let b: Vec<half::bf16> = unsafe { self.dev.dtoh_sync_copy(want).unwrap() };
+        let (mut sum, mut n, mut mx, mut bad, mut first_bad) = (0f64, 0usize, 0f64, 0usize, usize::MAX);
+        for r in 0..rows {
+            let (mut num, mut den) = (0f64, 0f64);
+            for c in 0..cols { let x = a[r * cols + c].to_f32() as f64; let y = b[r * cols + c].to_f32() as f64; num += (x - y) * (x - y); den += y * y; }
+            if den == 0.0 { continue; }
+            let rl = (num / den).sqrt();
+            if !rl.is_finite() || rl > 0.05 { bad += 1; if first_bad == usize::MAX { first_bad = r; } }
+            sum += rl; n += 1; if rl > mx { mx = rl; }
+        }
+        eprintln!("[w4a4-check] {what} rows={n}: relL2 mean {:.3e} max {:.3e} bad(>0.05) {bad}{}",
+                  if n > 0 { sum / n as f64 } else { 0.0 }, mx, if bad > 0 { format!(" first at row {first_bad}") } else { String::new() });
+    }
+
+    /// Grouped-prefill MoE W4A4 GEMM over the permuted rows: `x` [rows][k] (x_perm or h_p, rows =
+    /// ppad_cap), stacked expert weights (M rows per expert), out [rows][m]. The 128-row tile map
+    /// (per expert region of `g.poff`) is built on device on the gate_up call and reused for down.
+    fn w4a4_moe(&self, w4: &crate::w4a4::W4a4State, x: &B, rows: usize, k: usize, wq: u64, ws: u64, gs: u64,
+                m: usize, out: &B, g: &MoeGroupedScratch, ne: usize, e_base: i32, build_map: bool, x_gs: f32) {
+        use cudarc::driver::{LaunchAsync, LaunchConfig};
+        let pad8 = rows.div_ceil(8) * 8;   // the packer works in 8-row groups (rows >= `rows` zero-filled)
+        assert!(k <= w4.k_max && pad8 <= w4.rows_max, "W4A4 MoE: rows {rows} x K {k} exceed the scratch ({} x {})", w4.rows_max, w4.k_max);
+        assert!(k % 64 == 0);
+        let (bq, sb) = (*w4.bq.device_ptr() as u64, *w4.sb.device_ptr() as u64);
+        unsafe {
+            w4.quant.clone().launch_on_stream(&self.stream,
+                LaunchConfig { grid_dim: ((k / 64) as u32, (pad8 / 8) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                (*x.device_ptr() as u64, k as i32, rows as i32, pad8 as i32, bq, sb, x_gs))
+                .expect("w4a4_quant_pack_b (moe) launch");
+            if build_map {
+                w4.tilemap.clone().launch_on_stream(&self.stream,
+                    LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
+                    (*w4.tmap.device_ptr() as u64, *g.poff.device_ptr() as u64, ne as i32, w4.tiles_max as i32))
+                    .expect("w4a4_moe_tilemap_b launch");
+            }
+            w4.gemm_moe.clone().launch_on_stream(&self.stream,
+                LaunchConfig { grid_dim: (w4.tiles_max as u32, m.div_ceil(128) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM },
+                (*out.device_ptr() as u64, wq, ws, gs, bq, sb, *w4.tmap.device_ptr() as u64,
+                 *g.poff.device_ptr() as u64, m as i32, k as i32, e_base, 1.0f32 / x_gs))
+                .expect("w4a4_gemm_moe_b launch");
+        }
+        if w4.trace { eprintln!("[w4a4] moe m={m} k={k} rows={rows} x_gs={x_gs}"); }
+    }
 }
