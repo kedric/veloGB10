@@ -41,6 +41,41 @@ this box measured the GDN as the quantization-sensitive block — see `scripts/q
 Shards are written at 4 GB (`GB10_QUANT_SHARD_GB`): the loader holds a whole shard plus its
 parts in host memory while it repacks, and 12 GB shards pushed a 128 GB box over the edge.
 
+### 1b. Calibrated quantization: `--gptq` (GPTQ → NVFP4, optionally micro-rotated)
+
+`--recipe all` is round-to-nearest. `--gptq` re-quantizes the GEMM weights with GPTQ (Hessian-
+weighted error compensation from calibration activations), one layer at a time, on one GB10:
+
+```bash
+GB10_PLE_OFFLOAD=ssd ./target/release/gb10_inference --gptq \
+    --model-dir ~/models/Qwen3.8-Flash-Next \                 # bf16 source (read shard by shard)
+    --base ~/models/Qwen3.8-Flash-Next-NVFP4-velo \           # an existing artifact: embeddings, norms, PLE table, MTP head
+    --out ~/models/Qwen3.8-Flash-Next-GPTQ-velo \
+    --calib /var/tmp/calib.jsonl --nsamples 128 --seqlen 1024 \
+    [--gptq-groups expert,attn,mlp] [--rtn-groups mtp] [--damp 0.01] [--clip 7] [--rotate]
+```
+
+How it fits in 128 GB: the `--base` artifact is loaded as the model; for each layer its linears are
+swapped for the bf16 originals (~2.5 GB), the engine's own prefill runs the calibration samples
+through that single layer (`prefill_batch_range`) with Hessian taps in `gemm_act` / `moe_batch`
+(per routed expert for the MoE — 512 × 2560² f32 = 13 GB), GPTQ runs on the GPU (cuSOLVER
+Cholesky, a row-parallel 128-column block sweep with NVFP4 16-group scales and a clip search,
+cuBLAS propagation), the quantized layer is swapped back in and re-run so the next layer calibrates
+on quantized inputs, and the records stream to 4 GB output shards. Peak ≈ 95 GB. Groups not in
+`--gptq-groups`/`--rtn-groups` are written **bf16** (default: GDN, hyper-connections, router, PLE
+projections, lm_head, embed — the quantization-sensitive ones); the MTP head and the PLE table
+come from the base artifact. `--calib` is a jsonl (`{"text": …}`) or plain text; `random` gives
+seeded random ids (synthetic-model smoke test). `--rotate` is MR-GPTQ: a 16-point Hadamard
+micro-rotation (R = H16/4) is applied to every 16-block of the input dim before quantizing
+(W' = W·R, H' = R·H·R); the artifact's config carries `quantization_config.transform =
+{type: hadamard16, groups: […]}` and the engine rotates the matching activations at serve time
+(`gptq_rotate_act_b` before the dense GEMMs, on the gathered expert inputs and on the silu
+output before the down projection in the MoE paths; not supported together with `--mxfp4`).
+
+Synthetic-model check (`scripts/qwen4exp/ref_bf16.py`, the HF reference on the bf16 weights vs
+the engine's logits, same prompt): RTN 20.7 % relL2 / argmax 7/8 → GPTQ 12.0 % / 8/8 →
+MR-GPTQ 11.8 % / 8/8.
+
 ## 2. Serve
 
 ### Single GB10 — recommended: PLE table on the SSD
@@ -99,6 +134,7 @@ positions to image tokens (the reference uses interleaved 3-D MRoPE: (t, h, w) p
 `max(h, w)/2` positions per image for the following text). This is the existing behaviour on
 Qwen3.5 as well; implementing MRoPE (3-D rope gather in the attention and QSA-indexer kernels,
 per-lane position deltas after images) is the remaining fidelity item for image input.
+| `--gptq` calibrated re-quantization (GPTQ / MR-GPTQ → NVFP4, one layer at a time) | works — see §1b; real-model A/B pending |
 | vision input (OpenAI `image_url`, PNG/JPEG/WebP/GIF) | works — same tower as Qwen3.5 (identical HF code, 2560-wide merger), GPU tower, loaded from the one shard that holds `model.visual.*` (6 s, ~1.3 GB); image embeddings spliced before the hyper-connection expansion. Same limitation as the other families: image tokens use 1-D positions (no 3-D MRoPE) — see §3 |
 
 ### QSA sparse attention (long context)

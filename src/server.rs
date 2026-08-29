@@ -297,11 +297,30 @@ async fn chat_completions(
             }
             n
         });
+    // tool_choice: "none" renders the turn without tools; "required" / a named function FORCE the
+    // call by seeding the assistant turn with the template's tool-call opener (the thinking block
+    // is closed empty first — a forced call cannot start inside <think>). The seed is prepended to
+    // the generated text before parsing so the serializer sees a complete call.
+    let (tools_for_render, forced_prefix): (Option<&[serde_json::Value]>, String) = match &req.tool_choice {
+        Some(serde_json::Value::String(c)) if c == "none" => (None, String::new()),
+        Some(serde_json::Value::String(c)) if c == "required" && req.tools.is_some() => (req.tools.as_deref(), "<tool_call>\n<function=".to_string()),
+        Some(v) if v.get("type").and_then(|t| t.as_str()) == Some("function") && req.tools.is_some() => {
+            let name = v["function"]["name"].as_str().unwrap_or("").to_string();
+            (req.tools.as_deref(), format!("<tool_call>\n<function={name}>\n"))
+        }
+        _ => (req.tools.as_deref(), String::new()),
+    };
     let t_render = std::time::Instant::now();
-    let prompt = match state.tokenizer.apply_chat_template(&req.messages, req.tools.as_deref(), effort) {
+    let mut prompt = match state.tokenizer.apply_chat_template(&req.messages, tools_for_render, effort) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    if !forced_prefix.is_empty() {
+        if let Some(p) = prompt.strip_suffix("<think>\n") { prompt = format!("{p}<think>\n\n</think>\n\n"); }
+        prompt.push_str(&forced_prefix);
+        eprintln!("[req] tool_choice forces a call: seeded {:?}", forced_prefix);
+    }
+    let forced_prefix_stream = forced_prefix.clone();
     let render_ms = t_render.elapsed().as_secs_f64() * 1000.0;
 
     // Optional diagnostic: dump the exact rendered prompt string so the bytes a model
@@ -474,7 +493,7 @@ async fn chat_completions(
             // multi-byte char split across tokens (all emoji) into "�" — the crate's ByteLevel
             // decode is String::from_utf8_lossy per call. Reassembles raw bytes across tokens.
             let mut stream_dec = tokenizer.stream_decoder();
-            let mut acc = String::new();
+            let mut acc = forced_prefix_stream.clone();
             let mut n = 0usize;
             let mut stop_hit = false;
             let mut finish = "length".to_string();
@@ -652,7 +671,7 @@ async fn chat_completions(
             }
         }
         let dt = t0.elapsed().as_secs_f32();
-        let mut text = state.tokenizer.decode(&tokens, true).unwrap_or_default();
+        let mut text = format!("{forced_prefix}{}", state.tokenizer.decode(&tokens, true).unwrap_or_default());
         if !req.stop.is_empty() {
             if let Some(p) = req.stop.iter().filter_map(|s| text.find(s)).min() {
                 text.truncate(p); finish = "stop".to_string();

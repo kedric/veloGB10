@@ -9,6 +9,7 @@ pub mod gpu;
 pub mod quant;
 pub mod ple;
 pub mod memwatch;
+pub mod gptq;
 pub mod mxfp4;
 pub mod batch;
 pub mod kernels;

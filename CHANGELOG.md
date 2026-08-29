@@ -22,6 +22,14 @@ generic language where they aren't individually notable.
   keys are cached per position like the KV; below the limit the dense kernels are unchanged.
   `GB10_Q4_DENSE_ATTN=1` (A/B) forces dense; `GB10_QSA_DUMP=1` dumps selections for the oracle
   check (`scripts/qwen4exp/compare_qsa.py`).
+- **`--gptq`**: calibrated GPTQ / MR-GPTQ (`--rotate`, 16-point Hadamard micro-rotation)
+  re-quantization to NVFP4, one layer at a time on one GB10 — the base artifact is loaded, each
+  layer's bf16 weights are swapped in from the source shards, the engine's own prefill runs the
+  calibration set with Hessian taps (per routed expert), GPTQ runs on the GPU (cuSOLVER Cholesky,
+  row-parallel block sweep with NVFP4 group scales + clip search), the quantized layer is re-run
+  for the next layer. Rotated artifacts are served with an activation micro-rotation before the
+  matching GEMMs. The loader now decides q/k/v and GDN fusion per tensor group, so mixed
+  bf16/NVFP4 artifacts load.
 - **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
   read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
   `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).

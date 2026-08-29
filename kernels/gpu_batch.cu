@@ -11233,3 +11233,157 @@ extern "C" __global__ void __launch_bounds__(256) gqa_attn_sel_prefill2(__nv_bfl
         for (int i = 0; i < 8; i++) if (i < DPL) orow[i] = f2b(l[g] > 0.0f ? acc[g][i] / l[g] : 0.0f);
     }
 }
+
+// ===================== GPTQ → NVFP4 (src/gptq.rs, the --gptq quantizer) =====================
+// W is f32 row-major [M, K] on device (a working copy of the bf16 source weight, optionally
+// micro-rotated). U is the upper Cholesky factor of the damped inverse Hessian (f32 row-major
+// [K, K]; only j <= k is read). The sweep quantizes one 128-column block for ALL rows at once —
+// one thread per row, columns strictly in order with the GPTQ error feedback inside the block —
+// and writes the NVFP4 codes (nibbles, [M, K/2]) and the per-16 E4M3 block scales ([M, K/16]) in
+// the artifact's layout; the cross-block propagation W[:, c1:] -= Err · U[c0:c1, c1:] is a cuBLAS
+// GEMM issued by the host between sweeps.
+
+__device__ __forceinline__ unsigned char gptq_e2m1(float x) {   // == quant::f32_to_e2m1 (RNE, ties to even code)
+    const float grid[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    unsigned char sign = x < 0.f ? 8 : 0;
+    float a = fminf(fabsf(x), 6.f);
+    unsigned char best = 0; float be = 1e30f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        float e = fabsf(grid[i] - a);
+        if (e < be - 1e-9f || (fabsf(e - be) <= 1e-9f && (i % 2) == 0)) { be = e; best = (unsigned char)i; }
+    }
+    return sign | best;
+}
+__device__ __forceinline__ float gptq_e2m1_val(unsigned char c) {
+    const float grid[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float v = grid[c & 7]; return (c & 8) ? -v : v;
+}
+
+extern "C" __global__ void gptq_bf16_to_f32_b(float* out, const __nv_bfloat16* in, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
+// |x| max over n floats (atomicMax on the non-negative float bit pattern; *out must start at 0).
+extern "C" __global__ void gptq_absmax_b(unsigned int* out, const __nv_bfloat16* x, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    float v = (i < n) ? fabsf(__bfloat162float(x[i])) : 0.f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(v));
+}
+
+// In-place 16-point Hadamard (orthonormal, H/4) on every 16-vector of a [M, K] f32 matrix.
+// axis 0: vectors along the rows (elements row*K + 16b + i) — the K (input) dimension;
+// axis 1: vectors along the columns (elements (16b+i)*K + col) — for the Hessian's row side.
+extern "C" __global__ void gptq_hadamard16_b(float* W, int M, int K, int axis) {
+    long long nvec = (axis == 0) ? (long long)M * (K / 16) : (long long)(M / 16) * K;
+    long long v = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= nvec) return;
+    float* p; long long stride;
+    if (axis == 0) { long long row = v / (K / 16), b = v % (K / 16); p = W + row * K + b * 16; stride = 1; }
+    else           { long long b = v / K, col = v % K; p = W + (b * 16) * K + col; stride = K; }
+    float x[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) x[i] = p[i * stride];
+    #pragma unroll
+    for (int len = 1; len < 16; len <<= 1)
+        #pragma unroll
+        for (int i = 0; i < 16; i += 2 * len)
+            #pragma unroll
+            for (int j = i; j < i + len; j++) { float a = x[j], b = x[j + len]; x[j] = a + b; x[j + len] = a - b; }
+    #pragma unroll
+    for (int i = 0; i < 16; i++) p[i * stride] = x[i] * 0.25f;
+}
+
+// The block sweep. c0 = first column of the block, bs = block width (multiple of 16, <= 256).
+// s_tensor = 1/global_scale (the per-tensor NVFP4 scale). nclip = number of clip ratios tried per
+// 16-group (1 = plain amax/6). Err [M, bs] row-major receives (w - q)/U[j][j].
+extern "C" __global__ void gptq_sweep_b(float* W, unsigned char* qw, unsigned char* qs, float* Err,
+                                        const float* U, int M, int K, int c0, int bs, float s_tensor, int nclip) {
+    const float ratios[7] = {1.0f, 0.95f, 0.9f, 0.85f, 0.8f, 0.75f, 0.7f};
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= M) return;
+    float* w = W + (long long)r * K;
+    float* e = Err + (long long)r * bs;
+    float s = 1.f, inv = 0.f;
+    for (int j = 0; j < bs; j++) {
+        const int col = c0 + j;
+        if ((col & 15) == 0) {
+            // group scale from the CURRENT (error-updated) values of this row's group
+            float amax = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(w[col + i]));
+            unsigned char best_code = 0; float best_err = 1e30f;
+            for (int c = 0; c < nclip; c++) {
+                float sraw = (amax > 0.f) ? amax * ratios[c] / 6.f / s_tensor : 0.f;
+                unsigned char code = f32_to_e4m3(sraw);
+                float sc = e4m3_f(code) * s_tensor;
+                float iv = (sc > 0.f) ? 1.f / sc : 0.f;
+                float err = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) { float q = gptq_e2m1_val(gptq_e2m1(w[col + i] * iv)) * sc; err += (q - w[col + i]) * (q - w[col + i]); }
+                if (c == 0 || err < best_err) { best_err = err; best_code = code; }
+            }
+            qs[(long long)r * (K / 16) + col / 16] = best_code;
+            s = e4m3_f(best_code) * s_tensor;
+            inv = (s > 0.f) ? 1.f / s : 0.f;
+        }
+        unsigned char code = gptq_e2m1(w[col] * inv);
+        float q = gptq_e2m1_val(code) * s;
+        long long qi = (long long)r * (K / 2) + col / 2;
+        unsigned char byte = qw[qi];
+        qw[qi] = (col & 1) ? ((byte & 0x0F) | (code << 4)) : ((byte & 0xF0) | code);
+        const float d = U[(long long)col * K + col];
+        const float err = (w[col] - q) / d;
+        e[j] = err;
+        const float* urow = U + (long long)col * K;
+        for (int k2 = j; k2 < bs; k2++) w[c0 + k2] -= err * urow[c0 + k2];
+    }
+}
+
+// Gather n token rows (each K bf16, contiguous) by index into dst [n, K].
+extern "C" __global__ void gptq_gather_rows_b(__nv_bfloat16* dst, const __nv_bfloat16* src, const int* idx, int n, int K) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)n * K) return;
+    int t = (int)(i / K), c = (int)(i % K);
+    dst[i] = src[(long long)idx[t] * K + c];
+}
+
+// act[i, t] = silu(g[i, t]) * u[i, t] from a fused [2I, n] f32 gate|up buffer (column-major per
+// token: gate rows 0..I, up rows I..2I), written bf16 [I, n].
+extern "C" __global__ void gptq_silu_mul_gu_b(__nv_bfloat16* act, const float* gu, int I, int n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)I * n) return;
+    int t = (int)(i / I), r = (int)(i % I);
+    float g = gu[(long long)t * 2 * I + r], u = gu[(long long)t * 2 * I + I + r];
+    act[i] = __float2bfloat16(g / (1.f + __expf(-g)) * u);
+}
+
+// The engine-side micro-rotation for MR-GPTQ artifacts: x' = H16/4 · x on every 16-block of the
+// K (feature) dimension of a bf16 activation matrix [K, n] (feature-contiguous per column).
+extern "C" __global__ void gptq_rotate_act_b(__nv_bfloat16* out, const __nv_bfloat16* x, long long nvec) {
+    long long v = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= nvec) return;
+    const __nv_bfloat16* p = x + v * 16;
+    float y[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) y[i] = __bfloat162float(p[i]);
+    #pragma unroll
+    for (int len = 1; len < 16; len <<= 1)
+        #pragma unroll
+        for (int i = 0; i < 16; i += 2 * len)
+            #pragma unroll
+            for (int j = i; j < i + len; j++) { float a = y[j], b = y[j + len]; y[j] = a + b; y[j + len] = a - b; }
+    __nv_bfloat16* o = out + v * 16;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) o[i] = __float2bfloat16(y[i] * 0.25f);
+}
+extern "C" __global__ void gptq_absmax_f32_b(unsigned int* out, const float* x, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    float v = (i < n) ? fabsf(x[i]) : 0.f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(v));
+}

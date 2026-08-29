@@ -10,6 +10,7 @@ inside the `llmc-qwen4:latest` docker image (transformers 5.16 with native `qwen
 | `ref_forward.py` | HF forward (fp32, eager) on the **dequantized** weights of an engine NVFP4 artifact, teacher-forced on the engine's tokens; compares per-step logits with `--probe-q4 --dump-logits`. |
 | `validate_quant.py` | Round-trip error of a quantized artifact vs its bf16 source (GEMM tensors + PLE records). |
 | `nvfp4.py` | Shared NVFP4 / PLE-record decoders (mirror of `src/quant.rs`). |
+| `ref_bf16.py` | Quality oracle: the HF reference on the ORIGINAL bf16 weights vs one or more engine dumps (`--probe-q4 --dump-logits`) — the served quantization error of each artifact (RTN / GPTQ / MR-GPTQ). |
 | `compare_qsa.py` | Matches the engine's QSA selection lists (`GB10_QSA_DUMP=1` stderr) against the reference's (`ref_forward.py` under `QSA_DUMP=1`), with the block scores of any differing block. |
 | `ref/` | The reference implementations the port was written against (HF `modeling_qwen4_exp.py`, SGLang `qwen4_exp*.py`, `hyperconnection.py`, `qwen4_ple_nvme.py`). |
 

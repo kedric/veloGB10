@@ -369,6 +369,40 @@ fn main() {
     }
 
     // Batched benchmark mode
+    if args.iter().any(|a| a == "--gptq-refmt") {
+        // --gptq-refmt --model-dir <artifact> --out <dir> [--fp8-groups gdn,hc,lmhead] [--rtn-groups ...]
+        let inp = parse_arg(&args, "--model-dir").expect("--gptq-refmt requires --model-dir <artifact>");
+        let out = parse_arg(&args, "--out").expect("--gptq-refmt requires --out <dir>");
+        let f8 = gb10_inference::gptq::parse_groups(parse_arg(&args, "--fp8-groups").unwrap_or("")).expect("--fp8-groups");
+        let f4 = gb10_inference::gptq::parse_groups(parse_arg(&args, "--rtn-groups").unwrap_or("")).expect("--rtn-groups");
+        if let Err(e) = gb10_inference::gptq::refmt(std::path::Path::new(inp), std::path::Path::new(out), &f8, &f4) {
+            eprintln!("ERROR: --gptq-refmt failed: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gptq") {
+        // --gptq --model-dir <bf16 source> --base <nvfp4 artifact> --out <dir> --calib <txt|jsonl>
+        //        [--nsamples 128] [--seqlen 1024] [--damp 0.01] [--clip 7] [--rotate]
+        //        [--gptq-groups expert,attn,mlp] [--rtn-groups mtp]
+        let src = parse_arg(&args, "--model-dir").expect("--gptq requires --model-dir <bf16 source>");
+        let base = parse_arg(&args, "--base").expect("--gptq requires --base <nvfp4 artifact>");
+        let out = parse_arg(&args, "--out").expect("--gptq requires --out <dir>");
+        let calib = parse_arg(&args, "--calib").expect("--gptq requires --calib <text or jsonl>");
+        let opts = gb10_inference::gptq::GptqOpts {
+            nsamples: parse_arg(&args, "--nsamples").and_then(|s| s.parse().ok()).unwrap_or(128),
+            seqlen: parse_arg(&args, "--seqlen").and_then(|s| s.parse().ok()).unwrap_or(1024),
+            damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
+            nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
+            rotate: args.iter().any(|a| a == "--rotate"),
+            gptq_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--gptq-groups").unwrap_or("expert,attn,mlp")).expect("--gptq-groups"),
+            nvfp4_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--rtn-groups").unwrap_or("mtp")).expect("--rtn-groups"),
+            fp8_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--fp8-groups").unwrap_or("")).expect("--fp8-groups"),
+        };
+        if let Err(e) = gb10_inference::gptq::run(std::path::Path::new(src), std::path::Path::new(base), std::path::Path::new(out), std::path::Path::new(calib), opts) {
+            eprintln!("ERROR: --gptq failed: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--bench-batch") {
         run_bench_batch(&args);
         return;

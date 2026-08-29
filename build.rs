@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rustc-env=CUDA_ARCHITECTURES=121");
     println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cusolver");
 
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
     println!("cargo:include={}/include", cuda_home);
