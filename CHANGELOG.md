@@ -30,6 +30,21 @@ generic language where they aren't individually notable.
   for the next layer. Rotated artifacts are served with an activation micro-rotation before the
   matching GEMMs. The loader now decides q/k/v and GDN fusion per tensor group, so mixed
   bf16/NVFP4 artifacts load.
+- **NVFP4 W4A4 prefill** (`GB10_W4A4_PREFILL`, `kernels/gpu_w4a4.cu`, `src/w4a4.rs`): the prefill
+  GEMMs of the experts / shared expert / attention run on the block-scaled FP4 tensor cores with
+  E2M1 activations (per-16 UE4M3 scales × the tensor's `input_global_scale`), reading the standard
+  tiled weights — no repack, no second copy; decode / verify keep W4A16 (MTP contract intact).
+  TTFT −26 % at 2.8K tokens, −28 % at 6.6K on Qwen3.8-Flash-Next. `GB10_W4A4_CHECK` fake-quant
+  self-check. `e4m3_ceil` no longer saturates to 0x7F (NaN in E4M3) — also fixed in gpu_mxfp4.cu.
+- **`input_global_scale`** written by `--gptq` for every calibrated tensor (activation amax from
+  the Hessian taps) and `--calib-igs` to calibrate an existing artifact in place
+  (`input_global_scale.json` sidecar merged by the loader).
+- **GPTQ fixes**: the dense Hessians (attention, indexer, shared expert) were keyed by the
+  quantizer's weight copy and never accumulated (those tensors silently got RTN); an empty
+  Hessian is now an error, the QSA indexer reuses q_proj's; MR-GPTQ rotation is applied on the
+  ≥128-token MoE prefill arm too (it was missing, breaking every rotated artifact past ~128
+  tokens); RTN groups are no longer marked rotated; `--gptq-refmt` copies config.json instead of
+  hard-linking (it edited the input artifact); output directories are guarded.
 - **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
   read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
   `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).

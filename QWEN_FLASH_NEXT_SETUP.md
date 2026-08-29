@@ -76,6 +76,14 @@ Synthetic-model check (`scripts/qwen4exp/ref_bf16.py`, the HF reference on the b
 the engine's logits, same prompt): RTN 20.7 % relL2 / argmax 7/8 → GPTQ 12.0 % / 8/8 →
 MR-GPTQ 11.8 % / 8/8.
 
+Every GPTQ'd triple also carries `{stem}.input_global_scale` (F32 [1], compressed-tensors
+convention: 6·448 / the activation |x| max seen by the calibration, after the MR rotation when
+there is one) — the per-tensor activation scale of the W4A4 prefill below. An artifact quantized
+before this existed can be calibrated in place without re-quantizing:
+`--calib-igs --model-dir <artifact> --calib <jsonl> --nsamples 512 --seqlen 1024` runs a plain
+prefill of the calibration set through the served model (~15 min) and writes
+`<artifact>/input_global_scale.json` (stem → scale), which the loader merges over the tensors.
+
 ## 2. Serve
 
 ### Single GB10 — recommended: PLE table on the SSD
@@ -99,6 +107,28 @@ mode). The logits are bit-identical to the resident mode.
 Omit `--ple-offload`. The table is uploaded at load (~30 s); footprint ≈ 100 GB + KV: it fits, but
 leaves **no room for anything else** on the box. The load-time guard refuses if the measured
 budget (`[mem] qwen4_exp footprint: ...` line) does not fit in `MemAvailable`; do not force it.
+
+### W4A4 prefill (`GB10_W4A4_PREFILL`)
+
+`GB10_W4A4_PREFILL=1` (= groups `expert,mlp,attn`; or a comma list of quantizer groups) runs the
+prefill GEMMs of those NVFP4 tensors on the Blackwell block-scaled FP4 tensor cores with the
+**activations quantized too** (E2M1 + UE4M3 scale per 16, times the tensor's
+`input_global_scale`; 1.0 when the artifact has none). The kernels (`kernels/gpu_w4a4.cu`) read
+the engine's standard tiled weights directly — no second weight copy, so the 97-GB expert set
+costs zero extra bytes — and only widths above the verify width (17+ tokens; the 128+-token
+grouped MoE arm for the experts) take the path: decode and the MTP verify keep the W4A16 chain,
+the lossless-verify contract is untouched. GDN, hyper-connections, PLE, router and lm_head stay
+on bf16 activations by default (`gdn`/`hc`/`ple`/`lmhead` can be added to the list).
+
+Measured on the RTN `all` artifact (batch 2, MTP, PLE on the SSD): TTFT 2 809 tokens 3.25 s →
+2.41 s, 6 613 tokens 7.44 s → 5.33 s (−26/−28 %); decode unchanged. Accuracy: the A4 rounding is a
+~4–14 % relL2 perturbation per GEMM (largest on the down projections), which the RTN artifact
+does not always absorb (one 1 178-token prompt flipped into a reasoning ramble) while the
+MR-GPTQ artifact — rotated weights, so the rotated activations are close to Gaussian per
+16-block, exactly the MR-GPTQ W4A4 regime of Egiazarian et al. 2025 — answers correctly; the
+tool-eval / GSM8K numbers are in the CHANGELOG. `GB10_W4A4_CHECK=1` recomputes every W4A4 GEMM
+through the bf16 chain on fake-quantized inputs and reports the per-row relL2 (kernel check: dense
+≤ 1e-2, MoE bit-identical); `GB10_W4A4_TRACE=1` logs each dispatch. Exclusive with `--mxfp4`.
 
 ### Memory safety
 

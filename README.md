@@ -463,7 +463,8 @@ cold-admit KV zeroing), `RUST_INFER_PREFILL_SCALAR=1` (scalar prefill path),
 `GB10_NO_DECODE_GRAPHS=1` (disable decode graphs), `RUST_INFER_CPU_SAMPLE=1` (CPU sampling),
 `GB10_TP_TRACE=1` (per-barrier timing histograms at exit). Opt-in prefill levers (default off):
 `GB10_FA_PREFILL=1` (tensor-core flash-attention prefill), `GB10_MXFP4_PREFILL=1` (v2 W4A4 prefill
-GEMM), `GB10_GDN_CHUNK=1` / `GB10_GDN_CHUNK2=1` (GDN tensor-core chunked scan); these change the
+GEMM), `GB10_W4A4_PREFILL=1|<groups>` (NVFP4 W4A4 prefill on the standard tiled weights — qwen4_exp,
+see QWEN_FLASH_NEXT_SETUP.md), `GB10_GDN_CHUNK=1` / `GB10_GDN_CHUNK2=1` (GDN tensor-core chunked scan); these change the
 prefill path and are on by default only where the gates hold.
 
 ### Probes (diagnostics)
