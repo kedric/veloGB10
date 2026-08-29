@@ -34,6 +34,9 @@ pub struct AppState {
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
+    /// Decode positions reserved beyond `max_tokens` for speculative verification/re-prime.
+    /// Mirrors the scheduler reserve so an HTTP-clamped request is always admissible.
+    pub decode_headroom: usize,
     /// Scheduler prefix-cache flag (mirror of TpConfig.prefix_cache). The message-boundary
     /// checkpoint (`ckpt_at`) is only ever USED when the scheduler's prefix cache is on
     /// (batch.rs filters it again); gating its render+tokenize here saves the double
@@ -258,6 +261,11 @@ fn spec_finish_reason(reason: &str) -> &str {
     if reason == "context_length_exceeded" { "length" } else { reason }
 }
 
+fn generation_room(max_seq_len: usize, prompt_len: usize, decode_headroom: usize) -> Option<usize> {
+    let used = prompt_len.checked_add(decode_headroom)?;
+    max_seq_len.checked_sub(used).filter(|&room| room > 0)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
@@ -401,15 +409,17 @@ async fn chat_completions(
     // out of bounds — silently, corrupting whatever allocation followed, which showed up as two
     // identical prefills disagreeing. Reject what cannot fit, and cap generation at the room left:
     // running short is a `finish_reason: "length"`, which is in the contract. Corruption is not.
-    if prompt_len >= state.max_seq_len {
+    if generation_room(state.max_seq_len, prompt_len, state.decode_headroom).is_none() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": {
             "message": format!("This model's maximum context length is {} tokens, but your messages \
-                                came to {} tokens. Shorten the input or restart the server with a \
-                                larger --max-seq-len.", state.max_seq_len, prompt_len),
+                                came to {} tokens and decoding reserves {} more positions. Shorten the input or \
+                                restart the server with a larger --max-seq-len.",
+                                state.max_seq_len, prompt_len, state.decode_headroom),
             "type": "invalid_request_error", "code": "context_length_exceeded",
         }}))).into_response();
     }
-    let room = state.max_seq_len - prompt_len;
+    let room = generation_room(state.max_seq_len, prompt_len, state.decode_headroom)
+        .expect("context room checked above");
     let asked = req.max_tokens.unwrap_or(state.default_max_tokens);
     let req_max = asked.min(room);
     // If the KV cache forced generation shorter than asked, SAY SO. A thinking model spends a big fixed
@@ -417,8 +427,8 @@ async fn chat_completions(
     // reasoning" as a conversation grows — which is exactly how this surfaced in the wild. Raise
     // --max-seq-len (graphs cost ~nothing here; KV is ~64 KB/token) to give multi-turn room.
     if req_max < asked {
-        eprintln!("[req] max_tokens clamped {} -> {} (KV cache room: {} of {} used by the {}-token prompt; \
-                   raise --max-seq-len)", asked, req_max, prompt_len, state.max_seq_len, prompt_len);
+        eprintln!("[req] max_tokens clamped {} -> {} (KV cache: {}-token prompt + {} reserved decode positions of {}; \
+                   raise --max-seq-len)", asked, req_max, prompt_len, state.decode_headroom, state.max_seq_len);
     }
     let temperature = req.temperature;
     let top_p = req.top_p.max(0.01);
@@ -751,4 +761,21 @@ pub fn create_router(state: AppState) -> Router {
         // so images that other engines accept also arrive here.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    use super::generation_room;
+
+    #[test]
+    fn mtp_headroom_is_reserved_before_clamping() {
+        assert_eq!(generation_room(4096, 1314, 16), Some(2766));
+        assert_eq!(generation_room(4096, 1324, 16), Some(2756));
+    }
+
+    #[test]
+    fn prompt_that_leaves_only_headroom_has_no_generation_room() {
+        assert_eq!(generation_room(4096, 4080, 16), None);
+        assert_eq!(generation_room(4096, usize::MAX, 16), None);
+    }
 }

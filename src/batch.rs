@@ -211,6 +211,12 @@ pub struct MtpPolicy {
 
 use crate::gpu::MAX_AUTO_DEPTH;
 
+/// KV positions kept beyond the requested output: MTP draft/verify plus re-prime slop,
+/// or one guard row for plain decode.
+pub fn decode_headroom(mtp_active: bool) -> usize {
+    if mtp_active { MAX_AUTO_DEPTH + 8 } else { 1 }
+}
+
 /// B8/G3 — the runtime speculation-source switch (PLAN/08 scheduler delta). `Mtp` is always
 /// available; `Dspark` is the block drafter (falls back to MTP while K-DSP is unbuilt); `DFlash2`
 /// is the S4F integrated round (S5F wiring; falls back to MTP when the artifact is absent/failed
@@ -1510,14 +1516,13 @@ impl BatchScheduler {
         // depth + 8 (the τ floor's slop) when MTP is active, using the policy MAX depth so a later
         // depth-upswitch can't cross the line mid-request. Plain decode needs no such headroom (1 slot
         // of slop). All inputs are replicated state, so both TP ranks reject identically.
-        let mtp_depth = if will_use_mtp { crate::gpu::MAX_AUTO_DEPTH } else { 0 };
-        let mtp_headroom = if will_use_mtp { mtp_depth + 8 } else { 1 };
+        let mtp_headroom = decode_headroom(will_use_mtp);
         let reject_msg = if plen >= self.kv_stride {
             Some(format!("prompt is {plen} tokens but the KV cache holds {} — raise --max-seq-len",
                          self.kv_stride))
-        } else if plen + max_new + mtp_headroom > self.kv_stride {
-            Some(format!("plen {plen} + max_new {max_new} + depth {mtp_depth} + 8 exceeds KV stride {} — \
-                          raise --max-seq-len", self.kv_stride))
+        } else if plen + mtp_headroom >= self.kv_stride {
+            Some(format!("prompt {plen} + decode headroom {mtp_headroom} leaves no generation room \
+                          in KV stride {} — raise --max-seq-len", self.kv_stride))
         } else {
             None
         };
@@ -1535,7 +1540,8 @@ impl BatchScheduler {
             let _ = tx.send(TokEvent::Finish { reason: "context_length_exceeded".to_string() });
             return;
         }
-        let max_new = max_new.min(self.kv_stride - plen - mtp_headroom);
+        let room = self.kv_stride - plen - mtp_headroom;
+        let max_new = max_new.min(room);
 
         // Bound the pool. Safe here: `trim` synchronizes before freeing, and this runs before any GPU
         // work for this request. Without it the pool grows forever — see Pool::trim.

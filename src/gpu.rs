@@ -2219,7 +2219,7 @@ impl GpuModel {
     pub fn load_from_dir(model_dir: &str) -> anyhow::Result<(Self, crate::qwen::Config)> {
         let (mut m, cfg) = Self::load_from_dir_impl(model_dir, None, 1)?;
         m.apply_transform_config(model_dir)?;
-        m.init_w4a4()?;
+        m.init_w4a4(model_dir)?;
         Ok((m, cfg))
     }
 
@@ -2231,7 +2231,7 @@ impl GpuModel {
     pub fn load_from_dir_tp(model_dir: &str, rank: i32, world: i32) -> anyhow::Result<(Self, crate::qwen::Config)> {
         let (mut m, cfg) = Self::load_from_dir_impl(model_dir, Some(rank), world)?;
         m.apply_transform_config(model_dir)?;
-        m.init_w4a4()?;
+        m.init_w4a4(model_dir)?;
         Ok((m, cfg))
     }
 
@@ -5197,6 +5197,19 @@ impl GpuModel {
         const BINV_BATCH: usize = 2;
         // MR-GPTQ: a rotated weight reads the micro-rotated activation (scratch, x untouched).
         let _rot_guard; let x: &B = if self.is_rotated(w) { _rot_guard = self.rot_x(x, inn, batch); &*_rot_guard } else { x };
+
+        // Controlled head-only exception to the W4A4 prefill rule. The LM head is always invoked
+        // on the last hidden column (N=1), so merely listing `lmhead` in GB10_W4A4_PREFILL could
+        // never exercise A4. GB10_W4A4_LMHEAD_NARROW=1 makes that A/B explicit; no other tensor may
+        // enter this arm, preserving the W4A16 decode/verify contract for the trunk and MTP.
+        if let (Some(w4), W::Nvfp4 { qweight, m, k, .. }) = (&self.w4a4, w) {
+            let ptr = *qweight.device_ptr() as u64;
+            if batch <= MAX_VERIFY && w4.narrow_on(ptr) && *k == inn && *m == outn && inn % 64 == 0
+                && x.len() >= batch * inn && out.len() >= batch * outn {
+                self.w4a4_dense(w4, w, x, out, inn, outn, batch, w4.xgs(ptr));
+                return;
+            }
+        }
 
         match w {
             W::Nvfp4 { qweight, scales, gs, .. } if batch <= MAX_VERIFY => {
@@ -19958,6 +19971,26 @@ impl GpuModel {
     pub fn gptq_layer(&self, li: usize) -> &GpuLayer { &self.layers[li] }
     pub fn gptq_dev(&self) -> &Arc<CudaDevice> { &self.dev }
 
+    /// Accumulate the LM-head Hessian from the complete final-normalized hidden stream. Serving
+    /// computes logits only for the last prompt token, so a normal GEMM tap would see one vector
+    /// per sample instead of `seqlen` vectors. `normed` is reusable [h, n] scratch.
+    ///
+    /// The Hessian is accumulated in the original basis; when MR is requested only the amax path
+    /// is rotated in-place, because `gptq_h32` rotates H later while W4A4 needs its activation scale
+    /// measured in the actually served (Hadamard) basis.
+    pub fn gptq_lmhead_hess_accum(&self, acc: &mut GptqHess, residual: &B, normed: &B, n: usize, rotate_amax: bool) {
+        let h = self.cfg.hidden_size;
+        assert_eq!(acc.k, h);
+        assert!(residual.len() >= h * n && normed.len() >= h * n);
+        blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
+            (d(normed), d(residual), d(&self.final_norm), h as i32, n as i32, fbits(self.cfg.rms_eps)));
+        self.gptq_hess_accum(d(&acc.h), h, d(normed), n);
+        if rotate_amax { self.rot_inplace(normed, h * n); }
+        blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0,
+            (d(&acc.amax), d(normed), (h * n) as i64));
+        acc.n += n;
+    }
+
     /// H += X·Xᵀ for X = bf16 [k, n] (feature-contiguous columns), f32 accumulate.
     fn gptq_hess_accum(&self, h_ptr: u64, k: usize, x_ptr: u64, n: usize) {
         use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t};
@@ -20301,12 +20334,27 @@ impl GpuModel {
     /// GB10_W4A4_PREFILL: collect the NVFP4 weights of the requested groups (by qweight pointer),
     /// their `input_global_scale` by name (a fused tensor takes the MIN of its parts = the largest
     /// calibrated amax), size the packed-activation scratch, load the sm_121a module.
-    fn init_w4a4(&mut self) -> anyhow::Result<()> {
-        let Some(groups) = crate::w4a4::groups_from_env() else { return Ok(()); };
+    fn init_w4a4(&mut self, model_dir: &str) -> anyhow::Result<()> {
+        let configured_a4 = std::fs::read_to_string(std::path::Path::new(model_dir).join("config.json"))
+            .ok().and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|j| j["quantization_config"]["activation_variant"].as_str().map(str::to_owned))
+            .as_deref() == Some("w4a4");
+        // An explicit environment value always wins, including `0` to disable an A4 artifact.
+        let groups = if std::env::var_os("GB10_W4A4_PREFILL").is_some() {
+            let Some(groups) = crate::w4a4::groups_from_env() else { return Ok(()); };
+            groups
+        } else if configured_a4 {
+            vec!["attn".into(), "mlp".into(), "gdn".into(), "lmhead".into()]
+        } else { return Ok(()); };
+        let narrow_requested = match std::env::var("GB10_W4A4_LMHEAD_NARROW") {
+            Ok(v) => v == "1",
+            Err(_) => configured_a4,
+        };
         anyhow::ensure!(self.mxfp4.is_none(), "GB10_W4A4_PREFILL and GB10_MXFP4 are exclusive");
         let has = |g: &str| groups.iter().any(|x| x == g);
         let lm = "model.language_model";
         let mut enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut narrow_enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut x_gs: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
         let mut k_max = 0usize;
         {
@@ -20354,12 +20402,17 @@ impl GpuModel {
                 } }
                 if has("ple") { if let Some(p) = &l.ple { add(&p.key_proj, &[format!("{lp}.ple.key_proj")]); add(&p.value_proj, &[format!("{lp}.ple.value_proj")]); } }
             }
-            if has("lmhead") { if let Some(w) = &self.lm_head { add(w, &["lm_head".to_string()]); } }
+            if has("lmhead") { if let Some(w) = &self.lm_head {
+                add(w, &["lm_head".to_string()]);
+                if narrow_requested {
+                    if let W::Nvfp4 { qweight, .. } = w { narrow_enabled.insert(*qweight.device_ptr() as u64); }
+                }
+            } }
         }
         if enabled.is_empty() { println!("W4A4 prefill: no NVFP4 weight in groups {groups:?} — off"); return Ok(()); }
         let rows_max = crate::batch::PREFILL_CHUNK.max(self.moe_g_pf.ppad_max);
         let tiles_max = self.moe_g_pf.ppad_max / crate::w4a4::W4_BN + self.cfg.num_experts + 2;
-        self.w4a4 = Some(crate::w4a4::W4a4State::build(&self.dev, groups, enabled, x_gs, rows_max, k_max, tiles_max)?);
+        self.w4a4 = Some(crate::w4a4::W4a4State::build(&self.dev, groups, enabled, narrow_enabled, x_gs, rows_max, k_max, tiles_max)?);
         Ok(())
     }
 

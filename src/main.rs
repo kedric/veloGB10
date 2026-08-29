@@ -293,6 +293,10 @@ fn print_help() {
     println!("  --ple-offload <ssd|none> qwen4_exp (Qwen3.8-Flash-Next): keep the PLE n-gram table on SSD [none = GPU-resident]");
     println!("  --quantize               bf16 dir -> NVFP4/FP8 artifact (--model-dir <in> --out <dir> --recipe <r>)");
     println!("                           groups: mlp attn gdn lmhead embed mtp router expert hc ple pletable; `all` = every group");
+    println!("  --gptq-lmhead            Replace an existing dense artifact's lm_head by MR-GPTQ NVFP4");
+    println!("                           (--model-dir <bf16> --base <artifact> --out <dir> --calib <jsonl>");
+    println!("                            --nsamples N --seqlen N --damp F --clip N --rotate)");
+    println!("                           GB10_W4A4_LMHEAD_NARROW=1 enables true A4 at the head's N=1 GEMM");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
@@ -389,6 +393,29 @@ fn main() {
         let f4 = gb10_inference::gptq::parse_groups(parse_arg(&args, "--rtn-groups").unwrap_or("")).expect("--rtn-groups");
         if let Err(e) = gb10_inference::gptq::refmt(std::path::Path::new(inp), std::path::Path::new(out), &f8, &f4) {
             eprintln!("ERROR: --gptq-refmt failed: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gptq-lmhead") {
+        let src = parse_arg(&args, "--model-dir").expect("--gptq-lmhead requires --model-dir <bf16 source>");
+        let base = parse_arg(&args, "--base").expect("--gptq-lmhead requires --base <MR-GPTQ artifact>");
+        let out = parse_arg(&args, "--out").expect("--gptq-lmhead requires --out <dir>");
+        let calib = parse_arg(&args, "--calib").expect("--gptq-lmhead requires --calib <text or jsonl>");
+        let opts = gb10_inference::gptq::GptqOpts {
+            nsamples: parse_arg(&args, "--nsamples").and_then(|s| s.parse().ok()).unwrap_or(128),
+            seqlen: parse_arg(&args, "--seqlen").and_then(|s| s.parse().ok()).unwrap_or(1024),
+            damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
+            nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
+            rotate: args.iter().any(|a| a == "--rotate"),
+            gptq_groups: vec![gb10_inference::quant::Group::LmHead],
+            nvfp4_groups: vec![],
+            fp8_groups: vec![],
+        };
+        if let Err(e) = gb10_inference::gptq::lmhead(
+            std::path::Path::new(src), std::path::Path::new(base), std::path::Path::new(out),
+            std::path::Path::new(calib), opts)
+        {
+            eprintln!("ERROR: --gptq-lmhead failed: {e:#}"); std::process::exit(1);
         }
         return;
     }
@@ -12147,6 +12174,9 @@ fn run_server(args: &[String]) {
         }
         let policy = gb10_inference::batch::MtpPolicy::with_source(
             gpu.mtp_present(), mtp_force, mtp_depth, mtp_r, spec_source);
+        // Keep the HTTP clamp aligned with the scheduler reserve. Auto may re-enable later,
+        // so retain the startup worst case for the server lifetime.
+        let decode_headroom = gb10_inference::batch::decode_headroom(policy.active());
         if !gpu.mtp_present() {
             println!("MTP: model has no MTP head — plain decode.");
         } else {
@@ -12299,6 +12329,7 @@ fn run_server(args: &[String]) {
                     }
                 }),
             max_seq_len,
+            decode_headroom,
             prefix_cache,
             // Vision tower(s) (v3): load the 333 model.visual.* tensors, and build the GPU fast path
             // on the shared device. Fails softly — a text-only / GPU-less server keeps its exact

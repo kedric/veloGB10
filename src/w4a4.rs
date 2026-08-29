@@ -32,6 +32,10 @@ pub struct W4a4State {
     pub tiles_max: usize,
     /// NVFP4 weights (by qweight device pointer) whose prefill GEMM takes the W4A4 path.
     pub enabled: HashSet<u64>,
+    /// Explicit opt-in for narrow (decode/verify) W4A4. Kept separate from `enabled` because
+    /// ordinary groups preserve the W4A16 batch-invariant path at N <= MAX_VERIFY.
+    /// Today only lm_head is admitted here, for controlled W4A16-vs-W4A4 quality benches.
+    pub narrow_enabled: HashSet<u64>,
     /// Input global scale per enabled weight (absent = 1.0).
     pub x_gs: HashMap<u64, f32>,
     pub groups: Vec<String>,
@@ -54,7 +58,7 @@ pub fn groups_from_env() -> Option<Vec<String>> {
 }
 
 impl W4a4State {
-    pub fn build(dev: &Arc<CudaDevice>, groups: Vec<String>, enabled: HashSet<u64>, x_gs: HashMap<u64, f32>,
+    pub fn build(dev: &Arc<CudaDevice>, groups: Vec<String>, enabled: HashSet<u64>, narrow_enabled: HashSet<u64>, x_gs: HashMap<u64, f32>,
                  rows_max: usize, k_max: usize, tiles_max: usize) -> anyhow::Result<Self> {
         let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_w4a4.ptx")?);
         dev.load_ptx(ptx, "gpu_w4a4", &["w4a4_quant_pack_b", "w4a4_gemm_b", "w4a4_gemm_moe_b",
@@ -73,9 +77,10 @@ impl W4a4State {
                  groups, enabled.len(), x_gs.len(), rows_max, k_max, (rows_max * k_max * 3 / 4) as f64 / 1e6);
         Ok(Self { quant: get("w4a4_quant_pack_b"), gemm: get("w4a4_gemm_b"), gemm_moe: get("w4a4_gemm_moe_b"),
                   tilemap: get("w4a4_moe_tilemap_b"), fakequant: get("w4a4_fakequant_b"), bq, sb, rows_max, k_max, tmap, tiles_max,
-                  enabled, x_gs, groups, trace })
+                  enabled, narrow_enabled, x_gs, groups, trace })
     }
     #[inline] pub fn on(&self, qweight_ptr: u64) -> bool { self.enabled.contains(&qweight_ptr) }
+    #[inline] pub fn narrow_on(&self, qweight_ptr: u64) -> bool { self.narrow_enabled.contains(&qweight_ptr) }
     #[inline] pub fn xgs(&self, qweight_ptr: u64) -> f32 { self.x_gs.get(&qweight_ptr).copied().unwrap_or(1.0) }
     /// Dense launch grid (token-fastest raster, group width 8): ceil(tn/8)*8 * tm blocks.
     pub fn dense_grid(mf: usize, nt: usize) -> u32 {
