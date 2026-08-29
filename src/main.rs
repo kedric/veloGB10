@@ -369,6 +369,18 @@ fn main() {
     }
 
     // Batched benchmark mode
+    if args.iter().any(|a| a == "--calib-igs") {
+        // --calib-igs --model-dir <artifact> [--out <dir> = artifact] --calib <txt|jsonl> [--nsamples 128] [--seqlen 1024]
+        let inp = parse_arg(&args, "--model-dir").expect("--calib-igs requires --model-dir <artifact>");
+        let out = parse_arg(&args, "--out").unwrap_or(inp);
+        let calib = parse_arg(&args, "--calib").expect("--calib-igs requires --calib <text or jsonl>");
+        let ns = parse_arg(&args, "--nsamples").and_then(|s| s.parse().ok()).unwrap_or(128);
+        let sl = parse_arg(&args, "--seqlen").and_then(|s| s.parse().ok()).unwrap_or(1024);
+        if let Err(e) = gb10_inference::gptq::calib_igs(std::path::Path::new(inp), std::path::Path::new(out), std::path::Path::new(calib), ns, sl) {
+            eprintln!("ERROR: --calib-igs failed: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--gptq-refmt") {
         // --gptq-refmt --model-dir <artifact> --out <dir> [--fp8-groups gdn,hc,lmhead] [--rtn-groups ...]
         let inp = parse_arg(&args, "--model-dir").expect("--gptq-refmt requires --model-dir <artifact>");

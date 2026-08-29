@@ -772,6 +772,8 @@ pub struct GpuModel {
     pub(crate) w4a4: Option<crate::w4a4::W4a4State>,
     /// `{stem}.input_global_scale` values read from the artifact (compressed-tensors), by stem.
     pub(crate) igs_by_name: std::collections::HashMap<String, f32>,
+    /// `--calib-igs`: armed activation |x| max accumulators by NVFP4 qweight pointer (prefill GEMMs only).
+    pub(crate) igs_tap: std::sync::Mutex<Option<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u32>>>>,
     mtp: Option<GpuMtpLayer>,
     k: KernelTable,
     bk: HashMap<String, CudaFunction>,
@@ -2209,7 +2211,7 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         dev.synchronize()?;
-        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, hc_mixer: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name: Default::default() })
+        Ok(Self { dev, blas, stream, cfg, embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head: None, draft_ids: Vec::new(), lm_head_sharded: false, tp_sharded_at_load: false, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4: None, hc_mixer: None, tp_rank: 0, tp_world: 1, tp_ctx_dptr: 0, head_visits: None, dflash_tap: None, df2_capture: None, df2_prime: None, dflash_lm_head: None, df2_full_head: None, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name: Default::default(), igs_tap: std::sync::Mutex::new(None) })
     }
 
     /// Stream-load from safetensors directly as bf16 — no f32 intermediate.
@@ -4052,7 +4054,16 @@ impl GpuModel {
         let (kv_quant, kv_tq, kv_tq_b3, kv_k8v4) = Self::kv_modes_from_env();
         let tq_tables = Self::build_tq_tables(&dev)?;
         mem_probe("post-mxfp4-build");
-        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, hc_mixer, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name }, cfg))
+        // `input_global_scale.json` (written by --calib-igs) overrides / supplements the tensors.
+        let mut igs_by_name = igs_by_name;
+        if let Ok(js) = std::fs::read_to_string(std::path::Path::new(model_dir).join("input_global_scale.json")) {
+            if let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&js) {
+                let n0 = igs_by_name.len();
+                for (k, v) in m { if let Some(f) = v.as_f64() { igs_by_name.insert(k, f as f32); } }
+                println!("input_global_scale.json: {} entries (artifact tensors: {n0})", igs_by_name.len());
+            }
+        }
+        Ok((Self { dev, blas, stream, cfg: cfg.clone(), embed, lm_head, final_norm, layers, mtp, k, bk, cos_table, sin_table, sc_pos, sc_rope, sc_slot, sc_winsrc, sc_parent, sc_path, sc_tok, sc_pstart, moe_ids, moe_wts, moe_g, moe_g_pf, sc_i1a, sc_i1b, sv_pf, sv_ki, sv_sd, sv_cand, sv_p, sv_r, mr_tok, mr_pos, verify_params, verify_resid, verify_graphs, gdn_slot_tables, sv_t20: std::sync::OnceLock::new(), sv_t20_scratch: std::sync::OnceLock::new(), deq_scratch, splitk_partials, tp_f32_scratch, mtp_sids, draft_head, draft_ids, lm_head_sharded: lm_head_sharded_lc, gdn_chunk_raw_fn: gdn_chunk_load_raw_fn(), gdn_chunk_tc_raw_fn: gdn_chunk_tc_load_raw_fn(), tp_sharded_at_load: sal.is_some(), kv_quant, kv_tq, kv_tq_b3, kv_k8v4, tq_tables, mxfp4, hc_mixer, tp_rank: 0, tp_world: world, tp_ctx_dptr: 0, head_visits: None, dflash_tap: dflash_tap_out, df2_capture: df2_capture_out, df2_prime: None, dflash_lm_head: dflash_full_lm_head, df2_full_head: df2_full_head_lc, gptq_tap: std::sync::Mutex::new(None), rotated: Default::default(), rot_small: parking_lot::Mutex::new(None), w4a4: None, igs_by_name, igs_tap: std::sync::Mutex::new(None) }, cfg))
     }
 
     fn init_ptx(dev: &Arc<CudaDevice>) -> anyhow::Result<()> {
@@ -4586,6 +4597,7 @@ impl GpuModel {
     fn gemm_quant_prefill_inner(&self, w: &W, x: &B, out: &mut B, inn: usize, outn: usize, batch: usize, allow_pf4: bool) {
         // NVFP4 W4A4 prefill (src/w4a4.rs): enabled tensors above the verify width run the
         // block-scaled FP4 tensor-core GEMM on the standard tiled weights (no repack, no copy).
+        if let W::Nvfp4 { qweight, .. } = w { self.igs_tap_x(*qweight.device_ptr() as u64, x, inn * batch); }
         if let (Some(w4), W::Nvfp4 { qweight, scales, gs, m, k }) = (&self.w4a4, w) {
             let ptr = *qweight.device_ptr() as u64;
             if allow_pf4 && w4.on(ptr) && batch > MAX_VERIFY && *k == inn && *m == outn && inn % 64 == 0
@@ -6273,11 +6285,13 @@ impl GpuModel {
                     blaunch!(self, "moe_tilemap_b", grid(ne), (256,1,1), 0,
                         (*g.tile_e.device_ptr() as u64, *g.poff.device_ptr() as u64, ne as i32));
                     let x_perm = pool.get_bf16(ppad_cap * h);
+                    if self.igs_armed() { self.memset_compute_stream(d(&x_perm), ppad_cap * h * 2); }   // stale tail rows must not feed the amax
                     blaunch!(self, "moe_gather_x_b", grid(ppad_cap * h), (256,1,1), 0,
                         (d(&x_perm), x_s, *g.perm_tok.device_ptr() as u64, h as i32, ppad_cap as i32,
                          *g.poff.device_ptr() as u64, ne as i32));
                     // MR-GPTQ: the gathered rows get the H16/4 micro-rotation (same as the < 128 paths)
                     if self.rotated.contains(&(*guq.device_ptr() as u64)) { self.rot_inplace(&x_perm, ppad_cap * h); }
+                    self.igs_tap_x(*guq.device_ptr() as u64, &x_perm, ppad_cap * h);
                     let ngroups_max = (ppad_cap / 16) as u32;   // blocks past poff[ne]/16 early-exit on device
                     // E23: 32-token grouped tiles (x4) halve the expert-weight re-reads at prefill
                     // scale. Bitwise contract identical (see the kernel); GB10_MOE_GROUPED_WIDE=0
@@ -6375,10 +6389,12 @@ impl GpuModel {
                     });
                     let h_p: Option<B> = if dn_native_fused { None } else { Some(pool.get_bf16(ppad_cap * mi)) };
                     if let Some(h_p) = &h_p {
+                        if self.igs_armed() { self.memset_compute_stream(d(h_p), ppad_cap * mi * 2); }
                         blaunch!(self, "moe_silu_bf16_b", grid(ppad_cap * mi), (256,1,1), 0,
                             (d(h_p), d(&gu_p), mi as i32, ppad_cap as i32,
                              *g.poff.device_ptr() as u64, ne as i32));
                         if self.rotated.contains(&(*dnq.device_ptr() as u64)) { self.rot_inplace(h_p, ppad_cap * mi); }
+                        self.igs_tap_x(*dnq.device_ptr() as u64, h_p, ppad_cap * mi);
                     } else {
                         assert!(!self.rotated.contains(&(*dnq.device_ptr() as u64)), "MR-GPTQ rotation is not supported on the fused-silu down path");
                     }
@@ -20440,5 +20456,71 @@ impl GpuModel {
                 .expect("w4a4_gemm_moe_b launch");
         }
         if w4.trace { eprintln!("[w4a4] moe m={m} k={k} rows={rows} x_gs={x_gs}"); }
+    }
+}
+
+
+// ---------------------------------------------------------------- --calib-igs: activation amax per NVFP4 weight
+impl GpuModel {
+    /// Every NVFP4 2-D weight of the trunk (+ lm_head) as (tensor stem, qweight device pointer, K).
+    /// A fused tensor (qkv, GDN in_proj, shared gate|up) lists one entry per source stem, all with
+    /// the fused pointer — the same activation feeds them.
+    pub fn nvfp4_weights_by_name(&self) -> Vec<(String, u64, usize)> {
+        let lm = "model.language_model";
+        let mut v: Vec<(String, u64, usize)> = Vec::new();
+        let mut add = |w: &W, names: &[String]| { if let W::Nvfp4 { qweight, k, .. } = w { for n in names { v.push((n.clone(), *qweight.device_ptr() as u64, *k)); } } };
+        for (li, l) in self.layers.iter().enumerate() {
+            let lp = format!("{lm}.layers.{li}");
+            if let Some(fa) = &l.fa {
+                let (q, k, vv) = (format!("{lp}.self_attn.q_proj"), format!("{lp}.self_attn.k_proj"), format!("{lp}.self_attn.v_proj"));
+                match &fa.qkv { AttnIn::Fused(w) => add(w, &[q, k, vv]), AttnIn::Split { q: wq, k: wk, v: wv } => { add(wq, &[q]); add(wk, &[k]); add(wv, &[vv]); } }
+                add(&fa.o_proj, &[format!("{lp}.self_attn.o_proj")]);
+                if let Some(ix) = &fa.indexer { add(&ix.qk_proj, &[format!("{lp}.self_attn.indexer.index_qk_proj")]); }
+            }
+            if let Some(la) = &l.la {
+                let n = |s: &str| format!("{lp}.linear_attn.{s}");
+                match &la.in_proj {
+                    GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")]),
+                    GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")]); add(z, &[n("in_proj_z")]); add(b, &[n("in_proj_b")]); add(a, &[n("in_proj_a")]); }
+                }
+                add(&la.out_proj, &[n("out_proj")]);
+            }
+            match &l.mlp {
+                Ffn::Moe(m) => {
+                    add(&m.gate_up, &[format!("{lp}.mlp.experts.gate_up_proj")]); add(&m.down, &[format!("{lp}.mlp.experts.down_proj")]);
+                    let (sg, su, sd) = (format!("{lp}.mlp.shared_expert.gate_proj"), format!("{lp}.mlp.shared_expert.up_proj"), format!("{lp}.mlp.shared_expert.down_proj"));
+                    add(&m.shared.gate, &[sg.clone()]); add(&m.shared.up, &[su.clone()]); add(&m.shared.down, &[sd]);
+                    if let Some(w) = &m.shared_gate_up { add(w, &[sg, su]); }
+                    add(&m.router, &[format!("{lp}.mlp.gate")]);
+                }
+                Ffn::Dense(m) => { add(&m.gate, &[format!("{lp}.mlp.gate_proj")]); add(&m.up, &[format!("{lp}.mlp.up_proj")]); add(&m.down, &[format!("{lp}.mlp.down_proj")]); }
+            }
+            if let Some((a, b)) = &l.hc {
+                add(&a.down, &[format!("{lp}.attn_hyper_connection.input_mix_weight_down")]); add(&a.up, &[format!("{lp}.attn_hyper_connection.input_mix_weight_up")]);
+                add(&b.down, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_down")]); add(&b.up, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_up")]);
+            }
+            if let Some(p) = &l.ple { add(&p.key_proj, &[format!("{lp}.ple.key_proj")]); add(&p.value_proj, &[format!("{lp}.ple.value_proj")]); }
+        }
+        if let Some(w) = &self.lm_head { add(w, &["lm_head".to_string()]); }
+        v
+    }
+    pub fn igs_arm(&self, ptrs: &[u64]) {
+        let mut m = std::collections::HashMap::new();
+        for &p in ptrs { m.entry(p).or_insert_with(|| self.dev.htod_sync_copy(&[0u32]).unwrap()); }
+        *self.igs_tap.lock().unwrap() = Some(m);
+    }
+    /// Disarm and return the accumulated |x| max per pointer.
+    pub fn igs_disarm(&self) -> std::collections::HashMap<u64, f32> {
+        self.sync_stream();
+        let m = self.igs_tap.lock().unwrap().take().unwrap_or_default();
+        m.iter().map(|(p, a)| { let mut o = [0u32]; unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut o, d(a)).unwrap(); } (*p, f32::from_bits(o[0])) }).collect()
+    }
+    #[inline] fn igs_armed(&self) -> bool { self.igs_tap.lock().unwrap().is_some() }
+    /// Fold `n` bf16 values of `x` into the accumulator of weight `ptr` (no-op when not armed).
+    fn igs_tap_x(&self, ptr: u64, x: &B, n: usize) {
+        let g = self.igs_tap.lock().unwrap();
+        let Some(t) = g.as_ref() else { return; };
+        let Some(a) = t.get(&ptr) else { return; };
+        blaunch!(self, "gptq_absmax_b", grid(n), (256,1,1), 0, (d(a), d(x), n as i64));
     }
 }

@@ -578,6 +578,39 @@ pub fn parse_groups(s: &str) -> Result<Vec<Group>> {
 }
 
 
+/// `--calib-igs`: calibrate the W4A4 activation scales of an EXISTING quantized artifact without
+/// re-quantizing: a plain prefill of the calibration set through the served model, the |x| max of
+/// every NVFP4 GEMM input (after the MR rotation when there is one) captured by qweight pointer,
+/// `input_global_scale = 6*448 / amax` written to `<out>/input_global_scale.json` (stem -> value;
+/// the loader reads it next to the artifact's own `*.input_global_scale` tensors, json wins).
+pub fn calib_igs(model_dir: &Path, out: &Path, calib: &Path, nsamples: usize, seqlen: usize) -> Result<()> {
+    if std::env::var("GB10_PLE_OFFLOAD").is_err() { std::env::set_var("GB10_PLE_OFFLOAD", "ssd"); }
+    std::fs::create_dir_all(out)?;
+    let t_all = std::time::Instant::now();
+    let (gpu, cfg) = GpuModel::load_from_dir(&model_dir.to_string_lossy())?;
+    let samples = calib_tokens(model_dir, calib, nsamples, seqlen, cfg.vocab_size)?;
+    let weights = gpu.nvfp4_weights_by_name();
+    let ptrs: Vec<u64> = weights.iter().map(|w| w.1).collect();
+    println!("[calib-igs] {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)", samples.len(), { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
+    gpu.igs_arm(&ptrs);
+    let mut pool = Pool::new(gpu.gptq_dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, seqlen);
+    let nl = cfg.num_layers;
+    for (s, toks) in samples.iter().enumerate() {
+        let _ = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0, seqlen, 0, 0, nl, None);
+        if (s + 1) % 32 == 0 || s + 1 == samples.len() { gpu.gptq_sync(); println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, samples.len(), t_all.elapsed().as_secs_f32() / 60.0); }
+    }
+    let amax = gpu.igs_disarm();
+    let mut js = serde_json::Map::new();
+    let (mut n_ok, mut n_zero) = (0, 0);
+    for (stem, ptr, _k) in &weights {
+        match amax.get(ptr).copied().and_then(igs_of) { Some(g) => { js.insert(stem.clone(), serde_json::json!(g)); n_ok += 1; } None => { n_zero += 1; } }
+    }
+    std::fs::write(out.join("input_global_scale.json"), serde_json::to_string_pretty(&serde_json::Value::Object(js))?)?;
+    println!("[calib-igs] {n_ok} scales written ({n_zero} weights never fed at this seqlen) → {} in {:.1} min", out.join("input_global_scale.json").display(), t_all.elapsed().as_secs_f32() / 60.0);
+    Ok(())
+}
+
 /// `--gptq-refmt`: re-format an existing artifact without recalibrating — the bf16 2-D weights of
 /// `fp8_groups` become row-scaled FP8 (`quant::quantize_fp8`), those of `nvfp4_groups` RTN NVFP4;
 /// every other tensor (packed triples included) is copied verbatim, the PLE files are linked.
