@@ -420,6 +420,29 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     let is_rtn = |name: &str| opts.nvfp4_groups.contains(&quant::group_of(name));
     let is_fp8 = |name: &str| opts.fp8_groups.contains(&quant::group_of(name));
     let lm = "model.language_model";
+    // The non-layer tensors the artifact takes from the SOURCE (embed, lm_head, final mixer) are
+    // served during the calibration exactly as they will be served — source bf16, or the
+    // quantizer's own RTN / FP8 when their group asks for it — not as the base's RTN copies.
+    {
+        let mut mk = |name: &str| -> Result<Option<W>> {
+            let Some(meta) = src.metas.get(name) else { return Ok(None) };
+            if meta.dtype != "BF16" || meta.shape.len() != 2 { return Ok(None); }
+            let (shape, v) = src.read_bf16(name)?;
+            let (m, k) = (shape[0], shape[1]);
+            let q = m % 16 == 0 && k % 16 == 0;
+            Ok(Some(if q && is_rtn(name) { let r = rtn_2d(&v, m, k); gpu.gptq_w_nvfp4(&r.qw, &r.sc, m, k, r.gs) }
+                    else if q && is_fp8(name) { gpu.gptq_w_fp8(quant::quantize_fp8(&v, m, k)) }
+                    else { gpu.gptq_w_bf16(&v) }))
+        };
+        let embed = mk(&format!("{lm}.embed_tokens.weight"))?;
+        let head = mk("lm_head.weight")?;
+        let mixer = match (mk(&format!("{lm}.hyper_connection_mixer.input_mix_weight_down.weight"))?,
+                           mk(&format!("{lm}.hyper_connection_mixer.input_mix_weight_up.weight"))?) {
+            (Some(a), Some(b)) => Some((a, b)), _ => None };
+        let n = embed.is_some() as usize + head.is_some() as usize + mixer.is_some() as usize * 2;
+        gpu.gptq_install_nonlayer(embed, head, mixer);
+        println!("[gptq] {n} non-layer tensors (embed / lm_head / final mixer) reinstalled from the source as the artifact will serve them");
+    }
     // Per-sample residual streams between layers (None before layer 0: the prefill embeds).
     let mut hidden: Vec<Option<B>> = (0..ns).map(|_| None).collect();
     let nl = cfg.num_layers;

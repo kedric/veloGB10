@@ -20411,6 +20411,14 @@ impl GpuModel {
         if let Some(p) = layer.ple.as_mut() { p.key_proj = dummy(); p.value_proj = dummy(); }
     }
     pub fn gptq_num_layers(&self) -> usize { self.layers.len() }
+    /// `--gptq`: serve the non-layer tensors during calibration exactly as the artifact will carry
+    /// them (source bf16 / the quantizer's own RTN or FP8), instead of the base artifact's copies.
+    pub fn gptq_install_nonlayer(&mut self, embed: Option<W>, lm_head: Option<W>, mixer: Option<(W, W)>) {
+        if let Some(e) = embed { self.embed = e; }
+        if let Some(l) = lm_head { self.lm_head = Some(l); }
+        if let Some((dn, up)) = mixer { if let Some(m) = self.hc_mixer.as_mut() { m.down = dn; m.up = up; } }
+        self.sync_stream();
+    }
     /// `--rotate`: the sequential pass must serve the freshly installed rotated weights with the
     /// activation micro-rotation, exactly like a loaded MR-GPTQ artifact.
     pub fn gptq_mark_rotated(&mut self, w: &W) {
