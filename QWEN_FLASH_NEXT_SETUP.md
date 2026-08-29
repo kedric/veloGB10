@@ -55,7 +55,10 @@ GB10_PLE_OFFLOAD=ssd ./target/release/gb10_inference --gptq \
     --base ~/models/Qwen3.8-Flash-Next-NVFP4-velo \           # an existing artifact: embeddings, norms, PLE table, MTP head
     --out ~/models/Qwen3.8-Flash-Next-GPTQ-velo \
     --calib /var/tmp/calib.jsonl --nsamples 128 --seqlen 1024 \
-    [--gptq-groups expert,attn,mlp] [--rtn-groups mtp] [--damp 0.01] [--clip 7] [--rotate]
+    [--gptq-groups expert,attn,mlp] [--rtn-groups mtp] [--fp8-groups ...] [--damp 0.01] [--clip 7] [--rotate]
+    # groups: expert attn mlp gdn lmhead (GPTQ); any group for --rtn-groups / --fp8-groups.
+    # `lmhead` GPTQ uses the final-mixer outputs of every calibration token as its Hessian;
+    # embed / lm_head / final mixer are served during the calibration as the artifact will carry them.
 ```
 
 How it fits in 128 GB: the `--base` artifact is loaded as the model; for each layer its linears are
