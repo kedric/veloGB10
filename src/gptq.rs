@@ -609,6 +609,14 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
             let (_, outb) = gpu.prefill_batch_range(&mut pool, &samples[s], &mut state, 0, seqlen, 0, li, li + 1, inc);
             hidden[s] = Some(outb);
         }
+        // 5b. the quantized layer is never run again (the next layer calibrates on `hidden`, the LM
+        //     head on the final residual streams): release its device weights now instead of keeping
+        //     every quantized layer resident (~1.4 GB/layer, 68 GB by layer 47 — the 1M-token
+        //     calibration hit the memory watchdog at layer 43). The rotation markers are keyed by
+        //     device pointer, so clear them with the buffers they described.
+        gpu.gptq_drop_layer_weights(li);
+        gpu.gptq_reset_rotation();
+        gpu.gptq_sync();
         // 6. stream the layer's tensors out: GPTQ/RTN records, everything else verbatim from the source
         let mut n_q = 0;
         for (name, meta) in src.metas.range(format!("{lp}.")..).take_while(|(k, _)| k.starts_with(&format!("{lp}."))) {
