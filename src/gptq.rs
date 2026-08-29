@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use half::bf16;
 use cudarc::driver::DevicePtr;
+use base64::Engine;
 use crate::gpu::{GpuModel, GptqTap, GptqHess, W, B, S, Pool, AttnIn, GdnIn, Ffn};
 use crate::quant::{self, Group};
 
@@ -342,8 +343,43 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
         let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
         return Ok((0..nsamples).map(|_| (0..seqlen).map(|_| (next() % (vocab as u64).max(4)) as u32 + 4).map(|t| t.min(vocab as u32 - 1)).collect()).collect());
     }
-    let tok = crate::tokenizer::QwenTokenizer::from_file(&model_dir.join("tokenizer.json").to_string_lossy())?;
     let raw = std::fs::read_to_string(calib).with_context(|| format!("read {}", calib.display()))?;
+    // `calib_compose` emits sample-aligned JSONL with the exact token IDs audited in its manifest.
+    // Consume those IDs directly: re-rendering/re-tokenizing would destroy both category boundaries
+    // and the exact token ratios. A pre-tokenized file is deliberately all-or-nothing.
+    if calib.extension().map_or(false, |e| e == "jsonl") {
+        let mut samples = Vec::new();
+        let mut saw_pretokenized = false;
+        for (line_no, line) in raw.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .with_context(|| format!("{}:{}: invalid JSON", calib.display(), line_no + 1))?;
+            let Some(ids) = v.get("input_ids") else {
+                anyhow::ensure!(!saw_pretokenized,
+                    "{}:{}: mixed corpus: every row must contain input_ids", calib.display(), line_no + 1);
+                break;
+            };
+            saw_pretokenized = true;
+            let ids = ids.as_array().ok_or_else(|| anyhow!("{}:{}: input_ids is not an array", calib.display(), line_no + 1))?;
+            anyhow::ensure!(ids.len() == seqlen,
+                "{}:{}: input_ids has {} tokens, expected seqlen={seqlen}", calib.display(), line_no + 1, ids.len());
+            let mut sample = Vec::with_capacity(seqlen);
+            for (column, id) in ids.iter().enumerate() {
+                let id = id.as_u64().ok_or_else(|| anyhow!("{}:{}: input_ids[{column}] is not an unsigned integer", calib.display(), line_no + 1))?;
+                anyhow::ensure!(id < vocab as u64,
+                    "{}:{}: input_ids[{column}]={id} is outside vocab_size={vocab}", calib.display(), line_no + 1);
+                sample.push(id as u32);
+            }
+            samples.push(sample);
+            if samples.len() == nsamples { break; }
+        }
+        if saw_pretokenized {
+            anyhow::ensure!(samples.len() == nsamples,
+                "pre-tokenized calibration corpus contains {} complete samples, asked {nsamples}", samples.len());
+            println!("[gptq] loaded {nsamples} pre-tokenized, sample-aligned calibration rows");
+            return Ok(samples);
+        }
+    }
+    let tok = crate::tokenizer::QwenTokenizer::from_file(&model_dir.join("tokenizer.json").to_string_lossy())?;
     // jsonl with a "text" field, or plain text (blank-line separated documents)
     // jsonl lines: {"text": …} raw documents, or {"messages": [{role, content}, …]} rendered
     // through the model's own chat template (calibration in the served format).
@@ -371,6 +407,70 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
     anyhow::ensure!(samples.len() >= nsamples.min(1), "calibration text too short for one sample of {seqlen} tokens");
     if samples.len() < nsamples { println!("[gptq] calibration text gave {} samples (asked {nsamples})", samples.len()); }
     Ok(samples)
+}
+
+struct VisionCalibSample {
+    tokens: Vec<u32>,
+    image_embeds: Vec<f32>,
+    spans: Vec<crate::vision_encoder::ImageSpan>,
+}
+
+fn local_image_data_url(url: &str) -> Result<String> {
+    if url.starts_with("data:") { return Ok(url.to_string()); }
+    let path = Path::new(url);
+    anyhow::ensure!(path.is_file(), "vision calibration requires a local file or data URL, got {url}");
+    let mime = match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp",
+        other => return Err(anyhow!("unsupported calibration image extension {other:?}: {}", path.display())),
+    };
+    let data = base64::engine::general_purpose::STANDARD.encode(std::fs::read(path)?);
+    Ok(format!("data:{mime};base64,{data}"))
+}
+
+/// Return `Some` only for a raw multimodal JSONL. The visual tower and preprocessing are the same
+/// ones as the serving request path; this is intentionally used by `calib_igs`, not the 2048-token
+/// GPTQ Hessian run.
+fn vision_calib_samples(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usize) -> Result<Option<Vec<VisionCalibSample>>> {
+    if calib.extension().map_or(true, |e| e != "jsonl") { return Ok(None); }
+    let raw = std::fs::read_to_string(calib).with_context(|| format!("read {}", calib.display()))?;
+    let first = match raw.lines().find(|line| !line.trim().is_empty()) { Some(line) => line, None => return Ok(None) };
+    let first_value: serde_json::Value = serde_json::from_str(first)?;
+    if first_value.get("input_ids").is_some() { return Ok(None); }
+    let first_messages: Vec<crate::tokenizer::ChatMessage> = match first_value.get("messages") {
+        Some(messages) => serde_json::from_value(messages.clone())?, None => return Ok(None),
+    };
+    if !first_messages.iter().any(|message| !message.images.is_empty()) { return Ok(None); }
+
+    let tok = crate::tokenizer::QwenTokenizer::from_file(&model_dir.join("tokenizer.json").to_string_lossy())?;
+    let tower = crate::vision_tower::VisualTower::load(&model_dir.to_string_lossy())
+        .with_context(|| format!("load visual tower from {}", model_dir.display()))?;
+    let mut samples = Vec::new();
+    for (line_no, line) in raw.lines().filter(|line| !line.trim().is_empty()).enumerate() {
+        if samples.len() == nsamples { break; }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("{}:{}: invalid JSON", calib.display(), line_no + 1))?;
+        let messages: Vec<crate::tokenizer::ChatMessage> = serde_json::from_value(value["messages"].clone())
+            .with_context(|| format!("{}:{}: invalid multimodal messages", calib.display(), line_no + 1))?;
+        let mut urls = Vec::new();
+        for image in messages.iter().flat_map(|message| &message.images) {
+            urls.push(local_image_data_url(image.url.as_deref().ok_or_else(|| anyhow!("{}:{}: image URL is absent", calib.display(), line_no + 1))?)?);
+        }
+        anyhow::ensure!(!urls.is_empty(), "{}:{}: mixed text/vision corpus", calib.display(), line_no + 1);
+        let rendered = tok.apply_chat_template_no_gen(&messages, None, None)?;
+        let prompt_tokens = tok.encode(&rendered, true)?;
+        let mut prepared = crate::vision_encoder::prepare_vision_request(&tower, &urls, &prompt_tokens)?;
+        let vision_end = prepared.spans.iter().map(|span| span.start + span.num_tokens).max().unwrap_or(0);
+        anyhow::ensure!(vision_end <= seqlen,
+            "{}:{}: image span ends at token {vision_end}, beyond seqlen={seqlen}", calib.display(), line_no + 1);
+        anyhow::ensure!(prepared.expanded_tokens.len() >= seqlen,
+            "{}:{}: multimodal prompt has only {} expanded tokens, expected at least {seqlen}",
+            calib.display(), line_no + 1, prepared.expanded_tokens.len());
+        prepared.expanded_tokens.truncate(seqlen);
+        samples.push(VisionCalibSample { tokens: prepared.expanded_tokens, image_embeds: prepared.image_embeds, spans: prepared.spans });
+    }
+    anyhow::ensure!(samples.len() == nsamples,
+        "vision calibration corpus contains {} usable samples, asked {nsamples}", samples.len());
+    Ok(Some(samples))
 }
 
 fn prepare_output_dir(out: &Path, inputs: &[&Path]) -> Result<()> {
@@ -870,18 +970,28 @@ pub fn calib_igs(model_dir: &Path, out: &Path, calib: &Path, nsamples: usize, se
     std::fs::create_dir_all(out)?;
     let t_all = std::time::Instant::now();
     let (gpu, cfg) = GpuModel::load_from_dir(&model_dir.to_string_lossy())?;
-    let samples = calib_tokens(model_dir, calib, nsamples, seqlen, cfg.vocab_size)?;
+    let vision_samples = vision_calib_samples(model_dir, calib, nsamples, seqlen)?;
+    let samples = if vision_samples.is_none() { Some(calib_tokens(model_dir, calib, nsamples, seqlen, cfg.vocab_size)?) } else { None };
+    let sample_count = vision_samples.as_ref().map_or_else(|| samples.as_ref().unwrap().len(), Vec::len);
     let weights = gpu.nvfp4_weights_by_name();
     let ptrs: Vec<u64> = weights.iter().map(|w| w.1).collect();
-    println!("[calib-igs] {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)", samples.len(), { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
+    println!("[calib-igs] {} {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)", sample_count,
+             if vision_samples.is_some() { "vision" } else { "text" }, { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
     gpu.igs_arm(&ptrs);
     let mut pool = Pool::new(gpu.gptq_dev().clone());
     let mut state = gpu.new_batch_state(1, 1, seqlen);
     let nl = cfg.num_layers;
-    for (s, toks) in samples.iter().enumerate() {
+    for s in 0..sample_count {
         gpu.zero_slot_state(&mut state, 0, seqlen);
+        let toks = if let Some(vision) = &vision_samples {
+            let sample = &vision[s];
+            let embeds: Vec<bf16> = sample.image_embeds.iter().copied().map(bf16::from_f32).collect();
+            state.vision_embeds = Some(gpu.gptq_dev().htod_sync_copy(&embeds)?);
+            state.vision_spans = sample.spans.clone();
+            &sample.tokens
+        } else { &samples.as_ref().unwrap()[s] };
         let _ = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0, seqlen, 0, 0, nl, None);
-        if (s + 1) % 32 == 0 || s + 1 == samples.len() { gpu.gptq_sync(); println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, samples.len(), t_all.elapsed().as_secs_f32() / 60.0); }
+        if (s + 1) % 32 == 0 || s + 1 == sample_count { gpu.gptq_sync(); println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, sample_count, t_all.elapsed().as_secs_f32() / 60.0); }
     }
     let amax = gpu.igs_disarm();
     let mut js = serde_json::Map::new();
@@ -942,6 +1052,16 @@ pub fn refmt(input: &Path, out: &Path, fp8_groups: &[Group], nvfp4_groups: &[Gro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretokenized_calibration_preserves_sample_boundaries() {
+        let path = std::env::temp_dir().join(format!("gptq-pretokenized-test-{}.jsonl", std::process::id()));
+        std::fs::write(&path,
+            "{\"input_ids\":[1,2,3,4],\"text\":\"ignored\"}\n{\"input_ids\":[5,6,7,8],\"text\":\"ignored too\"}\n").unwrap();
+        let samples = calib_tokens(Path::new("/tokenizer-is-deliberately-absent"), &path, 2, 4, 16).unwrap();
+        assert_eq!(samples, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn output_dir_must_be_distinct_and_empty() {
