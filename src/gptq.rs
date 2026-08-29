@@ -1,5 +1,5 @@
-//! `--gptq`: GPTQ (optionally micro-rotated, "MR-GPTQ") quantization of a qwen4_exp checkpoint to
-//! the engine's NVFP4 artifact, ONE LAYER AT A TIME on a single GB10.
+//! `--gptq`: GPTQ (optionally micro-rotated, "MR-GPTQ") quantization of qwen3_5 dense and
+//! qwen4_exp MoE checkpoints to the engine's NVFP4 artifact, ONE LAYER AT A TIME on one GB10.
 //!
 //! The memory trick: the already-quantized `--base` artifact is loaded as the model (embedding,
 //! norms, PLE table on the SSD, MTP head…), and for each layer l its linear weights are swapped
@@ -302,7 +302,8 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     let basr = ShardReader::open(base)?;
     let (mut gpu, cfg) = GpuModel::load_from_dir(&base.to_string_lossy())?;
     gpu.gptq_reset_rotation();
-    anyhow::ensure!(cfg.is_q4(), "--gptq is implemented for qwen4_exp");
+    anyhow::ensure!(matches!(cfg.family, crate::qwen::Family::Qwen35 | crate::qwen::Family::Qwen4Exp),
+        "--gptq is implemented for qwen3_5 dense and qwen4_exp, got {:?}", cfg.family);
     let samples = calib_tokens(base, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
     let ns = samples.len();
     println!("[gptq] {} samples × {} tokens; groups GPTQ {:?}, RTN {:?}, rotate {}, damp {}, clip ratios {}",
@@ -354,15 +355,27 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
             } else {
                 for t in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"] { names.push(format!("{lp}.linear_attn.{t}.weight")); }
             }
-            names.push(format!("{lp}.mlp.experts.gate_up_proj")); names.push(format!("{lp}.mlp.experts.down_proj"));
-            for t in ["gate_proj", "up_proj", "down_proj"] { names.push(format!("{lp}.mlp.shared_expert.{t}.weight")); }
-            names.push(format!("{lp}.mlp.gate.weight"));
-            for hcn in ["attn_hyper_connection", "mlp_hyper_connection"] { for t in ["input_mix_weight_down", "input_mix_weight_up"] { names.push(format!("{lp}.{hcn}.{t}.weight")); } }
+            match &layer.mlp {
+                Ffn::Moe(_) => {
+                    names.push(format!("{lp}.mlp.experts.gate_up_proj"));
+                    names.push(format!("{lp}.mlp.experts.down_proj"));
+                    for t in ["gate_proj", "up_proj", "down_proj"] { names.push(format!("{lp}.mlp.shared_expert.{t}.weight")); }
+                    names.push(format!("{lp}.mlp.gate.weight"));
+                }
+                Ffn::Dense(_) => {
+                    for t in ["gate_proj", "up_proj", "down_proj"] { names.push(format!("{lp}.mlp.{t}.weight")); }
+                }
+            }
+            if layer.hc.is_some() {
+                for hcn in ["attn_hyper_connection", "mlp_hyper_connection"] {
+                    for t in ["input_mix_weight_down", "input_mix_weight_up"] { names.push(format!("{lp}.{hcn}.{t}.weight")); }
+                }
+            }
             if layer.ple.is_some() { for t in ["key_proj", "value_proj"] { names.push(format!("{lp}.ple.{t}.weight")); } }
         }
         let mut ws: HashMap<String, W> = HashMap::new();
         for n in &names { let w = up(&gpu, n, &mut tap, &mut bf)?; ws.insert(n.clone(), w); }
-        let gptq_experts = is_gptq(&format!("{lp}.mlp.experts.gate_up_proj"));
+        let gptq_experts = cfg.is_moe && is_gptq(&format!("{lp}.mlp.experts.gate_up_proj"));
         if gptq_experts {
             tap.moe_gu = (0..ne).map(|_| gpu.gptq_hess_new(h)).collect();
             tap.moe_dn = (0..ne).map(|_| gpu.gptq_hess_new(mi)).collect();
@@ -518,10 +531,13 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     for f in ["tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja", "merges.txt", "vocab.json", "preprocessor_config.json"] {
         let s = base.join(f); if s.exists() { std::fs::copy(&s, out.join(f))?; }
     }
-    let side: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("ple_ngram_nvfp4.json"))?)?;
-    let ple_file = side["file"].as_str().unwrap_or("ple_ngram_nvfp4.bin").to_string();
-    std::fs::copy(base.join("ple_ngram_nvfp4.json"), out.join("ple_ngram_nvfp4.json"))?;
-    if std::fs::hard_link(base.join(&ple_file), out.join(&ple_file)).is_err() { std::fs::copy(base.join(&ple_file), out.join(&ple_file))?; }
+    let ple_side = base.join("ple_ngram_nvfp4.json");
+    if ple_side.exists() {
+        let side: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ple_side)?)?;
+        let ple_file = side["file"].as_str().unwrap_or("ple_ngram_nvfp4.bin").to_string();
+        std::fs::copy(&ple_side, out.join("ple_ngram_nvfp4.json"))?;
+        if std::fs::hard_link(base.join(&ple_file), out.join(&ple_file)).is_err() { std::fs::copy(base.join(&ple_file), out.join(&ple_file))?; }
+    }
     let mut cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
     cj["quantization_config"]["gptq"] = serde_json::json!({ "nsamples": ns, "seqlen": seqlen, "damp": opts.damp, "clip_ratios": opts.nclip,
         "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
@@ -552,18 +568,27 @@ fn install_layer(gpu: &mut GpuModel, li: usize, is_attn: bool, lp: &str, ws: &mu
                                     b: take(format!("{lp}.linear_attn.in_proj_b.weight")), a: take(format!("{lp}.linear_attn.in_proj_a.weight")) };
         la.out_proj = take(format!("{lp}.linear_attn.out_proj.weight"));
     }
-    let Ffn::Moe(moe) = &mut layer.mlp else { panic!("qwen4_exp layers are MoE") };
-    moe.gate_up = take(format!("{lp}.mlp.experts.gate_up_proj"));
-    moe.down = take(format!("{lp}.mlp.experts.down_proj"));
-    moe.shared.gate = take(format!("{lp}.mlp.shared_expert.gate_proj.weight"));
-    moe.shared.up = take(format!("{lp}.mlp.shared_expert.up_proj.weight"));
-    moe.shared.down = take(format!("{lp}.mlp.shared_expert.down_proj.weight"));
-    moe.router = take(format!("{lp}.mlp.gate.weight"));
-    let hc = layer.hc.as_mut().unwrap();
-    hc.0.down = take(format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"));
-    hc.0.up = take(format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"));
-    hc.1.down = take(format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"));
-    hc.1.up = take(format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"));
+    match &mut layer.mlp {
+        Ffn::Moe(moe) => {
+            moe.gate_up = take(format!("{lp}.mlp.experts.gate_up_proj"));
+            moe.down = take(format!("{lp}.mlp.experts.down_proj"));
+            moe.shared.gate = take(format!("{lp}.mlp.shared_expert.gate_proj.weight"));
+            moe.shared.up = take(format!("{lp}.mlp.shared_expert.up_proj.weight"));
+            moe.shared.down = take(format!("{lp}.mlp.shared_expert.down_proj.weight"));
+            moe.router = take(format!("{lp}.mlp.gate.weight"));
+        }
+        Ffn::Dense(mlp) => {
+            mlp.gate = take(format!("{lp}.mlp.gate_proj.weight"));
+            mlp.up = take(format!("{lp}.mlp.up_proj.weight"));
+            mlp.down = take(format!("{lp}.mlp.down_proj.weight"));
+        }
+    }
+    if let Some(hc) = layer.hc.as_mut() {
+        hc.0.down = take(format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"));
+        hc.0.up = take(format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"));
+        hc.1.down = take(format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"));
+        hc.1.up = take(format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"));
+    }
     if let Some(p) = layer.ple.as_mut() {
         p.key_proj = take(format!("{lp}.ple.key_proj.weight"));
         p.value_proj = take(format!("{lp}.ple.value_proj.weight"));

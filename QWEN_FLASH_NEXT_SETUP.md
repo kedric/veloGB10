@@ -46,6 +46,9 @@ parts in host memory while it repacks, and 12 GB shards pushed a 128 GB box over
 `--recipe all` is round-to-nearest. `--gptq` re-quantizes the GEMM weights with GPTQ (Hessian-
 weighted error compensation from calibration activations), one layer at a time, on one GB10:
 
+The same path supports Qwen3.5 dense checkpoints. For a dense hybrid model, use
+`--gptq-groups attn,mlp,gdn`; `expert`, `hc`, and `ple` only apply to the MoE family.
+
 ```bash
 GB10_PLE_OFFLOAD=ssd ./target/release/gb10_inference --gptq \
     --model-dir ~/models/Qwen3.8-Flash-Next \                 # bf16 source (read shard by shard)

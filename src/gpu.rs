@@ -20276,7 +20276,10 @@ impl GpuModel {
             if let Some(ix) = fa.indexer.as_mut() { ix.qk_proj = dummy(); }
         }
         if let Some(la) = layer.la.as_mut() { la.in_proj = GdnIn::Split { qkv: dummy(), z: dummy(), b: dummy(), a: dummy() }; la.out_proj = dummy(); }
-        if let Ffn::Moe(m) = &mut layer.mlp { m.gate_up = dummy(); m.down = dummy(); m.shared.gate = dummy(); m.shared.up = dummy(); m.shared.down = dummy(); m.router = dummy(); }
+        match &mut layer.mlp {
+            Ffn::Moe(m) => { m.gate_up = dummy(); m.down = dummy(); m.shared.gate = dummy(); m.shared.up = dummy(); m.shared.down = dummy(); m.router = dummy(); }
+            Ffn::Dense(m) => { m.gate = dummy(); m.up = dummy(); m.down = dummy(); }
+        }
         if let Some((a, b)) = layer.hc.as_mut() { a.down = dummy(); a.up = dummy(); b.down = dummy(); b.up = dummy(); }
         if let Some(p) = layer.ple.as_mut() { p.key_proj = dummy(); p.value_proj = dummy(); }
     }
