@@ -133,7 +133,8 @@ impl Writer {
     fn push(&mut self, o: Out) {
         // Verbatim copies of a packed family arrive in name order (weight_global_scale, weight_packed,
         // weight_scale): hold the shard boundary until the family's last member.
-        let hold = o.name.ends_with(".weight_global_scale") || o.name.ends_with(".weight_packed");
+        // (input_global_scale sorts first: ".input_global_scale" < ".weight_*" — it holds too)
+        let hold = o.name.ends_with(".weight_global_scale") || o.name.ends_with(".weight_packed") || o.name.ends_with(".input_global_scale");
         self.push_raw(o);
         if !hold && self.bytes >= self.shard_bytes { self.flush(); }
     }
@@ -144,10 +145,13 @@ impl Writer {
         self.push_raw(Out { name: format!("{stem}.weight_scale"), dtype: safetensors::Dtype::F32, shape: vec![q.m], data: sc });
         if self.bytes >= self.shard_bytes { self.flush(); }
     }
-    fn push_nvfp4(&mut self, stem: &str, qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32) {
+    fn push_nvfp4(&mut self, stem: &str, qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32, igs: Option<f32>) {
         self.push_raw(Out { name: format!("{stem}.weight_packed"), dtype: safetensors::Dtype::U8, shape: vec![m, k / 2], data: qw });
         self.push_raw(Out { name: format!("{stem}.weight_scale"), dtype: safetensors::Dtype::F8_E4M3, shape: vec![m, k / 16], data: sc });
         self.push_raw(Out { name: format!("{stem}.weight_global_scale"), dtype: safetensors::Dtype::F32, shape: vec![1], data: gs.to_le_bytes().to_vec() });
+        if let Some(g) = igs {
+            self.push_raw(Out { name: format!("{stem}.input_global_scale"), dtype: safetensors::Dtype::F32, shape: vec![1], data: g.to_le_bytes().to_vec() });
+        }
         if self.bytes >= self.shard_bytes { self.flush(); }
     }
     fn flush(&mut self) {
@@ -169,8 +173,9 @@ impl Writer {
         let mut split = Vec::new();
         for (k, v) in &self.weight_map {
             if let Some(stem) = k.strip_suffix(".weight_packed") {
-                for suf in [".weight_scale", ".weight_global_scale"] {
-                    if self.weight_map.get(&format!("{stem}{suf}")) != Some(v) { split.push(format!("{stem}{suf}")); }
+                for suf in [".weight_scale", ".weight_global_scale", ".input_global_scale"] {
+                    if let Some(sv) = self.weight_map.get(&format!("{stem}{suf}")) { if sv != v { split.push(format!("{stem}{suf}")); } }
+                    else if suf != ".input_global_scale" { split.push(format!("{stem}{suf} (missing)")); }
                 }
             }
             if let Some(stem) = k.strip_suffix(".weight_scale") {
@@ -193,7 +198,9 @@ pub struct GptqOpts {
     pub fp8_groups: Vec<Group>,                                     // row-scaled FP8 (E4M3): the speed/accuracy middle ground
 }
 
-struct Rec { qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32 }
+/// `igs`: the W4A4 input global scale (6·448 / calibration activation amax), written as
+/// `{stem}.input_global_scale` — None for tensors the calibration never fed (RTN groups).
+struct Rec { qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32, igs: Option<f32> }
 /// Token subsample kept per layer for the down-projection fallback Hessians.
 const MOE_SUB_TOKENS: usize = 16384;
 fn mem_available_gb() -> f64 {
@@ -204,7 +211,8 @@ fn mem_available_gb() -> f64 {
 fn e4m3_scale_of(amax: f32) -> f32 { if amax > 0.0 { amax / (quant::E2M1_MAX * quant::E4M3_MAX) } else { 1.0 } }
 
 /// GPTQ one 2-D weight (bf16 on device at `w_ptr`, [m, k] row-major) with its Hessian.
-fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, hess: &S, opts: &GptqOpts, s_tensor: Option<f32>) -> Result<Rec> {
+fn igs_of(amax: f32) -> Option<f32> { if amax > 0.0 && amax.is_finite() { Some(6.0 * 448.0 / amax) } else { None } }
+fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, hess: &S, opts: &GptqOpts, s_tensor: Option<f32>, x_amax: f32) -> Result<Rec> {
     let w32 = gpu.gptq_w32(w_ptr, m, k, opts.rotate);
     // Adaptive damping (GPTQModel-style): 1 % → 5 % → 10 % of mean(diag) before falling back to
     // RTN (U = I: the sweep then rounds without error feedback, same scales and clip search).
@@ -220,13 +228,13 @@ fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, he
     } };
     let st = match s_tensor { Some(s) => s, None => e4m3_scale_of(gpu.gptq_absmax_f32(&w32, m * k)) };
     let (qw, sc) = gpu.gptq_sweep(&w32, &u, m, k, st, opts.nclip);
-    Ok(Rec { qw, sc, m, k, gs: 1.0 / st })
+    Ok(Rec { qw, sc, m, k, gs: 1.0 / st, igs: igs_of(x_amax) })
 }
 
 /// Plain RTN through the quantizer's own codec (weights the calibration never touches: the MTP head).
 fn rtn_2d(w: &[bf16], m: usize, k: usize) -> Rec {
     let q = quant::quantize_nvfp4(w, m, k);
-    Rec { qw: q.qweight, sc: q.scales, m, k, gs: q.global_scale }
+    Rec { qw: q.qweight, sc: q.scales, m, k, gs: q.global_scale, igs: None }
 }
 
 // ---------------------------------------------------------------- calibration data
@@ -402,6 +410,8 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
                 for e in 0..ne { let w32 = gpu.gptq_w32(base_ptr + (e * me * ke * 2) as u64, me, ke, opts.rotate); amax = amax.max(gpu.gptq_absmax_f32(&w32, me * ke)); }
                 let st = e4m3_scale_of(amax);
                 let mut qw = Vec::with_capacity(ne * me * ke / 2); let mut sc = Vec::with_capacity(ne * me * ke / 16);
+                // one input global scale per stacked tensor: the activation amax over all experts
+                let x_amax = (0..ne).map(|e| gpu.gptq_amax(&hs[e])).fold(0f32, f32::max);
                 for e in 0..ne {
                     let fallback: Option<GptqHess> = if hs[e].n < thr {
                         n_fallback += 1;
@@ -411,11 +421,11 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
                         }
                     } else { None };
                     let hess: &S = if hs[e].n < thr && is_gu { &tap.moe_all.as_ref().unwrap().h } else { fallback.as_ref().map(|f| &f.h).unwrap_or(&hs[e].h) };
-                    let r = gptq_2d(&gpu, &mut cs, base_ptr + (e * me * ke * 2) as u64, me, ke, hess, &opts, Some(st))?;
+                    let r = gptq_2d(&gpu, &mut cs, base_ptr + (e * me * ke * 2) as u64, me, ke, hess, &opts, Some(st), x_amax)?;
                     qw.extend_from_slice(&r.qw); sc.extend_from_slice(&r.sc);
                 }
                 if n_fallback > 0 { println!("[gptq] layer {li} {}: {n_fallback} experts under {thr} tokens used the all-token fallback", if is_gu { "gate_up" } else { "down" }); }
-                recs.insert(n.clone(), Rec { qw, sc, m: ne * me, k: ke, gs: 1.0 / st });
+                recs.insert(n.clone(), Rec { qw, sc, m: ne * me, k: ke, gs: 1.0 / st, igs: igs_of(x_amax) });
             } else if is_gptq(n) {
                 let mut acc = tap.by_ptr.get(key).ok_or_else(|| anyhow!("no Hessian for {n} (the calibration never reached this GEMM)"))?;
                 if *k % 16 != 0 || *m % 16 != 0 { continue; }   // e.g. in_proj_b/a [nh, h] — kept bf16 by the quantizer too
@@ -429,7 +439,8 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
                 anyhow::ensure!(acc.n > 0, "{n}: empty Hessian — no calibration token reached this GEMM (tap pointer mismatch?)");
                 if acc.n < 2 * *k { println!("[gptq] warning: {n} Hessian over only {} tokens (K = {k})", acc.n); }
                 let hess = &acc.h;
-                recs.insert(n.clone(), gptq_2d(&gpu, &mut cs, *b.device_ptr() as u64, *m, *k, hess, &opts, None)?);
+                let x_amax = gpu.gptq_amax(acc);
+                recs.insert(n.clone(), gptq_2d(&gpu, &mut cs, *b.device_ptr() as u64, *m, *k, hess, &opts, None, x_amax)?);
             } else if is_rtn(n) && *k % 16 == 0 && *m % 16 == 0 {
                 let (_, v) = src.read_bf16(n)?; recs.insert(n.clone(), rtn_2d(&v, *m, *k));
             }
@@ -468,7 +479,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         for (name, meta) in src.metas.range(format!("{lp}.")..).take_while(|(k, _)| k.starts_with(&format!("{lp}."))) {
             if name.contains(".ngram_embedding.shard_") { continue; }   // the PLE table comes from the base artifact
             let stem = name.strip_suffix(".weight").unwrap_or(name).to_string();
-            if let Some(r) = recs.remove(name) { writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs); n_q += 1; continue; }
+            if let Some(r) = recs.remove(name) { writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs); n_q += 1; continue; }
             if is_fp8(name) && meta.dtype == "BF16" && meta.shape.len() == 2 && meta.shape[0] % 16 == 0 && meta.shape[1] % 16 == 0 {
                 let (shape, v) = src.read_bf16(name)?; writer.push_fp8(&stem, quant::quantize_fp8(&v, shape[0], shape[1])); n_q += 1; continue;
             }
@@ -488,7 +499,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         let quantizable = meta.dtype == "BF16" && meta.shape.len() == 2 && meta.shape[1] % 16 == 0 && meta.shape[0] % 16 == 0 && !name.contains(".visual.");
         if quantizable && is_rtn(name) {
             let (shape, v) = src.read_bf16(name)?; let r = rtn_2d(&v, shape[0], shape[1]);
-            writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs); continue;
+            writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs); continue;
         }
         if quantizable && is_fp8(name) {
             let (shape, v) = src.read_bf16(name)?; writer.push_fp8(&stem, quant::quantize_fp8(&v, shape[0], shape[1])); continue;
@@ -585,7 +596,7 @@ pub fn refmt(input: &Path, out: &Path, fp8_groups: &[Group], nvfp4_groups: &[Gro
         }
         if quantizable && nvfp4_groups.contains(&g) {
             let (shape, v) = rd.read_bf16(name)?; let r = rtn_2d(&v, shape[0], shape[1]);
-            writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs); n4 += 1; continue;
+            writer.push_nvfp4(&stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs); n4 += 1; continue;
         }
         let (_, data) = rd.read_bytes(name)?;
         let dtype = match meta.dtype.as_str() { "BF16" => safetensors::Dtype::BF16, "F32" => safetensors::Dtype::F32, "I64" => safetensors::Dtype::I64,
@@ -642,7 +653,7 @@ mod tests {
         for i in 0..7 {
             let stem = format!("layers.{i}.w");
             // a GPTQ triple (~700 B) …
-            w.push_nvfp4(&stem, vec![1u8; 512], vec![2u8; 64], 16, 64, 1.0);
+            w.push_nvfp4(&stem, vec![1u8; 512], vec![2u8; 64], 16, 64, 1.0, None);
             // … a verbatim triple in index (name) order, as the base-artifact copy emits it
             let vs = format!("mtp.{i}.w");
             w.push(Out { name: format!("{vs}.weight_global_scale"), dtype: safetensors::Dtype::F32, shape: vec![1], data: vec![0u8; 4] });

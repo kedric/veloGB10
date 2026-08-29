@@ -19905,7 +19905,9 @@ impl GpuModel {
 
 /// One Hessian accumulator: H [k, k] f32 (row-major == column-major, symmetric) += X·Xᵀ over every
 /// calibration token whose activation reached the tapped GEMM; `n` counts the tokens.
-pub struct GptqHess { pub k: usize, pub h: S, pub n: usize }
+pub struct GptqHess { pub k: usize, pub h: S, pub n: usize,
+    /// |x| max over every calibration activation seen (float bits; `gptq_amax`) — the W4A4 `input_global_scale`.
+    pub amax: cudarc::driver::CudaSlice<u32> }
 
 /// The armed taps of one calibration pass: bf16 GEMM weights by device pointer (`gemm_act`'s
 /// `W::Bf16` arm), plus the per-expert accumulators of the layer's bf16 routed experts
@@ -19932,7 +19934,7 @@ impl GpuModel {
     pub fn gptq_hess_new(&self, k: usize) -> GptqHess {
         let mut h = self.dev.alloc_zeros::<f32>(k * k).unwrap();
         self.dev.memset_zeros(&mut h).unwrap();
-        GptqHess { k, h, n: 0 }
+        GptqHess { k, h, n: 0, amax: self.dev.htod_sync_copy(&[0u32]).unwrap() }
     }
     pub fn gptq_arm(&self, tap: GptqTap) { *self.gptq_tap.lock().unwrap() = Some(tap); }
     pub fn gptq_disarm(&self) -> Option<GptqTap> { self.gptq_tap.lock().unwrap().take() }
@@ -19963,10 +19965,11 @@ impl GpuModel {
         let Some(tap) = g.as_mut() else { return; };
         let Some(acc) = tap.by_ptr.get_mut(&w_ptr) else { return; };
         assert_eq!(acc.k, k, "gptq tap: K mismatch on weight {w_ptr:#x}");
-        let (hp, kk) = (d(&acc.h), acc.k);
+        let (hp, kk, ap) = (d(&acc.h), acc.k, d(&acc.amax));
         acc.n += n;
         drop(g);
         self.gptq_hess_accum(hp, kk, x_ptr, n);
+        blaunch!(self, "gptq_absmax_b", grid(kk * n), (256,1,1), 0, (ap, x_ptr, (kk * n) as i64));
     }
 
     /// `moe_batch` tap: gather each expert's routed tokens, accumulate the gate_up-input Hessian
@@ -20003,8 +20006,10 @@ impl GpuModel {
             if n == 0 { continue; }
             let idx = self.dev.htod_sync_copy(list).unwrap();
             blaunch!(self, "gptq_gather_rows_b", grid(n * h), (256,1,1), 0, (d(&xg), d(x), d(&idx), n as i32, h as i32));
-            let (hgu, hdn) = { let g = self.gptq_tap.lock().unwrap(); let t = g.as_ref().unwrap(); (d(&t.moe_gu[e].h), d(&t.moe_dn[e].h)) };
+            let (hgu, hdn, agu, adn) = { let g = self.gptq_tap.lock().unwrap(); let t = g.as_ref().unwrap();
+                (d(&t.moe_gu[e].h), d(&t.moe_dn[e].h), d(&t.moe_gu[e].amax), d(&t.moe_dn[e].amax)) };
             self.gptq_hess_accum(hgu, h, d(&xg), n);
+            blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0, (agu, d(&xg), (h * n) as i64));
             // gate|up = Wgu_e · x : Wgu_e row-major [2mi, h] == column-major [h, 2mi] → opT
             unsafe {
                 cudarc::cublas::result::gemm_ex(*self.blas.handle(),
@@ -20019,6 +20024,7 @@ impl GpuModel {
             }
             blaunch!(self, "gptq_silu_mul_gu_b", grid(mi * n), (256,1,1), 0, (d(&act), d(&gu32), mi as i32, n as i32));
             self.gptq_hess_accum(hdn, mi, d(&act), n);
+            blaunch!(self, "gptq_absmax_b", grid(mi * n), (256,1,1), 0, (adn, d(&act), (mi * n) as i64));
             { let mut g = self.gptq_tap.lock().unwrap(); let t = g.as_mut().unwrap(); t.moe_gu[e].n += n; t.moe_dn[e].n += n; }
             self.sync_stream();   // idx/xg reuse across iterations
         }
@@ -20048,6 +20054,13 @@ impl GpuModel {
         let lam = (damp as f64 * mean) as f32;
         for i in 0..k { let di = &mut hh[i * k + i]; if *di == 0.0 { *di = 1.0; } *di += lam; }
         self.dev.htod_sync_copy(&hh).unwrap()
+    }
+    /// The activation |x| max a tap accumulated (0 if it never fired).
+    pub fn gptq_amax(&self, hess: &GptqHess) -> f32 {
+        self.sync_stream();
+        let mut out = [0u32];
+        unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut out, d(&hess.amax)).unwrap(); }
+        f32::from_bits(out[0])
     }
     pub fn gptq_absmax_f32(&self, w32: &S, n: usize) -> f32 {
         let acc = self.dev.htod_sync_copy(&[0u32]).unwrap();
@@ -20234,7 +20247,7 @@ impl GpuModel {
             t0 += nn;
         }
         self.sync_stream();
-        GptqHess { k: mi, h: hess.h, n }
+        GptqHess { k: mi, h: hess.h, n, amax: hess.amax }
     }
     /// Replace a layer's big linear weights by 1-element dummies (the `--gptq` driver loads the
     /// base artifact only for its embeddings / norms / PLE / MTP: every layer is rebuilt from the
