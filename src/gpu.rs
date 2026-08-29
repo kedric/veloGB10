@@ -4155,7 +4155,8 @@ impl GpuModel {
             "qsa_key_write_b","qsa_score_b","qsa_block_keys_b","qsa_score_prefill_b","qsa_topk_b",
             "gqa_attn_sel_splitk","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
             "gptq_bf16_to_f32_b","gptq_absmax_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
-            "gptq_silu_mul_gu_b","gptq_rotate_act_b",
+            "gptq_silu_mul_gu_b","gptq_rotate_act_b","gptq_scale_stats_f32_b","gptq_scale_stats_bf16_b",
+            "gptq_static_scales_b","gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
             "kernel_build_id"];
         dev.load_ptx(bptx, module, &bfnames)?;
         Self::assert_kernel_build_id(dev, module)?;
@@ -20088,7 +20089,7 @@ impl GpuModel {
     }
     /// The Hessian, copied (optionally rotated on both sides: H' = R·H·R) and damped:
     /// H += damp·mean(diag)·I, dead columns (diag 0) pinned to 1.
-    pub fn gptq_h32(&self, hess: &S, k: usize, rotate: bool, damp: f32) -> S {
+    pub fn gptq_h32(&self, hess: &S, k: usize, rotate: bool, damp: f32, act_order: bool) -> (S, Option<cudarc::driver::CudaSlice<i32>>) {
         let h = self.dev.alloc_zeros::<f32>(k * k).unwrap();
         unsafe { cudarc::driver::result::memcpy_dtod_async(d(&h), d(hess), k * k * 4, self.stream.stream).unwrap(); }
         if rotate {
@@ -20100,9 +20101,20 @@ impl GpuModel {
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut hh, d(&h)).unwrap(); }
         let mut mean = 0f64; for i in 0..k { mean += hh[i * k + i] as f64; } mean /= k as f64;
         assert!(mean > 0.0, "gptq_h32: empty Hessian (no calibration token reached this GEMM)");
+        let diag: Vec<f32> = (0..k).map(|i| hh[i * k + i]).collect();
         let lam = (damp as f64 * mean) as f32;
         for i in 0..k { let di = &mut hh[i * k + i]; if *di == 0.0 { *di = 1.0; } *di += lam; }
-        self.dev.htod_sync_copy(&hh).unwrap()
+        let h = self.dev.htod_sync_copy(&hh).unwrap();
+        if act_order {
+            let order = crate::gptq::static_activation_order(&diag);
+            let perm = self.dev.htod_sync_copy(&order).unwrap();
+            let hp = self.dev.alloc_zeros::<f32>(k * k).unwrap();
+            blaunch!(self, "gptq_permute_h_b", grid(k * k), (256,1,1), 0,
+                (d(&hp), d(&h), d(&perm), k as i32));
+            (hp, Some(perm))
+        } else {
+            (h, None)
+        }
     }
     /// The activation |x| max a tap accumulated (0 if it never fired).
     pub fn gptq_amax(&self, hess: &GptqHess) -> f32 {
@@ -20118,6 +20130,43 @@ impl GpuModel {
         let mut out = [0u32];
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut out, d(&acc)).unwrap(); }
         f32::from_bits(out[0])
+    }
+    /// Sufficient statistics for one alternating tensor-scale step on an f32 working weight.
+    pub fn gptq_scale_stats_f32(&self, w32: &S, n: usize, s_tensor: f32, nclip: usize) -> (f64, f64, f64) {
+        assert!(n % 16 == 0);
+        let stats = self.dev.alloc_zeros::<f64>(3).unwrap();
+        let blocks = (n / 16).div_ceil(256).clamp(1, 4096) as u32;
+        blaunch!(self, "gptq_scale_stats_f32_b", (blocks,1,1), (256,1,1), 0,
+            (d(&stats), d(w32), (n / 16) as i64, fbits(s_tensor), nclip as i32));
+        self.sync_stream();
+        let v = self.dev.dtoh_sync_copy(&stats).unwrap();
+        (v[0], v[1], v[2])
+    }
+    /// Same scale statistics directly from a contiguous bf16 tensor, optionally Hadamard-rotated.
+    pub fn gptq_scale_stats_bf16(&self, w_ptr: u64, n: usize, rotate: bool, s_tensor: f32, nclip: usize) -> (f64, f64, f64) {
+        assert!(n % 16 == 0);
+        let stats = self.dev.alloc_zeros::<f64>(3).unwrap();
+        let blocks = (n / 16).div_ceil(256).clamp(1, 4096) as u32;
+        blaunch!(self, "gptq_scale_stats_bf16_b", (blocks,1,1), (256,1,1), 0,
+            (d(&stats), w_ptr, (n / 16) as i64, rotate as i32, fbits(s_tensor), nclip as i32));
+        self.sync_stream();
+        let v = self.dev.dtoh_sync_copy(&stats).unwrap();
+        (v[0], v[1], v[2])
+    }
+    /// Freeze the original block-16 E4M3 scales used by static activation-order GPTQ.
+    pub fn gptq_static_scales(&self, w32: &S, m: usize, k: usize, s_tensor: f32, nclip: usize) -> cudarc::driver::CudaSlice<u8> {
+        assert!(k % 16 == 0);
+        let qs = self.dev.alloc_zeros::<u8>(m * k / 16).unwrap();
+        blaunch!(self, "gptq_static_scales_b", grid(m * k / 16), (256,1,1), 0,
+            (d(&qs), d(w32), (m * k / 16) as i64, fbits(s_tensor), nclip as i32));
+        qs
+    }
+    /// Permute weight columns into descending activation-importance order.
+    pub fn gptq_permute_w(&self, w32: &S, m: usize, k: usize, perm: &cudarc::driver::CudaSlice<i32>) -> S {
+        let out = self.dev.alloc_zeros::<f32>(m * k).unwrap();
+        blaunch!(self, "gptq_permute_w_b", grid(m * k), (256,1,1), 0,
+            (d(&out), d(w32), d(perm), m as i32, k as i32));
+        out
     }
     /// The GPTQ block sweep over all K columns. `u` = upper Cholesky factor of H⁻¹ (row-major).
     /// Returns (nibble codes [m, k/2], E4M3 block scales [m, k/16]) in the artifact layout.
@@ -20157,6 +20206,51 @@ impl GpuModel {
         unsafe {
             cudarc::driver::result::memcpy_dtoh_sync(&mut hq, d(&qw)).unwrap();
             cudarc::driver::result::memcpy_dtoh_sync(&mut hs, d(&qs)).unwrap();
+        }
+        (hq, hs)
+    }
+    /// GPTQ sweep in static activation order. Scales stay in the original block-16 layout and
+    /// packed codes are written back to original columns, so serving needs no permutation.
+    pub fn gptq_sweep_static(&self, w32: &S, u: &S, perm: &cudarc::driver::CudaSlice<i32>,
+                             qs: &cudarc::driver::CudaSlice<u8>, m: usize, k: usize,
+                             s_tensor: f32) -> (Vec<u8>, Vec<u8>) {
+        use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t};
+        const BS: usize = 128;
+        let bs = BS.min(k);
+        assert!(k % 16 == 0 && bs % 16 == 0);
+        let mut qw = self.dev.alloc_zeros::<u8>(m * k / 2).unwrap();
+        self.dev.memset_zeros(&mut qw).unwrap();
+        let err = self.dev.alloc_zeros::<f32>(m * bs).unwrap();
+        let (neg1, one) = (-1.0f32, 1.0f32);
+        let mut c0 = 0usize;
+        while c0 < k {
+            let b = bs.min(k - c0);
+            blaunch!(self, "gptq_sweep_static_b", grid(m), (256,1,1), 0,
+                (d(w32), d(&qw), d(qs), d(&err), d(u), d(perm), m as i32, k as i32,
+                 c0 as i32, b as i32, fbits(s_tensor)));
+            let c1 = c0 + b;
+            if c1 < k {
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(*self.blas.handle(),
+                        OP::CUBLAS_OP_N, OP::CUBLAS_OP_N,
+                        (k - c1) as i32, m as i32, b as i32,
+                        &neg1 as *const f32 as *const _,
+                        (d(u) + ((c0 * k + c1) * 4) as u64) as *const _, cudaDataType::CUDA_R_32F, k as i32,
+                        d(&err) as *const _, cudaDataType::CUDA_R_32F, b as i32,
+                        &one as *const f32 as *const _,
+                        (d(w32) + (c1 * 4) as u64) as *mut _, cudaDataType::CUDA_R_32F, k as i32,
+                        cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT)
+                        .expect("gptq static propagation gemm");
+                }
+            }
+            c0 = c1;
+        }
+        self.sync_stream();
+        let mut hq = vec![0u8; m * k / 2];
+        let mut hs = vec![0u8; m * k / 16];
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_sync(&mut hq, d(&qw)).unwrap();
+            cudarc::driver::result::memcpy_dtoh_sync(&mut hs, d(qs)).unwrap();
         }
         (hq, hs)
     }

@@ -194,6 +194,7 @@ impl Writer {
 #[derive(Clone)]
 pub struct GptqOpts {
     pub nsamples: usize, pub seqlen: usize, pub damp: f32, pub nclip: usize, pub rotate: bool,
+    pub scale_iters: usize, pub static_act_order: bool,
     pub gptq_groups: Vec<Group>, pub nvfp4_groups: Vec<Group>,   // GPTQ'd / RTN'd; everything else bf16
     pub fp8_groups: Vec<Group>,                                     // row-scaled FP8 (E4M3): the speed/accuracy middle ground
 }
@@ -209,25 +210,121 @@ fn mem_available_gb() -> f64 {
 }
 
 fn e4m3_scale_of(amax: f32) -> f32 { if amax > 0.0 { amax / (quant::E2M1_MAX * quant::E4M3_MAX) } else { 1.0 } }
+pub(crate) fn static_activation_order(diag: &[f32]) -> Vec<i32> {
+    let mut order: Vec<usize> = (0..diag.len()).collect();
+    order.sort_by(|&a, &b| match (diag[a].is_finite(), diag[b].is_finite()) {
+        (true, true) => diag[b].total_cmp(&diag[a]).then_with(|| a.cmp(&b)),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.cmp(&b),
+    });
+    order.into_iter().map(|i| i as i32).collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScaleFit {
+    scale: f32,
+    initial_mse: f64,
+    final_mse: f64,
+    accepted: usize,
+}
+
+/// Alternate between NVFP4 local-scale/code assignment and the closed-form least-squares global
+/// tensor scale. A guarded line search makes this monotonic even across E4M3 assignment boundaries.
+fn alternating_scale_fit<F>(initial: f32, iterations: usize, mut stats: F) -> ScaleFit
+where F: FnMut(f32) -> (f64, f64, f64) {
+    if iterations == 0 || !initial.is_finite() || initial <= 0.0 {
+        return ScaleFit { scale: initial, initial_mse: f64::NAN, final_mse: f64::NAN, accepted: 0 };
+    }
+    let (_, _, initial_mse) = stats(initial);
+    if !initial_mse.is_finite() {
+        return ScaleFit { scale: initial, initial_mse, final_mse: initial_mse, accepted: 0 };
+    }
+    let mut scale = initial;
+    let mut mse = initial_mse;
+    let lo = initial * 0.25;
+    let hi = initial * 4.0;
+    let mut accepted = 0usize;
+    for _ in 0..iterations {
+        let (num, den, _) = stats(scale);
+        if !num.is_finite() || !den.is_finite() || den <= 0.0 { break; }
+        let mut candidate = (num / den) as f32;
+        if !candidate.is_finite() || candidate <= 0.0 { break; }
+        candidate = candidate.clamp(lo, hi);
+        if (candidate - scale).abs() <= scale.abs().max(f32::MIN_POSITIVE) * 1e-6 { break; }
+
+        let mut trial = candidate;
+        let mut trial_mse = stats(trial).2;
+        let mut found = trial_mse.is_finite() && trial_mse < mse;
+        for _ in 0..8 {
+            if found { break; }
+            trial = 0.5 * (scale + trial);
+            trial_mse = stats(trial).2;
+            found = trial_mse.is_finite() && trial_mse < mse;
+        }
+        if !found { break; }
+        scale = trial;
+        mse = trial_mse;
+        accepted += 1;
+    }
+    ScaleFit { scale, initial_mse, final_mse: mse, accepted }
+}
+
+fn optimize_w32_scale(gpu: &GpuModel, w32: &S, n: usize, initial: f32, opts: &GptqOpts) -> f32 {
+    let fit = alternating_scale_fit(initial, opts.scale_iters,
+        |s| gpu.gptq_scale_stats_f32(w32, n, s, opts.nclip));
+    if fit.accepted > 0 {
+        println!("[gptq] NVFP4 scale: {:.6e} -> {:.6e}, SSE {:.6e} -> {:.6e} ({} steps)",
+                 initial, fit.scale, fit.initial_mse, fit.final_mse, fit.accepted);
+    }
+    fit.scale
+}
+
+fn optimize_bf16_scale(gpu: &GpuModel, w_ptr: u64, n: usize, initial: f32, opts: &GptqOpts) -> f32 {
+    let fit = alternating_scale_fit(initial, opts.scale_iters,
+        |s| gpu.gptq_scale_stats_bf16(w_ptr, n, opts.rotate, s, opts.nclip));
+    if fit.accepted > 0 {
+        println!("[gptq] stacked NVFP4 scale: {:.6e} -> {:.6e}, SSE {:.6e} -> {:.6e} ({} steps)",
+                 initial, fit.scale, fit.initial_mse, fit.final_mse, fit.accepted);
+    }
+    fit.scale
+}
 
 /// GPTQ one 2-D weight (bf16 on device at `w_ptr`, [m, k] row-major) with its Hessian.
 fn igs_of(amax: f32) -> Option<f32> { if amax > 0.0 && amax.is_finite() { Some(6.0 * 448.0 / amax) } else { None } }
 fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, hess: &S, opts: &GptqOpts, s_tensor: Option<f32>, x_amax: f32) -> Result<Rec> {
     let w32 = gpu.gptq_w32(w_ptr, m, k, opts.rotate);
+    let initial_st = s_tensor.unwrap_or_else(|| e4m3_scale_of(gpu.gptq_absmax_f32(&w32, m * k)));
+    // Stacked MoE tensors pass their already jointly optimized scale; ordinary matrices optimize
+    // their own global scale from the original rotated f32 weight.
+    let st = if s_tensor.is_some() { initial_st } else { optimize_w32_scale(gpu, &w32, m * k, initial_st, opts) };
+
     // Adaptive damping (GPTQModel-style): 1 % → 5 % → 10 % of mean(diag) before falling back to
-    // RTN (U = I: the sweep then rounds without error feedback, same scales and clip search).
+    // RTN (U = I: the sweep then rounds without error feedback, same scales and static groups).
     let mut u: Option<S> = None;
+    let mut perm = None;
     for damp in [opts.damp, 0.05, 0.10] {
-        let h32 = gpu.gptq_h32(hess, k, opts.rotate, damp);
-        match cs.chol_inv_chol(gpu, &h32, k) { Ok(()) => { u = Some(h32); break; } Err(e) => eprintln!("[gptq] cholesky failed at damp {damp}: {e} — retrying"), }
+        let (h32, p) = gpu.gptq_h32(hess, k, opts.rotate, damp, opts.static_act_order);
+        perm = p;
+        match cs.chol_inv_chol(gpu, &h32, k) {
+            Ok(()) => { u = Some(h32); break; }
+            Err(e) => eprintln!("[gptq] cholesky failed at damp {damp}: {e} — retrying"),
+        }
     }
     let u = match u { Some(u) => u, None => {
         eprintln!("[gptq] Hessian not usable — RTN fallback for this tensor");
         let mut id = vec![0f32; k * k]; for i in 0..k { id[i * k + i] = 1.0; }
         gpu.gptq_dev().htod_sync_copy(&id)?
     } };
-    let st = match s_tensor { Some(s) => s, None => e4m3_scale_of(gpu.gptq_absmax_f32(&w32, m * k)) };
-    let (qw, sc) = gpu.gptq_sweep(&w32, &u, m, k, st, opts.nclip);
+    let (qw, sc) = if let Some(perm) = perm {
+        // Freeze block scales before error feedback, then work in importance order and write codes
+        // directly into their original columns. The artifact and serving path remain unchanged.
+        let qs = gpu.gptq_static_scales(&w32, m, k, st, opts.nclip);
+        let wp = gpu.gptq_permute_w(&w32, m, k, &perm);
+        gpu.gptq_sweep_static(&wp, &u, &perm, &qs, m, k, st)
+    } else {
+        gpu.gptq_sweep(&w32, &u, m, k, st, opts.nclip)
+    };
     Ok(Rec { qw, sc, m, k, gs: 1.0 / st, igs: igs_of(x_amax) })
 }
 
@@ -306,9 +403,10 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         "--gptq is implemented for qwen3_5 dense and qwen4_exp, got {:?}", cfg.family);
     let samples = calib_tokens(base, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
     let ns = samples.len();
-    println!("[gptq] {} samples × {} tokens; groups GPTQ {:?}, RTN {:?}, rotate {}, damp {}, clip ratios {}",
+    println!("[gptq] {} samples × {} tokens; groups GPTQ {:?}, RTN {:?}, rotate {}, damp {}, clip ratios {}, scale iters {}, act-order {}",
              ns, opts.seqlen, opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
-             opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(), opts.rotate, opts.damp, opts.nclip);
+             opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(), opts.rotate, opts.damp, opts.nclip,
+             opts.scale_iters, if opts.static_act_order { "static" } else { "none" });
     for li in 0..gpu.gptq_num_layers() { gpu.gptq_drop_layer_weights(li); }
     gpu.gptq_sync();
     println!("[gptq] base layer weights dropped (rebuilt per layer from the source); MemAvailable {:.1} GB", mem_available_gb());
@@ -421,7 +519,8 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
                 // one global scale per stacked tensor (the artifact's convention): amax over all (rotated) experts
                 let mut amax = 0f32;
                 for e in 0..ne { let w32 = gpu.gptq_w32(base_ptr + (e * me * ke * 2) as u64, me, ke, opts.rotate); amax = amax.max(gpu.gptq_absmax_f32(&w32, me * ke)); }
-                let st = e4m3_scale_of(amax);
+                let initial_st = e4m3_scale_of(amax);
+                let st = optimize_bf16_scale(&gpu, base_ptr, ne * me * ke, initial_st, &opts);
                 let mut qw = Vec::with_capacity(ne * me * ke / 2); let mut sc = Vec::with_capacity(ne * me * ke / 16);
                 // one input global scale per stacked tensor: the activation amax over all experts
                 let x_amax = (0..ne).map(|e| gpu.gptq_amax(&hs[e])).fold(0f32, f32::max);
@@ -540,6 +639,8 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     }
     let mut cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
     cj["quantization_config"]["gptq"] = serde_json::json!({ "nsamples": ns, "seqlen": seqlen, "damp": opts.damp, "clip_ratios": opts.nclip,
+        "global_scale_optimization": { "type": "alternating_least_squares", "iterations": opts.scale_iters },
+        "activation_order": if opts.static_act_order { "static" } else { "none" },
         "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
         "rtn_groups": opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
         "fp8_groups": opts.fp8_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>() });
@@ -648,6 +749,8 @@ pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOp
     cj["quantization_config"]["gptq"]["seqlen"] = serde_json::json!(opts.seqlen);
     cj["quantization_config"]["gptq"]["damp"] = serde_json::json!(opts.damp);
     cj["quantization_config"]["gptq"]["clip_ratios"] = serde_json::json!(opts.nclip);
+    cj["quantization_config"]["gptq"]["global_scale_optimization"] = serde_json::json!({ "type": "alternating_least_squares", "iterations": opts.scale_iters });
+    cj["quantization_config"]["gptq"]["activation_order"] = serde_json::json!(if opts.static_act_order { "static" } else { "none" });
     add(&mut cj["quantization_config"]["transform"]["groups"], "lmhead");
     cj["quantization_config"]["activation_variant"] = serde_json::json!("runtime-selectable-a16-or-a4");
     std::fs::write(&cp, serde_json::to_string_pretty(&cj)?)?;
@@ -837,5 +940,63 @@ mod tests {
         let shards: std::collections::BTreeSet<&str> = wm.values().map(|v| v.as_str().unwrap()).collect();
         assert!(shards.len() > 5, "the tiny shard size must have produced many shards ({})", shards.len());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    fn host_scale_stats(w: &[f32], s_tensor: f32, nclip: usize) -> (f64, f64, f64) {
+        const RATIOS: [f32; 7] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7];
+        let mut out = (0.0, 0.0, 0.0);
+        for x in w.chunks_exact(16) {
+            let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let mut best = (u8::default(), f64::INFINITY);
+            for &ratio in RATIOS.iter().take(nclip) {
+                let raw = if amax > 0.0 { amax * ratio / quant::E2M1_MAX / s_tensor } else { 0.0 };
+                let scode = quant::f32_to_e4m3(raw);
+                let scale = quant::e4m3_to_f32(scode) * s_tensor;
+                let mse = x.iter().map(|&v| {
+                    let q = if scale > 0.0 { quant::e2m1_to_f32(quant::f32_to_e2m1(v / scale)) * scale } else { 0.0 };
+                    let d = (q - v) as f64;
+                    d * d
+                }).sum::<f64>();
+                if mse < best.1 { best = (scode, mse); }
+            }
+            let es = quant::e4m3_to_f32(best.0);
+            let scale = es * s_tensor;
+            for &v in x {
+                let code = if scale > 0.0 { quant::f32_to_e2m1(v / scale) } else { 0 };
+                let z = es * quant::e2m1_to_f32(code);
+                out.0 += v as f64 * z as f64;
+                out.1 += z as f64 * z as f64;
+            }
+            out.2 += best.1;
+        }
+        out
+    }
+
+    #[test]
+    fn static_activation_order_is_descending_stable_and_finite_first() {
+        let order = static_activation_order(&[2.0, 9.0, 9.0, f32::NAN, 1.0, f32::INFINITY]);
+        assert_eq!(order, vec![1, 2, 0, 4, 3, 5]);
+    }
+
+    #[test]
+    fn alternating_scale_fit_never_increases_nvfp4_error() {
+        let w: Vec<f32> = (0..256).map(|i| {
+            let x = i as f32 - 127.5;
+            (x * 0.071).sin() * (0.2 + (i % 29) as f32 * 0.037) + x * 0.0009
+        }).collect();
+        let amax = w.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let initial = e4m3_scale_of(amax) * 1.8;
+        let fit = alternating_scale_fit(initial, 6, |s| host_scale_stats(&w, s, 7));
+        assert!(fit.final_mse <= fit.initial_mse);
+        assert!(fit.accepted > 0, "synthetic bad initial scale should admit an improving step");
+        assert!((fit.scale - initial).abs() > initial * 1e-5);
+    }
+
+    #[test]
+    fn alternating_scale_fit_keeps_zero_tensor_scale() {
+        let w = [0.0f32; 32];
+        let fit = alternating_scale_fit(1.0, 4, |s| host_scale_stats(&w, s, 7));
+        assert_eq!(fit.scale, 1.0);
+        assert_eq!(fit.final_mse, 0.0);
+        assert_eq!(fit.accepted, 0);
     }
 }

@@ -407,6 +407,8 @@ fn main() {
             damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
             nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
             rotate: args.iter().any(|a| a == "--rotate"),
+            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            static_act_order: !args.iter().any(|a| a == "--no-act-order"),
             gptq_groups: vec![gb10_inference::quant::Group::LmHead],
             nvfp4_groups: vec![],
             fp8_groups: vec![],
@@ -422,6 +424,7 @@ fn main() {
     if args.iter().any(|a| a == "--gptq") {
         // --gptq --model-dir <bf16 source> --base <nvfp4 artifact> --out <dir> --calib <txt|jsonl>
         //        [--nsamples 128] [--seqlen 1024] [--damp 0.01] [--clip 7] [--rotate]
+        //        [--scale-iters 4] [--no-act-order]
         //        [--gptq-groups expert,attn,mlp] [--rtn-groups mtp]
         let src = parse_arg(&args, "--model-dir").expect("--gptq requires --model-dir <bf16 source>");
         let base = parse_arg(&args, "--base").expect("--gptq requires --base <nvfp4 artifact>");
@@ -433,6 +436,8 @@ fn main() {
             damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
             nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
             rotate: args.iter().any(|a| a == "--rotate"),
+            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            static_act_order: !args.iter().any(|a| a == "--no-act-order"),
             gptq_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--gptq-groups").unwrap_or("expert,attn,mlp")).expect("--gptq-groups"),
             nvfp4_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--rtn-groups").unwrap_or("mtp")).expect("--rtn-groups"),
             fp8_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--fp8-groups").unwrap_or("")).expect("--fp8-groups"),

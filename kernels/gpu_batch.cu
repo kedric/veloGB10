@@ -11387,3 +11387,171 @@ extern "C" __global__ void gptq_absmax_f32_b(unsigned int* out, const float* x, 
     for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
     if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(v));
 }
+
+// Pick the best E4M3 local scale for one 16-value NVFP4 group. The candidates deliberately
+// match gptq_sweep_b: this helper is used by the alternating tensor-scale fit and by static
+// activation-order's precomputed groups, so calibration and the final sweep share one grid.
+__device__ __forceinline__ unsigned char gptq_best_scale16(const float x[16], float s_tensor,
+                                                            int nclip, float* best_mse) {
+    const float ratios[7] = {1.0f, 0.95f, 0.9f, 0.85f, 0.8f, 0.75f, 0.7f};
+    float amax = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(x[i]));
+    unsigned char best_code = 0;
+    float be = 1e30f;
+    for (int c = 0; c < nclip; c++) {
+        float raw = (amax > 0.f && s_tensor > 0.f) ? amax * ratios[c] / 6.f / s_tensor : 0.f;
+        unsigned char code = f32_to_e4m3(raw);
+        float sc = e4m3_f(code) * s_tensor;
+        float inv = sc > 0.f ? 1.f / sc : 0.f;
+        float err = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            float q = gptq_e2m1_val(gptq_e2m1(x[i] * inv)) * sc;
+            float d = q - x[i];
+            err += d * d;
+        }
+        if (c == 0 || err < be) { be = err; best_code = code; }
+    }
+    *best_mse = be;
+    return best_code;
+}
+
+// Alternating global-scale sufficient statistics. With a fixed local-scale/code assignment,
+// q_i = s_tensor * z_i and the least-squares tensor scale is sum(w_i*z_i)/sum(z_i^2).
+// Re-evaluating this kernel at that scale reassigns the local E4M3 scales and FP4 codes. One
+// block contributes three f64 atomics, avoiding the precision loss of atomics per 16-value group.
+extern "C" __global__ void gptq_scale_stats_f32_b(double* stats, const float* w,
+                                                   long long ngroups, float s_tensor, int nclip) {
+    __shared__ double sn[256], sd[256], se[256];
+    double num = 0.0, den = 0.0, mse = 0.0;
+    for (long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         g < ngroups; g += (long long)gridDim.x * blockDim.x) {
+        float x[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) x[i] = w[g * 16 + i];
+        float group_mse;
+        unsigned char scode = gptq_best_scale16(x, s_tensor, nclip, &group_mse);
+        float es = e4m3_f(scode);
+        float sc = es * s_tensor;
+        float inv = sc > 0.f ? 1.f / sc : 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            float z = es * gptq_e2m1_val(gptq_e2m1(x[i] * inv));
+            num += (double)x[i] * (double)z;
+            den += (double)z * (double)z;
+        }
+        mse += (double)group_mse;
+    }
+    sn[threadIdx.x] = num; sd[threadIdx.x] = den; se[threadIdx.x] = mse;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s; s >>= 1) {
+        if (threadIdx.x < s) { sn[threadIdx.x] += sn[threadIdx.x+s]; sd[threadIdx.x] += sd[threadIdx.x+s]; se[threadIdx.x] += se[threadIdx.x+s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { atomicAdd(stats, sn[0]); atomicAdd(stats + 1, sd[0]); atomicAdd(stats + 2, se[0]); }
+}
+
+// Same statistics directly from the bf16 source. This lets a stacked MoE tensor share one
+// optimized global scale without materializing every expert as f32 at once. Because MR's H16 acts
+// independently on exactly these groups, the optional rotation is lossless with respect to the
+// f32 working copy produced by gptq_w32.
+extern "C" __global__ void gptq_scale_stats_bf16_b(double* stats, const __nv_bfloat16* w,
+                                                    long long ngroups, int rotate,
+                                                    float s_tensor, int nclip) {
+    __shared__ double sn[256], sd[256], se[256];
+    double num = 0.0, den = 0.0, mse = 0.0;
+    for (long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         g < ngroups; g += (long long)gridDim.x * blockDim.x) {
+        float x[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) x[i] = __bfloat162float(w[g * 16 + i]);
+        if (rotate) {
+            #pragma unroll
+            for (int len = 1; len < 16; len <<= 1)
+                #pragma unroll
+                for (int i = 0; i < 16; i += 2 * len)
+                    #pragma unroll
+                    for (int j = i; j < i + len; j++) { float a=x[j], b=x[j+len]; x[j]=a+b; x[j+len]=a-b; }
+            #pragma unroll
+            for (int i = 0; i < 16; i++) x[i] *= 0.25f;
+        }
+        float group_mse;
+        unsigned char scode = gptq_best_scale16(x, s_tensor, nclip, &group_mse);
+        float es = e4m3_f(scode);
+        float sc = es * s_tensor;
+        float inv = sc > 0.f ? 1.f / sc : 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            float z = es * gptq_e2m1_val(gptq_e2m1(x[i] * inv));
+            num += (double)x[i] * (double)z;
+            den += (double)z * (double)z;
+        }
+        mse += (double)group_mse;
+    }
+    sn[threadIdx.x] = num; sd[threadIdx.x] = den; se[threadIdx.x] = mse;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s; s >>= 1) {
+        if (threadIdx.x < s) { sn[threadIdx.x] += sn[threadIdx.x+s]; sd[threadIdx.x] += sd[threadIdx.x+s]; se[threadIdx.x] += se[threadIdx.x+s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { atomicAdd(stats, sn[0]); atomicAdd(stats + 1, sd[0]); atomicAdd(stats + 2, se[0]); }
+}
+
+// Static groups: choose every local scale from the original, unpermuted rotated weight before
+// GPTQ updates it. Static activation-order can then visit columns in any order while every final
+// code remains reconstructible by the original block-of-16 scale layout.
+extern "C" __global__ void gptq_static_scales_b(unsigned char* qs, const float* w,
+                                                 long long ngroups, float s_tensor, int nclip) {
+    long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= ngroups) return;
+    float x[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) x[i] = w[g * 16 + i];
+    float mse;
+    qs[g] = gptq_best_scale16(x, s_tensor, nclip, &mse);
+}
+
+// out[:,j] = in[:,perm[j]], and out[i,j] = in[perm[i],perm[j]]. The latter permutes the
+// Hessian into the same activation-importance basis as the working weight.
+extern "C" __global__ void gptq_permute_w_b(float* out, const float* in, const int* perm, int M, int K) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)M * K) return;
+    int r = (int)(i / K), j = (int)(i % K);
+    out[i] = in[(long long)r * K + perm[j]];
+}
+extern "C" __global__ void gptq_permute_h_b(float* out, const float* in, const int* perm, int K) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)K * K) return;
+    int r = (int)(i / K), c = (int)(i % K);
+    out[i] = in[(long long)perm[r] * K + perm[c]];
+}
+
+// GPTQ sweep in activation-importance order with precomputed static scales. W and U are already
+// permuted. Codes are written directly at their ORIGINAL columns, so neither the artifact nor the
+// serving kernels need a permutation table.
+extern "C" __global__ void gptq_sweep_static_b(float* W, unsigned char* qw,
+                                                const unsigned char* qs, float* Err,
+                                                const float* U, const int* perm,
+                                                int M, int K, int c0, int bs, float s_tensor) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= M) return;
+    float* w = W + (long long)r * K;
+    float* e = Err + (long long)r * bs;
+    for (int j = 0; j < bs; j++) {
+        int col = c0 + j;
+        int orig = perm[col];
+        float s = e4m3_f(qs[(long long)r * (K / 16) + orig / 16]) * s_tensor;
+        float inv = s > 0.f ? 1.f / s : 0.f;
+        unsigned char code = gptq_e2m1(w[col] * inv);
+        float q = gptq_e2m1_val(code) * s;
+        long long qi = (long long)r * (K / 2) + orig / 2;
+        unsigned char byte = qw[qi];
+        qw[qi] = (orig & 1) ? ((byte & 0x0F) | (code << 4)) : ((byte & 0xF0) | code);
+        float d = U[(long long)col * K + col];
+        float err = (w[col] - q) / d;
+        e[j] = err;
+        const float* urow = U + (long long)col * K;
+        for (int k2 = j; k2 < bs; k2++) w[c0 + k2] -= err * urow[c0 + k2];
+    }
+}
