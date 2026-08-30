@@ -119,7 +119,13 @@ pub fn model_id_from_dir(model_path: &str) -> String {
 }
 
 fn esc(t: &str) -> String {
-    t.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    // SSE chunks interpolate this inside a JSON string. Hand-escaping only backslashes,
+    // quotes and newlines left literal tabs (common in Go), carriage returns and other
+    // control characters in the payload. Clients discard that invalid JSON, which looks
+    // like the first characters of indented lines were truncated. Use the complete JSON
+    // escaping rules, then remove the surrounding quotes supplied by the serializer.
+    let quoted = serde_json::to_string(t).expect("serializing a Rust string cannot fail");
+    quoted[1..quoted.len() - 1].to_string()
 }
 
 /// (The think close marker is resolved per-request from the model's vocab — see
@@ -765,7 +771,7 @@ pub fn create_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod context_budget_tests {
-    use super::generation_room;
+    use super::{esc, generation_room};
 
     #[test]
     fn mtp_headroom_is_reserved_before_clamping() {
@@ -777,5 +783,25 @@ mod context_budget_tests {
     fn prompt_that_leaves_only_headroom_has_no_generation_room() {
         assert_eq!(generation_room(4096, 4080, 16), None);
         assert_eq!(generation_room(4096, usize::MAX, 16), None);
+    }
+
+    #[test]
+    fn sse_json_escape_preserves_indented_go_code() {
+        let text = concat!(
+            "// New crée un cache.\n",
+            "func New(capacity int) *CacheLRU {\n",
+            "\treturn &CacheLRU{\r\n",
+            "\t\tcapacity: capacity,\n",
+            "\t\titems: make(map[interface{}]*list.Element),\n",
+            "\t}\n",
+            "}\n",
+        );
+        let payload = format!(r#"{{"delta":{{"content":"{}"}}}}"#, esc(text));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("SSE data must contain valid JSON");
+
+        assert_eq!(parsed["delta"]["content"], text);
+        assert!(!payload.contains('\t'), "JSON payload must not contain literal tabs");
+        assert!(!payload.contains('\r'), "JSON payload must not contain literal CRs");
     }
 }
