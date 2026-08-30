@@ -2,10 +2,12 @@
 //! enabled groups run on Blackwell's block-scaled FP4 tensor cores with the ACTIVATIONS quantized to
 //! E2M1 + UE4M3 per 16 (plus a per-tensor input global scale), reading the engine's standard tiled
 //! weights directly — no second weight copy. Decode / verify (batch <= MAX_VERIFY) keep the W4A16
-//! chain, so the MTP lossless-verify contract is untouched and nothing here is graph-captured.
+//! chain unless `GB10_W4A4_VERIFY` explicitly opts groups into the same A4 path. Decode and verify
+//! share that flag so speculation always verifies against the same numerical target as plain decode.
 //!
 //! Env: `GB10_W4A4_PREFILL=1` (groups expert,mlp,attn) or `GB10_W4A4_PREFILL=expert,attn,...`
 //! (any of expert mlp attn gdn hc ple lmhead — the same group names as the quantizer).
+//! `GB10_W4A4_VERIFY=1` (attn,mlp,gdn) or a group list enables narrow decode+verify W4A4.
 //! `GB10_W4A4_TRACE=1` logs each dispatch. Per-tensor `input_global_scale` (compressed-tensors) is
 //! read from the artifact when present (`{stem}.input_global_scale` F32 [1]); absent = 1.0.
 use std::collections::{HashMap, HashSet};
@@ -34,7 +36,9 @@ pub struct W4a4State {
     pub enabled: HashSet<u64>,
     /// Explicit opt-in for narrow (decode/verify) W4A4. Kept separate from `enabled` because
     /// ordinary groups preserve the W4A16 batch-invariant path at N <= MAX_VERIFY.
-    /// Today only lm_head is admitted here, for controlled W4A16-vs-W4A4 quality benches.
+    /// `GB10_W4A4_VERIFY` admits its selected groups here; lm_head also has its historical
+    /// controlled opt-in. Applying the same set at N=1 and N<=MAX_VERIFY keeps decode/verify
+    /// coherent while making the numerical W4A4 fork explicit.
     pub narrow_enabled: HashSet<u64>,
     /// Input global scale per enabled weight (absent = 1.0).
     pub x_gs: HashMap<u64, f32>,
@@ -49,12 +53,22 @@ pub fn check_on() -> bool {
 }
 
 /// The env request: None = off; Some(groups) = on for these quantizer groups.
-pub fn groups_from_env() -> Option<Vec<String>> {
-    let v = std::env::var("GB10_W4A4_PREFILL").ok()?;
+fn groups_from_var(name: &str, defaults: &[&str]) -> Option<Vec<String>> {
+    let v = std::env::var(name).ok()?;
     let v = v.trim();
     if v.is_empty() || v == "0" { return None; }
-    if v == "1" || v.eq_ignore_ascii_case("on") { return Some(vec!["expert".into(), "mlp".into(), "attn".into()]); }
+    if v == "1" || v.eq_ignore_ascii_case("on") {
+        return Some(defaults.iter().map(|s| (*s).to_string()).collect());
+    }
     Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+pub fn groups_from_env() -> Option<Vec<String>> {
+    groups_from_var("GB10_W4A4_PREFILL", &["expert", "mlp", "attn"])
+}
+
+pub fn verify_groups_from_env() -> Option<Vec<String>> {
+    groups_from_var("GB10_W4A4_VERIFY", &["attn", "mlp", "gdn"])
 }
 
 impl W4a4State {
@@ -73,8 +87,9 @@ impl W4a4State {
         let sb = dev.htod_sync_copy(&vec![0xFFu8; rows_max * (k_max / 4)])?;
         let tmap = dev.alloc_zeros::<i32>(1 + 2 * tiles_max.max(1))?;
         let trace = std::env::var("GB10_W4A4_TRACE").is_ok();
-        println!("W4A4 prefill ON: groups {:?} — {} NVFP4 weights ({} with an input_global_scale); scratch {} rows x K {} ({:.0} MB)",
-                 groups, enabled.len(), x_gs.len(), rows_max, k_max, (rows_max * k_max * 3 / 4) as f64 / 1e6);
+        println!("W4A4 runtime ON: groups {:?} — {} wide + {} narrow NVFP4 weights ({} with an input_global_scale); scratch {} rows x K {} ({:.0} MB)",
+                 groups, enabled.len(), narrow_enabled.len(), x_gs.len(), rows_max, k_max,
+                 (rows_max * k_max * 3 / 4) as f64 / 1e6);
         Ok(Self { quant: get("w4a4_quant_pack_b"), gemm: get("w4a4_gemm_b"), gemm_moe: get("w4a4_gemm_moe_b"),
                   tilemap: get("w4a4_moe_tilemap_b"), fakequant: get("w4a4_fakequant_b"), bq, sb, rows_max, k_max, tmap, tiles_max,
                   enabled, narrow_enabled, x_gs, groups, trace })

@@ -5206,10 +5206,9 @@ impl GpuModel {
         // MR-GPTQ: a rotated weight reads the micro-rotated activation (scratch, x untouched).
         let _rot_guard; let x: &B = if self.is_rotated(w) { _rot_guard = self.rot_x(x, inn, batch); &*_rot_guard } else { x };
 
-        // Controlled head-only exception to the W4A4 prefill rule. The LM head is always invoked
-        // on the last hidden column (N=1), so merely listing `lmhead` in GB10_W4A4_PREFILL could
-        // never exercise A4. GB10_W4A4_LMHEAD_NARROW=1 makes that A/B explicit; no other tensor may
-        // enter this arm, preserving the W4A16 decode/verify contract for the trunk and MTP.
+        // Explicit narrow W4A4 fork. GB10_W4A4_VERIFY selects groups for BOTH N=1 decode and
+        // N<=MAX_VERIFY: using one numerical target on both sides preserves speculative
+        // correctness. GB10_W4A4_LMHEAD_NARROW remains the historical head-only A/B.
         if let (Some(w4), W::Nvfp4 { qweight, m, k, .. }) = (&self.w4a4, w) {
             let ptr = *qweight.device_ptr() as u64;
             if batch <= MAX_VERIFY && w4.narrow_on(ptr) && *k == inn && *m == outn && inn % 64 == 0
@@ -20525,19 +20524,25 @@ impl GpuModel {
             .ok().and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|j| j["quantization_config"]["activation_variant"].as_str().map(str::to_owned))
             .as_deref() == Some("w4a4");
-        // An explicit environment value always wins, including `0` to disable an A4 artifact.
-        let groups = if std::env::var_os("GB10_W4A4_PREFILL").is_some() {
-            let Some(groups) = crate::w4a4::groups_from_env() else { return Ok(()); };
-            groups
+        // An explicit prefill value always wins, including `0`. Narrow decode+verify is a
+        // separate opt-in because it changes the target's numerical chain, but it must apply to
+        // BOTH N=1 decode and N<=MAX_VERIFY so speculative verification stays coherent.
+        let prefill_groups = if std::env::var_os("GB10_W4A4_PREFILL").is_some() {
+            crate::w4a4::groups_from_env().unwrap_or_default()
         } else if configured_a4 {
             vec!["attn".into(), "mlp".into(), "gdn".into(), "lmhead".into()]
-        } else { return Ok(()); };
+        } else { Vec::new() };
+        let verify_groups = crate::w4a4::verify_groups_from_env().unwrap_or_default();
+        if prefill_groups.is_empty() && verify_groups.is_empty() { return Ok(()); }
+        let mut groups = prefill_groups.clone();
+        for g in &verify_groups { if !groups.contains(g) { groups.push(g.clone()); } }
         let narrow_requested = match std::env::var("GB10_W4A4_LMHEAD_NARROW") {
             Ok(v) => v == "1",
             Err(_) => configured_a4,
         };
-        anyhow::ensure!(self.mxfp4.is_none(), "GB10_W4A4_PREFILL and GB10_MXFP4 are exclusive");
-        let has = |g: &str| groups.iter().any(|x| x == g);
+        anyhow::ensure!(self.mxfp4.is_none(), "GB10_W4A4_PREFILL/VERIFY and GB10_MXFP4 are exclusive");
+        let wide = |g: &str| prefill_groups.iter().any(|x| x == g);
+        let narrow = |g: &str| verify_groups.iter().any(|x| x == g);
         let lm = "model.language_model";
         let mut enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut narrow_enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -20545,57 +20550,64 @@ impl GpuModel {
         let mut k_max = 0usize;
         {
             let igs = &self.igs_by_name;
-            let mut add = |w: &W, names: &[String]| {
+            let mut add = |w: &W, names: &[String], wide_on: bool, narrow_on: bool| {
+                if !wide_on && !narrow_on { return; }
                 if let W::Nvfp4 { qweight, k, m, .. } = w {
                     if *k % 64 != 0 || *m % 16 != 0 { return; }
                     let ptr = *qweight.device_ptr() as u64;
-                    enabled.insert(ptr); k_max = k_max.max(*k);
+                    if wide_on { enabled.insert(ptr); }
+                    if narrow_on { narrow_enabled.insert(ptr); }
+                    k_max = k_max.max(*k);
                     let gsx = names.iter().filter_map(|n| igs.get(n)).cloned().fold(f32::INFINITY, f32::min);
                     if gsx.is_finite() && gsx > 0.0 { x_gs.insert(ptr, gsx); }
                 }
             };
             for (li, l) in self.layers.iter().enumerate() {
                 let lp = format!("{lm}.layers.{li}");
-                if has("attn") { if let Some(fa) = &l.fa {
+                let (attn_w, attn_n) = (wide("attn"), narrow("attn"));
+                if attn_w || attn_n { if let Some(fa) = &l.fa {
                     let (q, k, v) = (format!("{lp}.self_attn.q_proj"), format!("{lp}.self_attn.k_proj"), format!("{lp}.self_attn.v_proj"));
-                    match &fa.qkv { AttnIn::Fused(w) => add(w, &[q, k, v]),
-                                    AttnIn::Split { q: wq, k: wk, v: wv } => { add(wq, &[q]); add(wk, &[k]); add(wv, &[v]); } }
-                    add(&fa.o_proj, &[format!("{lp}.self_attn.o_proj")]);
-                    if let Some(ix) = &fa.indexer { add(&ix.qk_proj, &[format!("{lp}.self_attn.indexer.index_qk_proj")]); }
+                    match &fa.qkv { AttnIn::Fused(w) => add(w, &[q, k, v], attn_w, attn_n),
+                                    AttnIn::Split { q: wq, k: wk, v: wv } => { add(wq, &[q], attn_w, attn_n); add(wk, &[k], attn_w, attn_n); add(wv, &[v], attn_w, attn_n); } }
+                    add(&fa.o_proj, &[format!("{lp}.self_attn.o_proj")], attn_w, attn_n);
+                    if let Some(ix) = &fa.indexer { add(&ix.qk_proj, &[format!("{lp}.self_attn.indexer.index_qk_proj")], attn_w, attn_n); }
                 } }
-                if has("gdn") { if let Some(la) = &l.la {
+                let (gdn_w, gdn_n) = (wide("gdn"), narrow("gdn"));
+                if gdn_w || gdn_n { if let Some(la) = &l.la {
                     let n = |s: &str| format!("{lp}.linear_attn.{s}");
                     match &la.in_proj {
-                        GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")]),
-                        GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")]); add(z, &[n("in_proj_z")]); add(b, &[n("in_proj_b")]); add(a, &[n("in_proj_a")]); }
+                        GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")], gdn_w, gdn_n),
+                        GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")], gdn_w, gdn_n); add(z, &[n("in_proj_z")], gdn_w, gdn_n); add(b, &[n("in_proj_b")], gdn_w, gdn_n); add(a, &[n("in_proj_a")], gdn_w, gdn_n); }
                     }
-                    add(&la.out_proj, &[n("out_proj")]);
+                    add(&la.out_proj, &[n("out_proj")], gdn_w, gdn_n);
                 } }
                 match &l.mlp {
                     Ffn::Moe(m) => {
-                        if has("expert") { add(&m.gate_up, &[format!("{lp}.mlp.experts.gate_up_proj")]); add(&m.down, &[format!("{lp}.mlp.experts.down_proj")]); }
-                        if has("mlp") {
+                        if wide("expert") { add(&m.gate_up, &[format!("{lp}.mlp.experts.gate_up_proj")], true, false); add(&m.down, &[format!("{lp}.mlp.experts.down_proj")], true, false); }
+                        let (mlp_w, mlp_n) = (wide("mlp"), narrow("mlp"));
+                        if mlp_w || mlp_n {
                             let (sg, su, sd) = (format!("{lp}.mlp.shared_expert.gate_proj"), format!("{lp}.mlp.shared_expert.up_proj"), format!("{lp}.mlp.shared_expert.down_proj"));
-                            add(&m.shared.gate, &[sg.clone()]); add(&m.shared.up, &[su.clone()]); add(&m.shared.down, &[sd]);
-                            if let Some(w) = &m.shared_gate_up { add(w, &[sg, su]); }
+                            add(&m.shared.gate, &[sg.clone()], mlp_w, mlp_n); add(&m.shared.up, &[su.clone()], mlp_w, mlp_n); add(&m.shared.down, &[sd], mlp_w, mlp_n);
+                            if let Some(w) = &m.shared_gate_up { add(w, &[sg, su], mlp_w, mlp_n); }
                         }
                     }
-                    Ffn::Dense(m) => { if has("mlp") { add(&m.gate, &[format!("{lp}.mlp.gate_proj")]); add(&m.up, &[format!("{lp}.mlp.up_proj")]); add(&m.down, &[format!("{lp}.mlp.down_proj")]); } }
+                    Ffn::Dense(m) => { let (mw, mn) = (wide("mlp"), narrow("mlp")); if mw || mn { add(&m.gate, &[format!("{lp}.mlp.gate_proj")], mw, mn); add(&m.up, &[format!("{lp}.mlp.up_proj")], mw, mn); add(&m.down, &[format!("{lp}.mlp.down_proj")], mw, mn); } }
                 }
-                if has("hc") { if let Some((a, b)) = &l.hc {
-                    add(&a.down, &[format!("{lp}.attn_hyper_connection.input_mix_weight_down")]); add(&a.up, &[format!("{lp}.attn_hyper_connection.input_mix_weight_up")]);
-                    add(&b.down, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_down")]); add(&b.up, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_up")]);
+                let (hc_w, hc_n) = (wide("hc"), narrow("hc"));
+                if hc_w || hc_n { if let Some((a, b)) = &l.hc {
+                    add(&a.down, &[format!("{lp}.attn_hyper_connection.input_mix_weight_down")], hc_w, hc_n); add(&a.up, &[format!("{lp}.attn_hyper_connection.input_mix_weight_up")], hc_w, hc_n);
+                    add(&b.down, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_down")], hc_w, hc_n); add(&b.up, &[format!("{lp}.mlp_hyper_connection.input_mix_weight_up")], hc_w, hc_n);
                 } }
-                if has("ple") { if let Some(p) = &l.ple { add(&p.key_proj, &[format!("{lp}.ple.key_proj")]); add(&p.value_proj, &[format!("{lp}.ple.value_proj")]); } }
+                let (ple_w, ple_n) = (wide("ple"), narrow("ple"));
+                if ple_w || ple_n { if let Some(p) = &l.ple { add(&p.key_proj, &[format!("{lp}.ple.key_proj")], ple_w, ple_n); add(&p.value_proj, &[format!("{lp}.ple.value_proj")], ple_w, ple_n); } }
             }
-            if has("lmhead") { if let Some(w) = &self.lm_head {
-                add(w, &["lm_head".to_string()]);
-                if narrow_requested {
-                    if let W::Nvfp4 { qweight, .. } = w { narrow_enabled.insert(*qweight.device_ptr() as u64); }
-                }
+            let (lm_w, lm_n) = (wide("lmhead"), narrow("lmhead") || (wide("lmhead") && narrow_requested));
+            if lm_w || lm_n { if let Some(w) = &self.lm_head {
+                add(w, &["lm_head".to_string()], lm_w, lm_n);
             } }
         }
-        if enabled.is_empty() { println!("W4A4 prefill: no NVFP4 weight in groups {groups:?} — off"); return Ok(()); }
+        if enabled.is_empty() && narrow_enabled.is_empty() { println!("W4A4 runtime: no NVFP4 weight in groups {groups:?} — off"); return Ok(()); }
+        println!("W4A4 policy: prefill={prefill_groups:?}, decode+verify={verify_groups:?}");
         let rows_max = crate::batch::PREFILL_CHUNK.max(self.moe_g_pf.ppad_max);
         let tiles_max = self.moe_g_pf.ppad_max / crate::w4a4::W4_BN + self.cfg.num_experts + 2;
         self.w4a4 = Some(crate::w4a4::W4a4State::build(&self.dev, groups, enabled, narrow_enabled, x_gs, rows_max, k_max, tiles_max)?);

@@ -115,7 +115,10 @@ enum RoundWeight {
     Nvfp4 {
         qweight: CudaSlice<u8>,
         scales: CudaSlice<u8>,
+        w4_qweight: Option<CudaSlice<u8>>,
+        w4_scales: Option<CudaSlice<u8>>,
         gs: CudaSlice<f32>,
+        input_gs: Option<f32>,
         prime_bf16: CudaSlice<bf16>,
         m: usize,
         k: usize,
@@ -147,8 +150,41 @@ struct CalibScratch {
     kc: CudaSlice<bf16>, vc: CudaSlice<bf16>,
 }
 
+/// Optional block-scaled FP4 activation path for the 35 fixed-N=8 drafter projections. Context
+/// prime/injection deliberately stays W4A16: the prime gate proves that mixing its large-M A4
+/// path with fixed-N=8 A4 changes the KV ring enough to alter drafts. The standard packed weight
+/// layout is retained only when requested; W4A16 remains the zero-overhead fallback.
+struct Df2W4a4 {
+    quant: CudaFunction,
+    gemm: CudaFunction,
+    bq: CudaSlice<u8>,
+    sb: CudaSlice<u8>,
+    k_max: usize,
+}
+
+impl Df2W4a4 {
+    fn requested() -> bool {
+        std::env::var("GB10_DF2_W4A4").map(|v| {
+            let v = v.trim(); !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("off")
+        }).unwrap_or(false)
+    }
+
+    fn build(dev: &Arc<CudaDevice>) -> Result<Self> {
+        let module = "gpu_w4a4_df2";
+        let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_w4a4.ptx")?);
+        dev.load_ptx(ptx, module, &["w4a4_quant_pack_b", "w4a4_gemm_b", "kernel_build_id"])?;
+        crate::gpu::GpuModel::assert_kernel_build_id(dev, module)?;
+        let quant = dev.get_func(module, "w4a4_quant_pack_b").context("df2 w4a4 quant kernel")?;
+        let gemm = dev.get_func(module, "w4a4_gemm_b").context("df2 w4a4 gemm kernel")?;
+        let k_max = INTER;
+        let bq = dev.htod_sync_copy(&vec![0xFFu8; BLOCK * (k_max / 2)])?;
+        let sb = dev.htod_sync_copy(&vec![0xFFu8; BLOCK * (k_max / 4)])?;
+        Ok(Self { quant, gemm, bq, sb, k_max })
+    }
+}
+
 fn load_round_nvfp4(dev: &Arc<CudaDevice>, rd: &crate::gptq::ShardReader,
-                    stem: &str, m: usize, k: usize, rotated: bool) -> Result<RoundWeight> {
+                    stem: &str, m: usize, k: usize, rotated: bool, keep_w4: bool) -> Result<RoundWeight> {
     let (pm, qw) = rd.read_bytes(&format!("{stem}.weight_packed"))?;
     let (sm, sc) = rd.read_bytes(&format!("{stem}.weight_scale"))?;
     let (_, gb) = rd.read_bytes(&format!("{stem}.weight_global_scale"))?;
@@ -158,14 +194,25 @@ fn load_round_nvfp4(dev: &Arc<CudaDevice>, rd: &crate::gptq::ShardReader,
     let global_scale = f32::from_le_bytes(gb[..4].try_into().unwrap());
     anyhow::ensure!(global_scale.is_finite() && global_scale > 0.0,
                     "{stem}: invalid global scale {global_scale}");
+    let input_gs = rd.read_bytes(&format!("{stem}.input_global_scale")).ok().and_then(|(_, b)| {
+        (b.len() == 4).then(|| f32::from_le_bytes(b[..4].try_into().unwrap()))
+    }).filter(|v| v.is_finite() && *v > 0.0);
+    if keep_w4 {
+        anyhow::ensure!(input_gs.is_some(),
+                        "{stem}: GB10_DF2_W4A4 requires a valid input_global_scale");
+    }
     let prime = crate::quant::dequantize_nvfp4(&crate::quant::Nvfp4Tensor {
         qweight: qw.clone(), scales: sc.clone(), global_scale, m, k,
     });
     let (wt, st) = crate::quant::repack_nvfp4_mma(&qw, &sc, m, k);
+    let (w4_qweight, w4_scales) = if keep_w4 {
+        (Some(dev.htod_sync_copy(&qw)?), Some(dev.htod_sync_copy(&sc)?))
+    } else { (None, None) };
     Ok(RoundWeight::Nvfp4 {
         qweight: dev.htod_sync_copy(&wt)?, scales: dev.htod_sync_copy(&st)?,
+        w4_qweight, w4_scales,
         gs: dev.htod_sync_copy(&vec![1.0 / global_scale; m / 16])?,
-        prime_bf16: dev.htod_sync_copy(&prime)?, m, k, rotated,
+        input_gs, prime_bf16: dev.htod_sync_copy(&prime)?, m, k, rotated,
     })
 }
 
@@ -296,6 +343,7 @@ pub struct Df2Round {
     /// Large-M MR scratch and calibration workspace are reused across all 512 samples.
     prime_mr: CudaSlice<bf16>,
     calib: Option<CalibScratch>,
+    w4a4: Option<Df2W4a4>,
     cos_table: CudaSlice<f32>,
     sin_table: CudaSlice<f32>,
     /// Ring KV: per layer `[nkv, RING_STRIDE, hd]` bf16.
@@ -498,6 +546,15 @@ impl Df2Round {
             let module = if kfnames.contains(n) { "gpu_kernels" } else { "gpu_batch" };
             bk.insert(n.to_string(), dev.get_func(module, n).with_context(|| format!("kernel {n} not in ptx"))?);
         }
+        let w4a4 = if mixed && Df2W4a4::requested() {
+            anyhow::ensure!(!sharded, "GB10_DF2_W4A4 is not implemented for sharded rounds");
+            Some(Df2W4a4::build(&dev)?)
+        } else {
+            if Df2W4a4::requested() && !mixed {
+                eprintln!("[df2] GB10_DF2_W4A4 requested for a BF16 drafter — keeping BF16 projections");
+            }
+            None
+        };
 
         let mut layers = Vec::with_capacity(N_LAYERS);
         for l in &w.layers {
@@ -643,6 +700,7 @@ impl Df2Round {
             mr_input: alloc_z(INTER * BLOCK),
             prime_mr: alloc_z(HIDDEN * max_c),
             calib: None,
+            w4a4,
             cos_table, sin_table, k_ring, v_ring, nprev: 0,
             staging,
             sink: None,
@@ -684,7 +742,8 @@ impl Df2Round {
         if mixed {
             anyhow::ensure!(!sharded, "MR-GPTQ DFlash2 round sharding is not implemented yet");
             round.install_quantized_projections(dir)?;
-            eprintln!("[df2] loaded mixed MR-GPTQ/NVFP4 drafter artifact (35 projections)");
+            eprintln!("[df2] loaded mixed MR-GPTQ/NVFP4 drafter artifact (35 projections, {})",
+                      if round.w4a4.is_some() { "round W4A4 / context W4A16" } else { "W4A16" });
         }
         Ok(round)
     }
@@ -710,7 +769,7 @@ impl Df2Round {
                 let stem = format!("layers.{li}.{suffix}");
                 anyhow::ensure!(rd.metas.contains_key(&format!("{stem}.weight_packed")),
                                 "mixed DFlash2 artifact misses {stem}.weight_packed");
-                let w = load_round_nvfp4(&self.dev, &rd, &stem, m, k, rotated)?;
+                let w = load_round_nvfp4(&self.dev, &rd, &stem, m, k, rotated, self.w4a4.is_some())?;
                 match suffix {
                     "self_attn.q_proj" => self.layers[li].q_proj = w,
                     "self_attn.k_proj" => self.layers[li].k_proj = w,
@@ -959,13 +1018,43 @@ impl Df2Round {
             (d(out), d(w), x_ptr, outn as i32, inn as i32));
     }
 
-    /// Fixed-width (N=8) projection dispatch. Quantized DFlash2 projections use the same
-    /// W4A16 MMA kernel as the target decode path; MR tensors rotate their activation first.
-    fn gemm_weight(&self, out: &CudaSlice<bf16>, w: &RoundWeight, x_ptr: u64,
-                   outn: usize, inn: usize) {
+    /// Launch one fixed-N=8 W4A4 projection from row-major activation/output pointers.
+    fn gemm_w4a4(&self, out_ptr: u64, w4: &Df2W4a4, wq: &CudaSlice<u8>, ws: &CudaSlice<u8>,
+                  gs: &CudaSlice<f32>, x_ptr: u64, outn: usize, inn: usize,
+                  rows: usize, xgs: f32) {
+        assert!(rows == BLOCK && inn <= w4.k_max);
+        assert!(inn % 64 == 0 && outn % 16 == 0);
+        let pad8 = rows.div_ceil(8) * 8;
+        unsafe {
+            w4.quant.clone().launch_on_stream(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: ((inn / 64) as u32, (pad8 / 8) as u32, 1),
+                    block_dim: (256, 1, 1), shared_mem_bytes: 0,
+                },
+                (x_ptr, inn as i32, rows as i32, pad8 as i32,
+                 d(&w4.bq), d(&w4.sb), xgs),
+            ).expect("df2 w4a4 quant launch");
+            w4.gemm.clone().launch_on_stream(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1),
+                    block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM,
+                },
+                (d(wq), d(ws), d(&w4.bq), d(&w4.sb), d(gs), out_ptr,
+                 outn as i32, rows as i32, inn as i32, 1.0f32 / xgs),
+            ).expect("df2 w4a4 gemm launch");
+        }
+    }
+
+    /// Fixed-width (N=8) projection dispatch. MR tensors rotate their activation first; an
+    /// explicit DFlash2 A4 policy uses the same quantized activation path as prompt prime.
+    fn gemm_weight_impl(&self, out: &CudaSlice<bf16>, w: &RoundWeight, x_ptr: u64,
+                        outn: usize, inn: usize, allow_w4a4: bool) {
         match w {
             RoundWeight::Bf16(w) => self.gemm_dsp(out, w, x_ptr, outn, inn),
-            RoundWeight::Nvfp4 { qweight, scales, gs, m, k, rotated, .. } => {
+            RoundWeight::Nvfp4 { qweight, scales, w4_qweight, w4_scales, gs, input_gs,
+                                 m, k, rotated, .. } => {
                 assert_eq!((*m, *k), (outn, inn), "df2 nvfp4 projection shape");
                 let xp = if *rotated {
                     let blocks = inn * BLOCK / 16;
@@ -973,12 +1062,27 @@ impl Df2Round {
                         (d(&self.mr_input), x_ptr, blocks as i64));
                     d(&self.mr_input)
                 } else { x_ptr };
+                if let (true, Some(w4), Some(wq), Some(ws), Some(xgs)) =
+                    (allow_w4a4, self.w4a4.as_ref(), w4_qweight.as_ref(), w4_scales.as_ref(), *input_gs) {
+                    self.gemm_w4a4(d(out), w4, wq, ws, gs, xp, outn, inn, BLOCK, xgs);
+                    return;
+                }
                 let persistent = (crate::gpu::GB10_SMS * 6).min(outn / 16) as u32;
                 klaunch!(self, "gemm_mma_fp4_b", (persistent, 1, 1), (256, 1, 1), 0,
                     (d(out), d(qweight), d(scales), d(gs), xp,
                      outn as i32, inn as i32, BLOCK as i32, 0u64, 0i32));
             }
         }
+    }
+
+    fn gemm_weight(&self, out: &CudaSlice<bf16>, w: &RoundWeight, x_ptr: u64,
+                   outn: usize, inn: usize) {
+        self.gemm_weight_impl(out, w, x_ptr, outn, inn, true);
+    }
+
+    fn gemm_weight_context(&self, out: &CudaSlice<bf16>, w: &RoundWeight, x_ptr: u64,
+                           outn: usize, inn: usize) {
+        self.gemm_weight_impl(out, w, x_ptr, outn, inn, false);
     }
 
     /// Large-M GEMM (S3F's ctx-side kernel): out [outn, m] = w [outn, k] x x [k, m] col-major bf16.
@@ -989,8 +1093,9 @@ impl Df2Round {
             (d(out), d(w), x_ptr, outn as i32, k as i32, m as i32));
     }
 
-    /// Large-M prompt-prime dispatch. The quantized matrix is dequantized once at load;
-    /// only the activation Hadamard is performed here, preserving the MR basis exactly.
+    /// Large-M prompt-prime dispatch. The quantized matrix is dequantized once at load; only the
+    /// activation Hadamard is performed here, preserving both the MR basis and the W4A16 context
+    /// contract shared with incremental injection.
     fn gemm_tiled_weight(&self, out: &CudaSlice<bf16>, w: &RoundWeight, x_ptr: u64,
                          outn: usize, k: usize, m: usize) {
         match w {
@@ -1096,10 +1201,10 @@ impl Df2Round {
         self.gather_rope(&self.cos_c, &self.sin_c, d(&self.pos_c), m);
         for li in 0..N_LAYERS {
             let l = &self.layers[li];
-            self.gemm_weight(&self.kc, &l.k_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
+            self.gemm_weight_context(&self.kc, &l.k_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
             self.rmsnorm_perhead(&self.kc, &l.k_norm, nkv, m);
             self.rope(&self.kc, &self.cos_c, &self.sin_c, nkv, m);
-            self.gemm_weight(&self.vc, &l.v_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
+            self.gemm_weight_context(&self.vc, &l.v_proj, d(&self.th), nkv * HEAD_DIM, HIDDEN);
             klaunch!(self, "write_kv_b", grid(m * nkv * HEAD_DIM), (256, 1, 1), 0,
                 (d(&self.k_ring[li]), d(&self.v_ring[li]), d(&self.kc), d(&self.vc),
                  d(&self.wrow_c), RING_STRIDE as i32, nkv as i32, HEAD_DIM as i32,
@@ -1268,6 +1373,7 @@ impl Df2Round {
         let (wt, st) = crate::quant::repack_nvfp4_mma(qw, sc, m, k);
         let w = RoundWeight::Nvfp4 {
             qweight: self.dev.htod_sync_copy(&wt)?, scales: self.dev.htod_sync_copy(&st)?,
+            w4_qweight: None, w4_scales: None, input_gs: None,
             gs: self.dev.htod_sync_copy(&vec![1.0 / global_scale; m / 16])?,
             prime_bf16: self.dev.htod_sync_copy(&prime)?, m, k, rotated,
         };
@@ -1588,9 +1694,9 @@ impl Df2Round {
         self.dev.htod_sync_copy_into(&[ntot as i32], self.ntot_buf.as_mut().unwrap())?;
         self.dev.htod_sync_copy_into(&[anchor], self.anchor_buf.as_mut().unwrap())?;
         self.gather_rope(&self.blk.cos8, &self.blk.sin8, d(&self.pos_blk), BLOCK);
-        self.dev.synchronize()?;
+        // gather_rope and the graph replay use the same blocking stream, so stream ordering is
+        // sufficient here. The synchronous token D2H below is the single completion fence.
         g.launch();
-        self.dev.synchronize()?;
         let tokens: Vec<u32> = self.dev.dtoh_sync_copy(&self.walk_tokens)?.to_vec();
         Ok(tokens)
     }

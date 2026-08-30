@@ -210,6 +210,8 @@ fn print_help() {
     println!("                             artifact is absent/failed (never a hard failure); none =");
     println!("                             plain decode. S6F owns per-domain routing.");
     println!("    --draft-dir <dir>         S5F: the DFlash2 artifact dir for --spec-source=dflash2");
+    println!("    GB10_DF2_W4A4=1          Run the quantized drafter's 35 projections with A4 inputs");
+    println!("                               (explicit numerical/performance A/B; unset = W4A16 fallback).");
     println!("    --df2-round-shard <on|off> P2: shard the DFlash2 drafter round across the TP ranks");
     println!("                               (TP>2 only; head+selector stay replicated; the sharded");
     println!("                               round adds 2 all-reduces/layer on the trunk's AR path).  [on]");
@@ -326,6 +328,8 @@ fn print_help() {
     println!("  --mxfp4=on|off           QWEN: run fp4 decode/verify GEMMs on the native sm_121a");
     println!("                           OMMA path (same NVFP4 artifacts, lossless repack) — DEFAULT");
     println!("                           OFF; on = the tolerance-fork chain (acceptance re-baselined)");
+    println!("  GB10_W4A4_VERIFY=groups  W4A4 for decode AND verify N<=16 (1 = attn,mlp,gdn).");
+    println!("                           Explicit A/B; unset preserves the W4A16 narrow chain.");
     println!("  --probe-splitk           Split-K A/B sweep per shape (interleaved S, best-of-N);");
     println!("                           --shapes MxK,... overrides the default family set");
     println!("  --probe-moe-gemm         E11 MoE slot-fold A/B: synthetic weights at the fold decode");
