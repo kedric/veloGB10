@@ -13352,11 +13352,19 @@ impl GpuModel {
         self.zero_slot_state(state, 0, kv_stride);
         let (_first, residual) = self.prefill_batch(pool, tokens, state, 0, kv_stride, 0);
 
-        // prefill returns the PRE-final-norm hidden; logits_batch expects post-norm.
+        // prefill returns the PRE-final-norm hidden; logits_batch expects post-norm. On qwen4_exp
+        // the residual is the hyper-connected stream [n, rw] and the "final norm" is the
+        // hyper_connection_mixer (the serving path's branch in prefill_batch_range) — applying
+        // rmsnorm_b(final_norm) to it scored NaN on every window.
+        let rw = cfg.resid_width();
         let out = pool.get_bf16(h * n);
-        blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
-            (d(&out), d(&residual), d(&self.final_norm), h as i32, n as i32, fbits(cfg.rms_eps)));
-        pool.release_bf16(residual, h * n);
+        if let Some(m) = self.hc_mixer.as_ref() {
+            self.hc_pre(pool, &out, None, d(&residual), m, n);
+        } else {
+            blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
+                (d(&out), d(&residual), d(&self.final_norm), h as i32, n as i32, fbits(cfg.rms_eps)));
+        }
+        pool.release_bf16(residual, rw * n);
 
         let logits = self.logits_batch(pool, &out, n);
         pool.release_bf16(out, h * n);
