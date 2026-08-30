@@ -6681,6 +6681,9 @@ impl GpuModel {
     /// layout byte-for-byte, so the assert accepts both.
     pub fn kvq_row_bytes(&self, hd: usize) -> usize {
         assert!((self.kv_quant || self.kv_k8v4) && hd % 16 == 0, "kvq layout needs hd % 16 == 0");
+        // The packed readers (gqa_attn_splitk_q4 / _k8v4) dequantize DPL = hd/32 dims per lane in
+        // u16 groups of 4 nibbles: hd < 128 makes that loop empty and K/V read as ZEROS silently.
+        assert!(hd % 128 == 0 && hd <= 512, "the q4/k8v4 KV readers need head_dim % 128 == 0 and <= 512 (got {hd}); use --kv-cache bf16");
         (hd / 16) * 12
     }
 

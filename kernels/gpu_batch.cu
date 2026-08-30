@@ -1901,7 +1901,7 @@ extern "C" __global__ void compact_kv_b(__nv_bfloat16* k_cache, __nv_bfloat16* v
 //
 // Layout per (slot, kvh, position): hd/16 blocks × 9 B = [8 B codes (16×4b)] [1 B e4m3 scale].
 // The SAME e4m3 codec the NVFP4 weights use (round to nearest, low nibble = element 2j, high = 2j+1).
-// Per-block scale = amax/7 (e4m3), codes = round(x/scale) clamped to [-7, 7]. Deterministic and
+// Per-block scale = e4m3(amax/7), codes = round(x / e4m3(amax/7)) clamped to [-7, 7]. Deterministic and
 // position-local: the packed form of position p depends only on (kvh, p), never on batch or the
 // reduction structure — so decode, verify, and the prefill scratch all dequantize to the SAME
 // values and the lossless-MTP contract (bitwise verify==decode) is preserved by construction.
@@ -1921,8 +1921,13 @@ __device__ __forceinline__ void kvq16_pack(const __nv_bfloat16* x, unsigned char
     float amax = 0.f;
     #pragma unroll
     for (int i = 0; i < KVQ_BLK; i++) amax = fmaxf(amax, fabsf(b2f(x[i])));
-    const float inv_s = amax > 0.f ? 7.0f / amax : 0.f;
-    const float s = amax > 0.f ? amax / 7.0f : 0.f;
+    // Round the scale to e4m3 FIRST and code with the rounded value (the weight quantizer's
+    // convention, quant.rs). Coding with the exact amax/7 while the readers dequantize with the
+    // e4m3-rounded byte gave every block a common-mode gain error of up to +-6.25% (3 mantissa
+    // bits) on top of the +-0.5 LSB code error: +2..6% relL2 for nothing. f32_to_e4m3 is the exact
+    // inverse of e4m3_f on representable values, so the stored byte is the scale the codes used.
+    const float s = amax > 0.f ? e4m3_f(f32_to_e4m3(amax / 7.0f)) : 0.f;
+    const float inv_s = s > 0.f ? 1.0f / s : 0.f;
     unsigned char c[KVQ_BLK / 2];
     #pragma unroll
     for (int j = 0; j < KVQ_BLK / 2; j++) {
@@ -2063,8 +2068,10 @@ __device__ __forceinline__ void kv8_pack16(const __nv_bfloat16* x, unsigned char
     float amax = 0.f;
     #pragma unroll
     for (int i = 0; i < KVQ_BLK; i++) amax = fmaxf(amax, fabsf(b2f(x[i])));
-    const float inv_s = amax > 0.f ? 127.0f / amax : 0.f;   // amax==0 -> s=0, codes 0 (the q4 convention)
-    const float s = amax > 0.f ? amax / 127.0f : 0.f;
+    // Same convention as kvq16_pack: round the scale to its stored precision (fp16) first, then
+    // code with the rounded value, so the coder and the readers agree on the scale exactly.
+    const float s = amax > 0.f ? __half2float(__float2half(amax / 127.0f)) : 0.f;   // amax==0 -> s=0, codes 0
+    const float inv_s = s > 0.f ? 1.0f / s : 0.f;
     signed char c[KVQ_BLK];
     #pragma unroll
     for (int i = 0; i < KVQ_BLK; i++) {
