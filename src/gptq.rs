@@ -203,6 +203,43 @@ pub struct GptqOpts {
 /// `igs`: the W4A4 input global scale (6·448 / calibration activation amax), written as
 /// `{stem}.input_global_scale` — None for tensors the calibration never fed (RTN groups).
 struct Rec { qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32, igs: Option<f32> }
+
+fn write_df2_checkpoint(path: &Path, recs: &[(String, &Rec)]) -> Result<()> {
+    let meta: Vec<serde_json::Value> = recs.iter().map(|(name, r)| serde_json::json!({
+        "name": name, "m": r.m, "k": r.k, "gs": r.gs, "igs": r.igs,
+        "qw": r.qw.len(), "sc": r.sc.len()
+    })).collect();
+    let hdr = serde_json::to_vec(&meta)?;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&(hdr.len() as u64).to_le_bytes())?;
+    f.write_all(&hdr)?;
+    for (_, r) in recs { f.write_all(&r.qw)?; f.write_all(&r.sc)?; }
+    f.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn read_df2_checkpoint(path: &Path) -> Result<Vec<(String, Rec)>> {
+    let mut f = std::fs::File::open(path)?;
+    let mut lb = [0u8; 8]; f.read_exact(&mut lb)?;
+    let mut hb = vec![0u8; u64::from_le_bytes(lb) as usize]; f.read_exact(&mut hb)?;
+    let meta: Vec<serde_json::Value> = serde_json::from_slice(&hb)?;
+    let mut out = Vec::with_capacity(meta.len());
+    for m in meta {
+        let qn = m["qw"].as_u64().ok_or_else(|| anyhow!("bad DFlash2 checkpoint qw"))? as usize;
+        let sn = m["sc"].as_u64().ok_or_else(|| anyhow!("bad DFlash2 checkpoint sc"))? as usize;
+        let mut qw = vec![0u8; qn]; let mut sc = vec![0u8; sn];
+        f.read_exact(&mut qw)?; f.read_exact(&mut sc)?;
+        out.push((m["name"].as_str().ok_or_else(|| anyhow!("bad DFlash2 checkpoint name"))?.to_string(), Rec {
+            qw, sc, m: m["m"].as_u64().unwrap() as usize, k: m["k"].as_u64().unwrap() as usize,
+            gs: m["gs"].as_f64().unwrap() as f32, igs: m["igs"].as_f64().map(|x| x as f32),
+        }));
+    }
+    let mut tail = [0u8; 1];
+    anyhow::ensure!(f.read(&mut tail)? == 0, "trailing bytes in {}", path.display());
+    Ok(out)
+}
 /// Token subsample kept per layer for the down-projection fallback Hessians.
 const MOE_SUB_TOKENS: usize = 16384;
 fn mem_available_gb() -> f64 {
@@ -799,6 +836,208 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     Ok(())
 }
 
+/// Sequential MR-GPTQ for the 5-layer DFlash2 drafter. Target prompt taps are captured with
+/// the production W4A4 prefill enabled, projected once, and cached beside the output. Each draft
+/// layer is then calibrated on the already-quantized prefix of the drafter stack.
+pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
+               opts: GptqOpts, context_vectors: usize) -> Result<()> {
+    use crate::dflash2::{BLOCK as DB, HEAD_DIM, HIDDEN, INTER, N_LAYERS, NUM_HEADS, NUM_KV_HEADS};
+    use crate::dflash2::capture::Df2PrimeSink;
+    use crate::dflash2::round::Df2Round;
+
+    anyhow::ensure!(opts.rotate, "--gptq-dflash2 requires --rotate (MR-GPTQ artifact)");
+    anyhow::ensure!((1..=8192).contains(&opts.seqlen), "DFlash2 calibration seqlen must be 1..8192");
+    anyhow::ensure!(context_vectors > 0 && context_vectors <= opts.seqlen,
+                    "--df2-context-vectors must be 1..seqlen");
+    prepare_output_dir(out, &[source, target])?;
+    let cache = PathBuf::from(format!("{}.calib-cache", out.display()));
+    std::fs::create_dir_all(&cache)?;
+    let t_all = std::time::Instant::now();
+    let manifest = serde_json::json!({
+        "source": std::fs::canonicalize(source)?, "target": std::fs::canonicalize(target)?,
+        "calib": std::fs::canonicalize(calib)?, "calib_bytes": std::fs::metadata(calib)?.len(),
+        "nsamples": opts.nsamples, "seqlen": opts.seqlen, "damp": opts.damp,
+        "clip": opts.nclip, "scale_iters": opts.scale_iters,
+        "static_act_order": opts.static_act_order, "context_vectors": context_vectors,
+    });
+    let mp = cache.join("manifest.json");
+    if mp.exists() {
+        let old: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mp)?)?;
+        anyhow::ensure!(old == manifest, "{} belongs to a different DFlash2 calibration recipe", cache.display());
+    } else {
+        std::fs::write(&mp, serde_json::to_string_pretty(&manifest)?)?;
+    }
+
+    // This is the exact production target prefill requested by the recipe. DFlash2's own
+    // projections remain W4A16 at N=8; their IGS is still recorded for future native A4 work.
+    std::env::set_var("GB10_W4A4_PREFILL", "attn,mlp,gdn");
+    if std::env::var("GB10_PLE_OFFLOAD").is_err() { std::env::set_var("GB10_PLE_OFFLOAD", "ssd"); }
+    let src = ShardReader::open(source)?;
+    let (mut gpu, cfg) = GpuModel::load_from_dir(&target.to_string_lossy())?;
+    anyhow::ensure!(gpu.df2_round_compatible(), "target model is not dimension-compatible with DFlash2");
+    let samples = calib_tokens(target, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
+    let (head, embed) = gpu.df2_borrow().ok_or_else(|| anyhow!("target lm_head/embed cannot be borrowed"))?;
+    let mut round = Df2Round::load(&source.to_string_lossy(), Some(head), Some(embed), opts.seqlen + DB)?;
+    round.set_head_hadamard16(gpu.df2_head_hadamard16());
+    let prime = std::sync::Arc::new(Df2PrimeSink::new(gpu.gptq_dev(), opts.seqlen));
+    gpu.set_df2_prime_sink(prime.clone());
+    let mut pool = Pool::new(gpu.gptq_dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, opts.seqlen);
+    println!("[gptq-df2] cache: {} samples × {} W4A4-prefill tokens → {}",
+             samples.len(), opts.seqlen, cache.display());
+    for (si, toks) in samples.iter().enumerate() {
+        let sample_path = cache.join(format!("{si:06}.bin"));
+        if std::fs::metadata(&sample_path).map(|m| m.len() as usize).ok()
+            == Some(4 + HIDDEN * opts.seqlen * 2) { continue; }
+        gpu.zero_slot_state(&mut state, 0, opts.seqlen);
+        let (anchor, residual) = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0,
+            opts.seqlen, 0, 0, cfg.num_layers, None);
+        gpu.gptq_sync();
+        let th = round.project_taps_host(&prime.taps, opts.seqlen)?;
+        let mut raw = Vec::with_capacity(4 + th.len() * 2);
+        raw.extend_from_slice(&anchor.to_le_bytes());
+        raw.extend_from_slice(bytemuck::cast_slice(&th));
+        let tmp = sample_path.with_extension("tmp");
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(tmp, sample_path)?;
+        pool.release_bf16(residual, HIDDEN * opts.seqlen);
+        if (si + 1) % 8 == 0 || si + 1 == samples.len() {
+            println!("[gptq-df2] tap cache {}/{} ({:.1} min)", si + 1, samples.len(), t_all.elapsed().as_secs_f32()/60.0);
+        }
+    }
+    gpu.set_df2_prime_off();
+    drop(state); drop(pool); drop(prime);
+
+    let mut cs = Cusolver::new(&gpu)?;
+    let mut records: HashMap<String, Rec> = HashMap::new();
+    let specs = [
+        ("self_attn.q_proj", NUM_HEADS * HEAD_DIM, HIDDEN, 0usize),
+        ("self_attn.k_proj", NUM_KV_HEADS * HEAD_DIM, HIDDEN, 1usize),
+        ("self_attn.v_proj", NUM_KV_HEADS * HEAD_DIM, HIDDEN, 1usize),
+        ("self_attn.o_proj", HIDDEN, NUM_HEADS * HEAD_DIM, 2usize),
+        ("mlp.gate_proj", INTER, HIDDEN, 3usize),
+        ("mlp.up_proj", INTER, HIDDEN, 3usize),
+        ("mlp.down_proj", HIDDEN, INTER, 4usize),
+    ];
+    for li in 0..N_LAYERS {
+        let checkpoint = cache.join(format!("layer-{li}.records"));
+        if checkpoint.exists() {
+            let saved = read_df2_checkpoint(&checkpoint)?;
+            anyhow::ensure!(saved.len() == specs.len(), "{} has {} records, expected {}", checkpoint.display(), saved.len(), specs.len());
+            for (name, r) in saved {
+                let prefix = format!("layers.{li}.");
+                let suffix = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".weight"))
+                    .ok_or_else(|| anyhow!("bad DFlash2 checkpoint tensor {name}"))?;
+                round.install_calibrated_projection(li, suffix, &r.qw, &r.sc, r.gs, r.m, r.k, true)?;
+                records.insert(name, r);
+            }
+            println!("[gptq-df2] layer {li}: restored checkpoint {}", checkpoint.display());
+            continue;
+        }
+        let tl = std::time::Instant::now();
+        let mut hq = gpu.gptq_hess_new(HIDDEN);
+        let mut hkv = gpu.gptq_hess_new(HIDDEN);
+        let mut ho = gpu.gptq_hess_new(NUM_HEADS * HEAD_DIM);
+        let mut hgu = gpu.gptq_hess_new(HIDDEN);
+        let mut hdn = gpu.gptq_hess_new(INTER);
+        for si in 0..samples.len() {
+            let raw = std::fs::read(cache.join(format!("{si:06}.bin")))?;
+            anyhow::ensure!(raw.len() == 4 + HIDDEN * opts.seqlen * 2, "corrupt DFlash2 cache sample {si}");
+            let anchor = u32::from_le_bytes(raw[..4].try_into().unwrap());
+            let th: &[bf16] = bytemuck::cast_slice(&raw[4..]);
+            round.reset();
+            round.prime_projected(th, opts.seqlen, 0)?;
+            let x = round.capture_layer_inputs(anchor, li)?;
+            let qd = gpu.gptq_upload_bf16(&x.qkv);
+            let od = gpu.gptq_upload_bf16(&x.o);
+            let gud = gpu.gptq_upload_bf16(&x.gate_up);
+            let dnd = gpu.gptq_upload_bf16(&x.down);
+            gpu.gptq_hess_accum_external(&mut hq, &qd, DB, true);
+            gpu.gptq_hess_accum_external(&mut hkv, &qd, DB, true);
+            gpu.gptq_hess_accum_external(&mut ho, &od, DB, true);
+            gpu.gptq_hess_accum_external(&mut hgu, &gud, DB, true);
+            gpu.gptq_hess_accum_external(&mut hdn, &dnd, DB, true);
+            // Evenly sample prompt context for k/v. Full 2048-token Hessians are redundant and
+            // would dominate runtime; 16/sample gives 8192 context vectors at nsamples=512.
+            let mut sub = Vec::with_capacity(HIDDEN * context_vectors);
+            for j in 0..context_vectors {
+                let c = ((j + 1) * opts.seqlen / (context_vectors + 1)).min(opts.seqlen - 1);
+                sub.extend_from_slice(&th[c * HIDDEN..(c + 1) * HIDDEN]);
+            }
+            let td = gpu.gptq_upload_bf16(&sub);
+            gpu.gptq_hess_accum_external(&mut hkv, &td, context_vectors, true);
+            if (si + 1) % 16 == 0 || si + 1 == samples.len() { gpu.gptq_sync(); }
+        }
+        println!("[gptq-df2] layer {li}: Hessians q={} kv={} o={} gu={} down={} vectors",
+                 hq.n, hkv.n, ho.n, hgu.n, hdn.n);
+        for &(suffix, m, k, hk) in &specs {
+            let name = format!("layers.{li}.{suffix}.weight");
+            let (shape, host) = src.read_bf16(&name)?;
+            anyhow::ensure!(shape == vec![m, k], "{name}: shape {shape:?}, expected [{m},{k}]");
+            let wd = gpu.gptq_upload_bf16(&host);
+            let hess = match hk { 0 => &hq, 1 => &hkv, 2 => &ho, 3 => &hgu, 4 => &hdn, _ => unreachable!() };
+            let r = gptq_2d(&gpu, &mut cs, *wd.device_ptr() as u64, m, k, &hess.h,
+                            &opts, None, gpu.gptq_amax(hess))?;
+            round.install_calibrated_projection(li, suffix, &r.qw, &r.sc, r.gs, m, k, true)?;
+            records.insert(name, r);
+        }
+        gpu.gptq_sync();
+        let saved: Vec<(String, &Rec)> = specs.iter().map(|(suffix, _, _, _)| {
+            let name = format!("layers.{li}.{suffix}.weight");
+            let r = records.get(&name).expect("fresh DFlash2 record");
+            (name, r)
+        }).collect();
+        write_df2_checkpoint(&checkpoint, &saved)?;
+        println!("[gptq-df2] layer {li}/{} quantized sequentially in {:.1} min",
+                 N_LAYERS - 1, tl.elapsed().as_secs_f32()/60.0);
+    }
+
+    drop(round); drop(cs); drop(gpu);
+    let mut writer = Writer::new(out, 4 * 1024 * 1024 * 1024);
+    for (name, meta) in &src.metas {
+        let stem = name.strip_suffix(".weight").unwrap_or(name);
+        if let Some(r) = records.remove(name) {
+            writer.push_nvfp4(stem, r.qw, r.sc, r.m, r.k, r.gs, r.igs);
+            continue;
+        }
+        let (_, data) = src.read_bytes(name)?;
+        let dtype = match meta.dtype.as_str() {
+            "BF16" => safetensors::Dtype::BF16, "F32" => safetensors::Dtype::F32,
+            "I64" => safetensors::Dtype::I64, "U8" => safetensors::Dtype::U8,
+            o => return Err(anyhow!("dtype {o} on {name}")),
+        };
+        writer.push(Out { name: name.clone(), dtype, shape: meta.shape.clone(), data });
+    }
+    anyhow::ensure!(records.is_empty(), "unwritten DFlash2 GPTQ records: {}", records.len());
+    writer.finish()?;
+    for f in std::fs::read_dir(source)? {
+        let f = f?; let n = f.file_name().to_string_lossy().to_string();
+        if n.ends_with(".safetensors") || n == "model.safetensors.index.json" { continue; }
+        if !f.file_type()?.is_file() && !f.file_type()?.is_symlink() { continue; }
+        std::fs::copy(f.path(), out.join(&n))?;
+    }
+    let cp = out.join("config.json");
+    let mut cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cp)?)?;
+    cj["quantization_config"] = serde_json::json!({
+        "quant_method": "gptq", "format": "nvfp4-pack-quantized",
+        "activation_variant": "w4a16", "transform": { "type": "hadamard16", "groups": ["projections"] },
+        "gptq": { "nsamples": samples.len(), "seqlen": opts.seqlen, "damp": opts.damp,
+          "clip_ratios": opts.nclip, "activation_order": if opts.static_act_order { "static" } else { "none" },
+          "global_scale_optimization": { "type": "alternating_least_squares", "iterations": opts.scale_iters },
+          "context_vectors_per_sample": context_vectors, "sequential": true },
+        "calibration_target": { "model": target.display().to_string(),
+          "prefill": "GB10_W4A4_PREFILL=attn,mlp,gdn" },
+        "quantized_groups": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        "bf16_groups": ["fc", "conv", "norm", "selector"]
+    });
+    std::fs::write(&cp, serde_json::to_string_pretty(&cj)?)?;
+    if let Err(e) = std::fs::remove_dir_all(&cache) {
+        eprintln!("[gptq-df2] warning: could not remove cache {}: {e}", cache.display());
+    }
+    println!("[gptq-df2] done in {:.1} min → {}", t_all.elapsed().as_secs_f32()/60.0, out.display());
+    Ok(())
+}
+
 /// Quantize only the dense LM head of an existing MR-GPTQ artifact. This deliberately reuses the
 /// already-quantized trunk and calibrates on its real outputs, avoiding a second 64-layer GPTQ run.
 pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts) -> Result<()> {
@@ -1060,6 +1299,21 @@ mod tests {
             "{\"input_ids\":[1,2,3,4],\"text\":\"ignored\"}\n{\"input_ids\":[5,6,7,8],\"text\":\"ignored too\"}\n").unwrap();
         let samples = calib_tokens(Path::new("/tokenizer-is-deliberately-absent"), &path, 2, 4, 16).unwrap();
         assert_eq!(samples, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dflash2_checkpoint_roundtrip_is_exact() {
+        let path = std::env::temp_dir().join(format!("gptq-df2-checkpoint-{}.bin", std::process::id()));
+        let r = Rec { qw: vec![1, 2, 3, 4], sc: vec![9, 8], m: 16, k: 32,
+                      gs: 123.25, igs: Some(77.5) };
+        write_df2_checkpoint(&path, &[("layers.0.self_attn.q_proj.weight".into(), &r)]).unwrap();
+        let mut got = read_df2_checkpoint(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        let (name, q) = got.pop().unwrap();
+        assert_eq!(name, "layers.0.self_attn.q_proj.weight");
+        assert_eq!((q.qw, q.sc, q.m, q.k, q.gs, q.igs),
+                   (r.qw, r.sc, r.m, r.k, r.gs, r.igs));
         std::fs::remove_file(path).unwrap();
     }
 

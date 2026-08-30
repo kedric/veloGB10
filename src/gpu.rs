@@ -19975,7 +19975,9 @@ impl GpuModel {
 /// calibration token whose activation reached the tapped GEMM; `n` counts the tokens.
 pub struct GptqHess { pub k: usize, pub h: S, pub n: usize,
     /// |x| max over every calibration activation seen (float bits; `gptq_amax`) — the W4A4 `input_global_scale`.
-    pub amax: cudarc::driver::CudaSlice<u32> }
+    pub amax: cudarc::driver::CudaSlice<u32>,
+    /// Persistent MR amax scratch (capacity grows to the largest external activation batch).
+    rot_scratch: Option<B> }
 
 /// The armed taps of one calibration pass: bf16 GEMM weights by device pointer (`gemm_act`'s
 /// `W::Bf16` arm), plus the per-expert accumulators of the layer's bf16 routed experts
@@ -20002,7 +20004,7 @@ impl GpuModel {
     pub fn gptq_hess_new(&self, k: usize) -> GptqHess {
         let mut h = self.dev.alloc_zeros::<f32>(k * k).unwrap();
         self.dev.memset_zeros(&mut h).unwrap();
-        GptqHess { k, h, n: 0, amax: self.dev.htod_sync_copy(&[0u32]).unwrap() }
+        GptqHess { k, h, n: 0, amax: self.dev.htod_sync_copy(&[0u32]).unwrap(), rot_scratch: None }
     }
     pub fn gptq_arm(&self, tap: GptqTap) { *self.gptq_tap.lock().unwrap() = Some(tap); }
     pub fn gptq_disarm(&self) -> Option<GptqTap> { self.gptq_tap.lock().unwrap().take() }
@@ -20045,6 +20047,34 @@ impl GpuModel {
                 h_ptr as *mut _, cudaDataType::CUDA_R_32F, k as i32,
                 cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT).expect("gptq hessian gemm");
         }
+    }
+
+    /// Accumulate an externally staged bf16 activation matrix `[k,n]`. DFlash2 owns a
+    /// separate execution stream, so its calibration driver stages host snapshots onto the
+    /// trunk device before calling this method. H stays in the original basis; only the amax
+    /// copy is Hadamard-rotated, matching `gptq_h32` and the served MR activation path.
+    pub fn gptq_hess_accum_external(&self, acc: &mut GptqHess, x: &B, n: usize,
+                                    rotate_amax: bool) {
+        assert_eq!(x.len(), acc.k * n, "external GPTQ activation shape");
+        self.gptq_hess_accum(d(&acc.h), acc.k, d(x), n);
+        let ap = d(&acc.amax);
+        if rotate_amax {
+            let need = acc.k * n;
+            if acc.rot_scratch.as_ref().map_or(true, |b| b.len() < need) {
+                self.sync_stream();
+                acc.rot_scratch = Some(self.dev.alloc_zeros::<half::bf16>(need).expect("external GPTQ MR scratch"));
+            }
+            let xr = acc.rot_scratch.as_ref().unwrap();
+            unsafe { cudarc::driver::result::memcpy_dtod_async(d(xr), d(x), need * 2, self.stream.stream)
+                .expect("external GPTQ MR copy"); }
+            self.rot_inplace(xr, need);
+            blaunch!(self, "gptq_absmax_b", grid(acc.k * n), (256,1,1), 0,
+                (ap, d(xr), need as i64));
+        } else {
+            blaunch!(self, "gptq_absmax_b", grid(acc.k * n), (256,1,1), 0,
+                (ap, d(x), (acc.k * n) as i64));
+        }
+        acc.n += n;
     }
 
     /// `gemm_act` tap: a registered bf16 weight (by pointer) accumulates its input's Hessian.
@@ -20428,7 +20458,7 @@ impl GpuModel {
             t0 += nn;
         }
         self.sync_stream();
-        GptqHess { k: mi, h: hess.h, n, amax: hess.amax }
+        GptqHess { k: mi, h: hess.h, n, amax: hess.amax, rot_scratch: hess.rot_scratch }
     }
     /// Replace a layer's big linear weights by 1-element dummies (the `--gptq` driver loads the
     /// base artifact only for its embeddings / norms / PLE / MTP: every layer is rebuilt from the

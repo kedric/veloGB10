@@ -297,6 +297,10 @@ fn print_help() {
     println!("                           (--model-dir <bf16> --base <artifact> --out <dir> --calib <jsonl>");
     println!("                            --nsamples N --seqlen N --damp F --clip N --rotate)");
     println!("                           GB10_W4A4_LMHEAD_NARROW=1 enables true A4 at the head's N=1 GEMM");
+    println!("  --gptq-dflash2           Sequential MR-GPTQ/NVFP4 of the DFlash2 5-layer drafter");
+    println!("                           (--draft-dir <bf16-drafter> --model-dir <target-nvfp4>");
+    println!("                            --out <dir> --calib <jsonl> --nsamples 512 --seqlen 2048");
+    println!("                            --damp .01 --clip 7 --rotate --df2-context-vectors 16)");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
@@ -418,6 +422,30 @@ fn main() {
             std::path::Path::new(calib), opts)
         {
             eprintln!("ERROR: --gptq-lmhead failed: {e:#}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gptq-dflash2") {
+        let src = parse_arg(&args, "--draft-dir").expect("--gptq-dflash2 requires --draft-dir <bf16 drafter>");
+        let target = parse_arg(&args, "--model-dir").expect("--gptq-dflash2 requires --model-dir <target artifact>");
+        let out = parse_arg(&args, "--out").expect("--gptq-dflash2 requires --out <dir>");
+        let calib = parse_arg(&args, "--calib").expect("--gptq-dflash2 requires --calib <jsonl>");
+        let opts = gb10_inference::gptq::GptqOpts {
+            nsamples: parse_arg(&args, "--nsamples").and_then(|s| s.parse().ok()).unwrap_or(512),
+            seqlen: parse_arg(&args, "--seqlen").and_then(|s| s.parse().ok()).unwrap_or(2048),
+            damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
+            nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
+            rotate: args.iter().any(|a| a == "--rotate"),
+            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            static_act_order: !args.iter().any(|a| a == "--no-act-order"),
+            gptq_groups: vec![], nvfp4_groups: vec![], fp8_groups: vec![],
+        };
+        let ctx = parse_arg(&args, "--df2-context-vectors").and_then(|s| s.parse().ok()).unwrap_or(16);
+        if let Err(e) = gb10_inference::gptq::dflash2(
+            std::path::Path::new(src), std::path::Path::new(target), std::path::Path::new(out),
+            std::path::Path::new(calib), opts, ctx)
+        {
+            eprintln!("ERROR: --gptq-dflash2 failed: {e:#}"); std::process::exit(1);
         }
         return;
     }
