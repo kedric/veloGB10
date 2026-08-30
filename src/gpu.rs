@@ -20419,6 +20419,10 @@ impl GpuModel {
             }
             if has("hc") { if let Some((a, b)) = &l.hc { mark(&a.down); mark(&a.up); mark(&b.down); mark(&b.up); } }
             if has("ple") { if let Some(p) = &l.ple { mark(&p.key_proj); mark(&p.value_proj); } }
+            // the MoE router is GPTQ-able (`--gptq-groups router`): quantized in the rotated basis, so
+            // its input must be rotated at serving too (missing before 2026-08-30: a router-GPTQ
+            // artifact routed on unrotated logits and emitted EOS on every prompt).
+            if has("router") { if let Ffn::Moe(m) = &l.mlp { mark(&m.router); } }
         }
         if has("lmhead") {
             if let Some(w) = &self.lm_head { mark(w); }

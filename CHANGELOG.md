@@ -43,8 +43,10 @@ generic language where they aren't individually notable.
   quantizer's weight copy and never accumulated (those tensors silently got RTN); an empty
   Hessian is now an error, the QSA indexer reuses q_proj's; MR-GPTQ rotation is applied on the
   ≥128-token MoE prefill arm too (it was missing, breaking every rotated artifact past ~128
-  tokens); RTN groups are no longer marked rotated; `--gptq-refmt` copies config.json instead of
-  hard-linking (it edited the input artifact); output directories are guarded.
+  tokens); RTN groups are no longer marked rotated; the MoE router (`--gptq-groups router`) is
+  now marked rotated at load too (a router-GPTQ artifact routed on unrotated logits and answered
+  EOS to everything); `--gptq-refmt` copies config.json instead of hard-linking (it edited the
+  input artifact); output directories are guarded.
 - **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
   read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
   `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).
