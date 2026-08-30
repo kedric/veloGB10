@@ -2076,6 +2076,13 @@ impl GpuModel {
         Some((head, embed))
     }
 
+    /// Whether the exact lm_head borrowed by DFlash2 is marked Hadamard16-rotated.
+    pub fn df2_head_hadamard16(&self) -> bool {
+        self.df2_full_head.as_ref().or(self.lm_head.as_ref())
+            .map(|w| self.is_rotated(w))
+            .unwrap_or(false)
+    }
+
     /// S10' §4 — is this trunk dimension-compatible with the DFlash2 round? The round (the
     /// 3.8-27B drafter artifact) is hard-wired to HIDDEN=5120 (tap concat + fc + head GEMM),
     /// VOCAB=248320 (the borrowed lm_head's row count the head GEMM reads), and TAP_LAYERS

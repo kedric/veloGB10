@@ -3622,6 +3622,7 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
     // drafter artifact ships via --draft-dir / the shipped config, and every rank drafts the
     // SAME tokens (bit-identical taps from the all-reduced hiddens) so the verify all-reduces
     // stay in lockstep. The residency decision rides the post-load CalibTable message.
+    let head_hadamard16 = gpu.df2_head_hadamard16();
     let (head, embed) = match gpu.df2_borrow() {
         Some(p) => p,
         None => {
@@ -3661,6 +3662,7 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
             return None;
         }
     };
+    round.set_head_hadamard16(head_hadamard16);
     let sink = std::sync::Arc::new(Df2TapSink::new(gpu.dev()));
     round.attach_sink(&sink);
     let prime = std::sync::Arc::new(Df2PrimeSink::new(

@@ -216,6 +216,10 @@ pub struct Df2Round {
     /// serving trunk) or BF16 (the plain-BF16 class).
     pub head: Option<BorrowedW>,
     pub embed: Option<BorrowedW>,
+    // Whether the borrowed trunk lm_head expects Hadamard16-rotated activations.
+    head_hadamard16: bool,
+    // Dedicated `[HIDDEN, 7]` scratch: h_final must stay unrotated for the selector.
+    head_input: CudaSlice<bf16>,
     cos_table: CudaSlice<f32>,
     sin_table: CudaSlice<f32>,
     /// Ring KV: per layer `[nkv, RING_STRIDE, hd]` bf16.
@@ -392,7 +396,7 @@ impl Df2Round {
         let mut bfnames = ["rmsnorm_b", "rmsnorm_perhead_b", "rope_b", "gather_rope_b",
             "write_kv_b", "add_residual_b", "silu_mul_b", "kernel_build_id",
             "gemm_mma_fp4_b", "embed_gather_fp4_tiled_b", "dequant_fp4_tiled_b",
-            "embed_gather_b", "gemm_binv_b"].to_vec();
+            "embed_gather_b", "gemm_binv_b", "gptq_rotate_act_b"].to_vec();
         // P2: the all-reduce handshake kernels live in gpu_batch.cu (the trunk AR path's module);
         // f32tobf16 lives in gpu_kernels.cu — it joins kfnames below (a name from the wrong
         // module is a load-time CUDA_ERROR_NOT_FOUND, caught live at the first SHARD=on boot).
@@ -556,6 +560,8 @@ impl Df2Round {
         }
         Ok(Self {
             dev, stream, bk, layers, glob, hp_w, pred_cb, succ_cb, head, embed,
+            head_hadamard16: false,
+            head_input: alloc_z(HIDDEN * 7),
             cos_table, sin_table, k_ring, v_ring, nprev: 0,
             staging,
             sink: None,
@@ -725,21 +731,37 @@ impl Df2Round {
     /// the N-clamped X reads) or BF16 (`gemm_binv_b`, NC=7 specialization, the batch-invariant
     /// fixed-order reduction — the same kernel the bf16 serving chain's logits use).
     fn head_logits(&self) {
+        let h_final = d(&self.blk.h_final) + (HIDDEN * 2) as u64;
+        let head_input = if self.head_hadamard16 {
+            let blocks = HIDDEN * 7 / 16;
+            klaunch!(self, "gptq_rotate_act_b", grid(blocks), (256, 1, 1), 0,
+                (d(&self.head_input), h_final, blocks as i64));
+            d(&self.head_input)
+        } else {
+            h_final
+        };
         match self.head.expect("head ptrs") {
             BorrowedW::Nvfp4(p) => {
                 let persistent = (crate::gpu::GB10_SMS * 6).min(VOCAB / 16) as u32;
                 klaunch!(self, "gemm_mma_fp4_b", (persistent, 1, 1), (256, 1, 1), 0,
                     (d(&self.logits), p.qweight, p.scales, p.gs,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
+                     head_input,
                      VOCAB as i32, HIDDEN as i32, 7i32, 0u64, 0i32));
             }
             BorrowedW::Bf16 { ptr } => {
                 let smem = (7 * 256 * 4) as u32;
                 klaunch!(self, "gemm_binv_b", (VOCAB as u32, 1, 1), (256, 1, 1), smem,
-                    (d(&self.logits), ptr,
-                     d(&self.blk.h_final) + (HIDDEN * 2) as u64,
+                    (d(&self.logits), ptr, head_input,
                      VOCAB as i32, HIDDEN as i32, 7i32));
             }
+        }
+    }
+
+    /// Configure the activation transform expected by the borrowed trunk lm_head.
+    pub fn set_head_hadamard16(&mut self, enabled: bool) {
+        self.head_hadamard16 = enabled;
+        if enabled {
+            eprintln!("[df2] borrowed lm_head uses hadamard16; rotating DFlash2 h_final before the head GEMM");
         }
     }
 
