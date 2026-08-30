@@ -328,8 +328,9 @@ fn print_help() {
     println!("  --mxfp4=on|off           QWEN: run fp4 decode/verify GEMMs on the native sm_121a");
     println!("                           OMMA path (same NVFP4 artifacts, lossless repack) — DEFAULT");
     println!("                           OFF; on = the tolerance-fork chain (acceptance re-baselined)");
-    println!("  GB10_W4A4_VERIFY=groups  W4A4 for decode AND verify N<=16 (1 = attn,mlp,gdn).");
-    println!("                           Explicit A/B; unset preserves the W4A16 narrow chain.");
+    println!("  GB10_W4A4_VERIFY=groups  EXPERIMENTAL W4A4 decode+verify; fails the lossless gate.");
+    println!("                           Leave unset in production to preserve the W4A16 narrow chain.");
+    println!("  GB10_W4A4_N8=0           Restore the wide narrow-path GEMM for performance A/B.");
     println!("  --probe-splitk           Split-K A/B sweep per shape (interleaved S, best-of-N);");
     println!("                           --shapes MxK,... overrides the default family set");
     println!("  --probe-moe-gemm         E11 MoE slot-fold A/B: synthetic weights at the fold decode");

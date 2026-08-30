@@ -29,7 +29,7 @@ Serve on one GB10 with the quantized directory as `--draft-dir`:
 
 ```bash
 GB10_W4A4_PREFILL=attn,mlp,gdn \
-GB10_W4A4_VERIFY=attn,mlp,gdn \
+GB10_DF2_W4A4=1 \
 target/release/gb10_inference --server \
   --model-dir "$HOME/models/Qwen3.8-27B-MR-GPTQ-NVFP4-v5" \
   --draft-dir "$HOME/models/Qwen3.8-27B-DFlash2-MR-GPTQ-NVFP4-v1" \
@@ -37,15 +37,18 @@ target/release/gb10_inference --server \
   --max-seq-len 226114 --max-batch 1 --prefix-cache on
 ```
 
-`GB10_W4A4_VERIFY` applies the same activation-A4 path to plain decode and speculative verify
-(N≤16), keeping those two numerical targets coherent. The drafter remains a single-lane path,
-so `--max-batch 1` is the latency-oriented setting.
+Leave `GB10_W4A4_VERIFY` unset in production. Although it applies activation A4 to plain decode
+and speculative verify, the complete target chain is not batch-bit-invariant and fails the binding
+lossless probe. The W4A16 target decode/verify path with W4A4 prefill and drafter passes all six
+lossless prompts, including both 2k-token cases. The drafter remains a single-lane path, so
+`--max-batch 1` is the latency-oriented setting.
 
-`GB10_DF2_W4A4=1` is the explicit experimental A/B arm for A4 inputs on the 35 fixed-N=8
-drafter-block projections. Prompt prime and incremental context injection deliberately remain
-W4A16 so they build the same KV ring. On the GB10 validation host this arm was slightly slower
-than W4A16 (graph median 9.888 ms vs 9.740 ms), so leave it unset for the current best latency;
-the option remains available for future kernel tuning and quality/performance evaluation.
+`GB10_DF2_W4A4=1` enables A4 inputs on the 35 fixed-N=8 drafter-block projections. The specialized
+8-row kernel avoids computing the unused rows of the 128-row prefill tile. On the GB10 validation
+host it reduced the draft graph median from 9.909 ms (wide W4A4) to 9.332 ms, and is 4.2% faster
+than the 9.740 ms W4A16 draft path. Its graph and eager outputs are bit-identical. Prompt prime and
+incremental context injection remain W4A16 so they build the same KV ring. Set
+`GB10_W4A4_N8=0` to restore the old wide W4A4 kernel for A/B or rollback.
 
 Quantized DFlash2 round sharding is intentionally rejected for now. Use the artifact on the
 single-GB10 round path; BF16 DFlash2 retains its existing sharded path.

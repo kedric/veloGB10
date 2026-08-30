@@ -157,6 +157,7 @@ struct CalibScratch {
 struct Df2W4a4 {
     quant: CudaFunction,
     gemm: CudaFunction,
+    gemm_n8: CudaFunction,
     bq: CudaSlice<u8>,
     sb: CudaSlice<u8>,
     k_max: usize,
@@ -172,14 +173,15 @@ impl Df2W4a4 {
     fn build(dev: &Arc<CudaDevice>) -> Result<Self> {
         let module = "gpu_w4a4_df2";
         let ptx = Ptx::from_src(std::fs::read_to_string("src/ptx/gpu_w4a4.ptx")?);
-        dev.load_ptx(ptx, module, &["w4a4_quant_pack_b", "w4a4_gemm_b", "kernel_build_id"])?;
+        dev.load_ptx(ptx, module, &["w4a4_quant_pack_b", "w4a4_gemm_b", "w4a4_gemm_n8_b", "kernel_build_id"])?;
         crate::gpu::GpuModel::assert_kernel_build_id(dev, module)?;
         let quant = dev.get_func(module, "w4a4_quant_pack_b").context("df2 w4a4 quant kernel")?;
-        let gemm = dev.get_func(module, "w4a4_gemm_b").context("df2 w4a4 gemm kernel")?;
+        let gemm = dev.get_func(module, "w4a4_gemm_b").context("df2 w4a4 wide gemm kernel")?;
+        let gemm_n8 = dev.get_func(module, "w4a4_gemm_n8_b").context("df2 w4a4 n8 gemm kernel")?;
         let k_max = INTER;
         let bq = dev.htod_sync_copy(&vec![0xFFu8; BLOCK * (k_max / 2)])?;
         let sb = dev.htod_sync_copy(&vec![0xFFu8; BLOCK * (k_max / 4)])?;
-        Ok(Self { quant, gemm, bq, sb, k_max })
+        Ok(Self { quant, gemm, gemm_n8, bq, sb, k_max })
     }
 }
 
@@ -1035,15 +1037,27 @@ impl Df2Round {
                 (x_ptr, inn as i32, rows as i32, pad8 as i32,
                  d(&w4.bq), d(&w4.sb), xgs),
             ).expect("df2 w4a4 quant launch");
-            w4.gemm.clone().launch_on_stream(
-                &self.stream,
-                LaunchConfig {
-                    grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1),
-                    block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM,
-                },
-                (d(wq), d(ws), d(&w4.bq), d(&w4.sb), d(gs), out_ptr,
-                 outn as i32, rows as i32, inn as i32, 1.0f32 / xgs),
-            ).expect("df2 w4a4 gemm launch");
+            if crate::w4a4::n8_on() {
+                w4.gemm_n8.clone().launch_on_stream(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (outn.div_ceil(128) as u32, 1, 1),
+                        block_dim: (128, 1, 1), shared_mem_bytes: crate::w4a4::W4_N8_SMEM,
+                    },
+                    (d(wq), d(ws), d(&w4.bq), d(&w4.sb), d(gs), out_ptr,
+                     outn as i32, rows as i32, inn as i32, 1.0f32 / xgs),
+                ).expect("df2 w4a4 n8 gemm launch");
+            } else {
+                w4.gemm.clone().launch_on_stream(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1),
+                        block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM,
+                    },
+                    (d(wq), d(ws), d(&w4.bq), d(&w4.sb), d(gs), out_ptr,
+                     outn as i32, rows as i32, inn as i32, 1.0f32 / xgs),
+                ).expect("df2 w4a4 wide gemm launch");
+            }
         }
     }
 

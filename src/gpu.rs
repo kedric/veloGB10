@@ -5206,9 +5206,10 @@ impl GpuModel {
         // MR-GPTQ: a rotated weight reads the micro-rotated activation (scratch, x untouched).
         let _rot_guard; let x: &B = if self.is_rotated(w) { _rot_guard = self.rot_x(x, inn, batch); &*_rot_guard } else { x };
 
-        // Explicit narrow W4A4 fork. GB10_W4A4_VERIFY selects groups for BOTH N=1 decode and
-        // N<=MAX_VERIFY: using one numerical target on both sides preserves speculative
-        // correctness. GB10_W4A4_LMHEAD_NARROW remains the historical head-only A/B.
+        // Explicit EXPERIMENTAL narrow W4A4 fork. GB10_W4A4_VERIFY selects groups for both N=1
+        // and N<=MAX_VERIFY, but the full lossless gate still fails (other batched operations
+        // amplify A4 rounding). Production leaves it unset. GB10_W4A4_LMHEAD_NARROW remains the
+        // historical head-only A/B.
         if let (Some(w4), W::Nvfp4 { qweight, m, k, .. }) = (&self.w4a4, w) {
             let ptr = *qweight.device_ptr() as u64;
             if batch <= MAX_VERIFY && w4.narrow_on(ptr) && *k == inn && *m == outn && inn % 64 == 0
@@ -20525,8 +20526,8 @@ impl GpuModel {
             .and_then(|j| j["quantization_config"]["activation_variant"].as_str().map(str::to_owned))
             .as_deref() == Some("w4a4");
         // An explicit prefill value always wins, including `0`. Narrow decode+verify is a
-        // separate opt-in because it changes the target's numerical chain, but it must apply to
-        // BOTH N=1 decode and N<=MAX_VERIFY so speculative verification stays coherent.
+        // separate experimental opt-in because it changes the target's numerical chain. It is
+        // applied to both N=1 and N<=MAX_VERIFY for controlled A/B, but is not lossless end-to-end.
         let prefill_groups = if std::env::var_os("GB10_W4A4_PREFILL").is_some() {
             crate::w4a4::groups_from_env().unwrap_or_default()
         } else if configured_a4 {
@@ -20634,10 +20635,17 @@ impl GpuModel {
                     LaunchConfig { grid_dim: ((inn / 64) as u32, (pad8 / 8) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
                     (xq + (off * inn * 2) as u64, inn as i32, rows as i32, pad8 as i32, bq, sb, x_gs))
                     .expect("w4a4_quant_pack_b launch");
-                w4.gemm.clone().launch_on_stream(&self.stream,
-                    LaunchConfig { grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM },
-                    (wq, ws, bq, sb, gs, oq + (off * outn * 2) as u64, outn as i32, rows as i32, inn as i32, 1.0f32 / x_gs))
-                    .expect("w4a4_gemm_b launch");
+                if rows <= MAX_VERIFY && crate::w4a4::n8_on() {
+                    w4.gemm_n8.clone().launch_on_stream(&self.stream,
+                        LaunchConfig { grid_dim: (outn.div_ceil(128) as u32, rows.div_ceil(8) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: crate::w4a4::W4_N8_SMEM },
+                        (wq, ws, bq, sb, gs, oq + (off * outn * 2) as u64, outn as i32, rows as i32, inn as i32, 1.0f32 / x_gs))
+                        .expect("w4a4_gemm_n8_b launch");
+                } else {
+                    w4.gemm.clone().launch_on_stream(&self.stream,
+                        LaunchConfig { grid_dim: (crate::w4a4::W4a4State::dense_grid(outn, rows), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: crate::w4a4::W4_SMEM },
+                        (wq, ws, bq, sb, gs, oq + (off * outn * 2) as u64, outn as i32, rows as i32, inn as i32, 1.0f32 / x_gs))
+                        .expect("w4a4_gemm_b launch");
+                }
             }
             off += rows;
         }

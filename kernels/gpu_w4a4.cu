@@ -186,6 +186,16 @@ extern "C" __global__ void w4a4_quant_pack_b(
 #define W4_NSTAGES 4
 #define W4_SMEM (W4_NSTAGES * W4_STAGE_BYTES)                                   // 43008
 
+// Narrow decode/verify specialization: one 8-token group instead of the wide core's 128-token
+// tile. The hardware MMA is m16n8k64, so this removes the 15 unused n8 fragments (and the second
+// token warp group) rather than computing 128 rows and discarding 120 of them.
+#define W4_N8_STAGE_A 4096
+#define W4_N8_STAGE_B 256
+#define W4_N8_STAGE_SFA 512
+#define W4_N8_STAGE_SFB 128
+#define W4_N8_STAGE_BYTES (W4_N8_STAGE_A + W4_N8_STAGE_B + W4_N8_STAGE_SFA + W4_N8_STAGE_SFB)
+#define W4_N8_SMEM (W4_NSTAGES * W4_N8_STAGE_BYTES)                              // 19968
+
 // Swizzled position of source 16-B chunk `ch` (= tile kb = ch>>3, lane-group g = ch&7) inside the
 // 512-B A slice: the two chunks a lane reads (tiles kb and kb+2... no: kb = t>>1 and 2 + (t>>1))
 // differ in bit 0 of kb only when t>>1 differs; XOR-ing g with 4*(kb&1) puts them 16 words apart.
@@ -349,6 +359,134 @@ __device__ __forceinline__ void w4a4_gemm_core(
                     Out[(size_t)tok * Mf + feat + e] = tile[tl * TSTRIDE + f8 + e];
         }
     }
+}
+
+// One 128-feature x 8-token tile. Four warps cover the four 32-feature bands; each warp issues
+// 2 (m16) x 1 (n8) MMAs per K64 instead of the wide core's 2 x 8. Results already have the
+// token-major coordinates in registers, so the 128x136 shared-memory transpose is unnecessary.
+__device__ __forceinline__ void w4a4_gemm_n8_core(
+    const uint8_t* __restrict__ wt, const uint8_t* __restrict__ sct, const float* __restrict__ gs,
+    const uint32_t* __restrict__ Bp, const uint32_t* __restrict__ SFB,
+    bf16* __restrict__ Out, int Mf, int K, int bm, int bn, int n_end, float out_scale,
+    uint8_t* smem)
+{
+    const int nks = K >> 6;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int wm = tid >> 5;
+    const int qg = bn >> 3;
+
+    auto load_stage = [&](int s, int ks) {
+        uint8_t* base = smem + s * W4_N8_STAGE_BYTES;
+#pragma unroll
+        for (int i = 0; i < 3; i++) {
+            int idx = tid + i * 128;
+            if (idx >= 312) break;
+            if (idx < 256) {                                    // A: 8 slices x 4 tiles x 128 B
+                int sl = idx >> 5, ch = idx & 31;
+                int mt = (bm >> 4) + sl;
+                uint8_t* dst = base + sl * 512 + w4_swz(ch) * 16;
+                if (mt * 16 < Mf)
+                    cp16(dst, wt + ((size_t)mt * nks + ks) * 512 + ch * 16);
+                else
+                    *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+            } else if (idx < 272) {                             // B: one 8-token group, 256 B
+                int ch = idx - 256;
+                cp16(base + W4_N8_STAGE_A + ch * 16,
+                     Bp + ((size_t)qg * nks + ks) * 64 + ch * 4);
+            } else if (idx < 304) {                             // SFA: 8 slices x 4 chunks
+                int j = idx - 272, sl = j >> 2, ch = j & 3;
+                int mt = (bm >> 4) + sl;
+                uint8_t* dst = base + W4_N8_STAGE_A + W4_N8_STAGE_B + sl * 64 + ch * 16;
+                if (mt * 16 < Mf)
+                    cp16(dst, sct + ((size_t)mt * nks + ks) * 64 + ch * 16);
+                else
+                    *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+            } else {                                            // SFB: one group, 128 B
+                int ch = idx - 304;
+                cp16(base + W4_N8_STAGE_A + W4_N8_STAGE_B + W4_N8_STAGE_SFA + ch * 16,
+                     SFB + ((size_t)qg * nks + ks) * 32 + ch * 4);
+            }
+        }
+        cp_commit();
+    };
+
+    load_stage(0, 0);
+    if (nks > 1) load_stage(1, 1);
+    if (nks > 2) load_stage(2, 2);
+
+    float acc[2][4];
+#pragma unroll
+    for (int ma = 0; ma < 2; ma++)
+#pragma unroll
+        for (int c = 0; c < 4; c++) acc[ma][c] = 0.f;
+
+    const int kb0 = (t >> 1), kb1 = 2 + (t >> 1);
+    const int ch0 = w4_swz((kb0 << 3) | g), ch1 = w4_swz((kb1 << 3) | g);
+    const int jb = (t & 1) << 1;
+
+    for (int kt = 0; kt < nks; kt++) {
+        const int s = kt % W4_NSTAGES;
+        const int committed = (kt + 3 < nks) ? (kt + 3) : nks;
+        const int need = committed - kt - 1;
+        if (need <= 0) cp_wait<0>();
+        else if (need == 1) cp_wait<1>();
+        else cp_wait<2>();
+        __syncthreads();
+        if (kt + 3 < nks) load_stage((kt + 3) % W4_NSTAGES, kt + 3);
+
+        const uint8_t* st = smem + s * W4_N8_STAGE_BYTES;
+        const uint8_t* sfa_s8 = st + W4_N8_STAGE_A + W4_N8_STAGE_B;
+        const uint32_t* sfb_s = (const uint32_t*)(sfa_s8 + W4_N8_STAGE_SFA);
+        const uint2* bp = (const uint2*)(st + W4_N8_STAGE_A + lane * 8);
+        const uint32_t b0 = bp->x, b1 = bp->y, sfb = sfb_s[lane];
+
+#pragma unroll
+        for (int ma = 0; ma < 2; ma++) {
+            const int sl = wm * 2 + ma;
+            const uint8_t* As = st + sl * 512;
+            uint4 q0 = *(const uint4*)(As + ch0 * 16);
+            uint4 q1 = *(const uint4*)(As + ch1 * 16);
+            uint32_t a0 = w4_gather(q0, jb), a1 = w4_gather(q0, jb + 1);
+            uint32_t a2 = w4_gather(q1, jb), a3 = w4_gather(q1, jb + 1);
+            uint32_t sfa = 0u;
+            if (t <= 1) {
+                const uint8_t* ss = sfa_s8 + sl * 64 + g + 8 * t;
+                sfa = (uint32_t)ss[0] | ((uint32_t)ss[16] << 8)
+                    | ((uint32_t)ss[32] << 16) | ((uint32_t)ss[48] << 24);
+            }
+            mxf4_mma(a0, a1, a2, a3, b0, b1, sfa, sfb,
+                     acc[ma][0], acc[ma][1], acc[ma][2], acc[ma][3]);
+        }
+    }
+
+#pragma unroll
+    for (int ma = 0; ma < 2; ma++) {
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            int fl = wm * 32 + ma * 16 + g + 8 * (c >= 2);
+            int tok = bn + 2 * t + (c & 1);
+            int feat = bm + fl;
+            if (tok < n_end && feat < Mf) {
+                const int gi = feat >> 4;
+                Out[(size_t)tok * Mf + feat] = f2b(acc[ma][c] * gs[gi] * out_scale);
+            }
+        }
+    }
+}
+
+// Grid (ceil(Mf/128), ceil(Nt/8)); Nt is restricted to 1..16 by the runtime narrow path.
+extern "C" __global__ __launch_bounds__(128, 4) void w4a4_gemm_n8_b(
+    const uint8_t* __restrict__ wt, const uint8_t* __restrict__ sct,
+    const uint32_t* __restrict__ Bp, const uint32_t* __restrict__ SFB,
+    const float* __restrict__ gs, bf16* __restrict__ Out,
+    int Mf, int Nt, int K, float out_scale)
+{
+    const int bm = blockIdx.x * W4_BM;
+    const int bn = blockIdx.y * 8;
+    if (bm >= Mf || bn >= Nt) return;
+    extern __shared__ uint8_t smem[];
+    w4a4_gemm_n8_core(wt, sct, gs, Bp, SFB, Out, Mf, K, bm, bn, Nt, out_scale, smem);
 }
 
 // Dense: one weight matrix [Mf][K], Nt packed rows. Token-fastest raster (group width 8) so
