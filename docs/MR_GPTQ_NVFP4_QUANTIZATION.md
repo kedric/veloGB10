@@ -1,5 +1,9 @@
 # MR-GPTQ NVFP4 Quantization for Qwen3.8
 
+For the exact validated dense v5 recipe, including corpus hashes, A4 scale collection, W4A16
+heads, DFlash2, and the production launch command, use [`CALIBRATION_CORPUS.md`](CALIBRATION_CORPUS.md).
+
+
 This guide describes the complete procedure used to produce an NVFP4 artifact for W4A16 or
 W4A4 inference. It covers dense models such as `Qwen3.8-27B`, the
 `Qwen3.8-Flash-Next` MoE model, RTN base conversion, MR-GPTQ calibration, validation, and
@@ -123,7 +127,7 @@ Do not include benchmark samples that will later be used to compare the artifact
 The local mixed calibration corpus can be selected with:
 
 ```bash
-export CALIB="$HOME/models/calibration-sources/mixed-fr-en-multilingual-code.jsonl"
+export CALIB="$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl"
 test -f "$CALIB"
 ```
 
@@ -218,8 +222,8 @@ cd ~/workspace/veloGB10
 export GPU_ID=0
 export SRC="$HOME/models/Qwen3.8-27B"
 export BASE="$HOME/models/Qwen3.8-27B-NVFP4-base"
-export FINAL="$HOME/models/Qwen3.8-27B-MR-GPTQ-NVFP4-v2"
-export CALIB="$HOME/models/calibration-sources/mixed-fr-en-multilingual-code.jsonl"
+export FINAL="$HOME/models/Qwen3.8-27B-MR-GPTQ-NVFP4-v5"
+export CALIB="$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl"
 
 test -d "$SRC"
 test -d "$BASE"
@@ -241,7 +245,7 @@ GB10_PLE_OFFLOAD=ssd \
   --scale-iters 4 \
   --gptq-groups attn,mlp,gdn,lmhead \
   --rtn-groups mtp,embed \
-  2>&1 | tee /var/tmp/qwen38_27b_mr_gptq_nvfp4_v2.log
+  2>&1 | tee /var/tmp/qwen38_27b_mr_gptq_nvfp4_v5.log
 ```
 
 Do not add:
@@ -343,7 +347,7 @@ Monitor:
 Examples:
 
 ```bash
-tail -f /var/tmp/qwen38_27b_mr_gptq_nvfp4_v2.log
+tail -f /var/tmp/qwen38_27b_mr_gptq_nvfp4_v5.log
 ```
 
 ```bash
@@ -397,21 +401,24 @@ GB10_W4A4_PREFILL=1 \
 
 `GB10_W4A4_PREFILL=1` enables `expert`, `mlp`, and `attn` when those groups are present.
 
-To benchmark A4 activations for the `lm_head` as well, use:
+For the validated dense 27B profile, enable A4 only on the transformer trunk and explicitly keep
+the main, MTP, and DFlash2 head activations in A16:
 
 ```bash
-export GB10_W4A4_PREFILL=expert,mlp,attn,lmhead
+unset GB10_W4A4_LMHEAD_NARROW
+export GB10_W4A4_PREFILL=attn,mlp,gdn
 ```
 
-For the dense 27B model, use:
+The `lm_head` weight is still W4 MR-GPTQ. Only its input activation stays BF16/A16. To run a
+separate experimental A4 head comparison, both list `lmhead` and explicitly enable the narrow
+head path:
 
 ```bash
 export GB10_W4A4_PREFILL=attn,mlp,gdn,lmhead
+export GB10_W4A4_LMHEAD_NARROW=1
 ```
 
-Benchmark `lm_head` A4 separately because activation quantization at the output head may have a
-more visible effect on quality. Decode and MTP verification normally keep the W4A16 path unless
-an experimental narrow mode is explicitly enabled.
+Do not use the experimental narrow mode for the validated v5 serving profile.
 
 Test at least:
 
