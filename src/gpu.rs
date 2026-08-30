@@ -4165,7 +4165,8 @@ impl GpuModel {
             "gqa_attn_sel_splitk","gqa_attn_sel_splitk_k8v4","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
             "gptq_bf16_to_f32_b","gptq_absmax_b","igs_hist_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
             "gptq_silu_mul_gu_b","gptq_rotate_act_b","gptq_scale_stats_f32_b","gptq_scale_stats_bf16_b",
-            "gptq_static_scales_b","gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
+            "gptq_static_scales_b","gptq_static_scales_hessian_b",
+            "gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
             "kernel_build_id"];
         dev.load_ptx(bptx, module, &bfnames)?;
         Self::assert_kernel_build_id(dev, module)?;
@@ -20229,6 +20230,24 @@ impl GpuModel {
         let qs = self.dev.alloc_zeros::<u8>(m * k / 16).unwrap();
         blaunch!(self, "gptq_static_scales_b", grid(m * k / 16), (256,1,1), 0,
             (d(&qs), d(w32), (m * k / 16) as i64, fbits(s_tensor), nclip as i32));
+        qs
+    }
+    /// Freeze block-16 scales by minimizing dw^T H_block dw across every positive finite E4M3
+    /// scale. h32 must be rotated/damped but unpermuted, matching w32's original block layout.
+    pub fn gptq_static_scales_hessian(
+        &self, w32: &S, h32: &S, m: usize, k: usize, s_tensor: f32,
+    ) -> cudarc::driver::CudaSlice<u8> {
+        assert!(k % 16 == 0);
+        let qs = self.dev.alloc_zeros::<u8>(m * k / 16).unwrap();
+        let fallbacks = self.dev.alloc_zeros::<u64>(1).unwrap();
+        let launch_grid = ((k / 16) as u32, m.div_ceil(8) as u32, 1u32);
+        blaunch!(self, "gptq_static_scales_hessian_b", launch_grid, (256,1,1), 0,
+            (d(&qs), d(w32), d(h32), d(&fallbacks), m as i32, k as i32, fbits(s_tensor)));
+        self.sync_stream();
+        let n = self.dev.dtoh_sync_copy(&fallbacks).unwrap()[0];
+        if n != 0 {
+            eprintln!("[gptq] local-Hessian scale search: {n} non-finite groups fell back to amax");
+        }
         qs
     }
     /// Permute weight columns into descending activation-importance order.

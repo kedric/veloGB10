@@ -11709,6 +11709,69 @@ extern "C" __global__ void gptq_static_scales_b(unsigned char* qs, const float* 
     qs[g] = gptq_best_scale16(x, s_tensor, nclip, &mse);
 }
 
+// NVIDIA-style NVFP4 local-Hessian scale search. One CUDA block handles eight output rows
+// for one original 16-column group. Each warp cooperatively evaluates all 126 positive finite
+// E4M3 scales and minimizes dw^T H_block dw. The same scale bytes and
+// packed FP4 layout are consumed by the existing runtime; this adds no inference overhead.
+extern "C" __global__ void gptq_static_scales_hessian_b(
+        unsigned char* qs, const float* w, const float* H,
+        unsigned long long* fallback_count, int M, int K, float s_tensor) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int group = blockIdx.x;
+    const int row = (int)blockIdx.y * 8 + warp;
+    const int c0 = group * 16;
+    __shared__ float h16[16 * 16];
+
+    const int t = threadIdx.x;
+    h16[t] = H[(long long)(c0 + t / 16) * K + c0 + t % 16];
+    __syncthreads();
+    if (row >= M) return;
+
+    // The warp cooperates on one candidate at a time: lane i owns dw[i], then broadcasts it
+    // to form one Hessian row. This performs the same arithmetic as four independent candidates
+    // per lane while keeping register pressure and PTX size bounded.
+    const unsigned mask = 0xffffffffu;
+    const float wi = lane < 16 ? w[(long long)row * K + c0 + lane] : 0.f;
+    float amax = lane < 16 ? fabsf(wi) : 0.f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
+    float best_loss = 3.402823466e+38F;
+    int best_code = 0;
+    #pragma unroll 1
+    for (int code = 1; code <= 126; code++) {
+        const float scale = e4m3_f((unsigned char)code) * s_tensor;
+        const float inv = scale > 0.f ? 1.f / scale : 0.f;
+        const float q = lane < 16 ? gptq_e2m1_val(gptq_e2m1(wi * inv)) * scale : 0.f;
+        const float dw = lane < 16 ? wi - q : 0.f;
+        float hd = 0.f;
+        #pragma unroll 1
+        for (int j = 0; j < 16; j++) {
+            const float dwj = __shfl_sync(mask, dw, j);
+            if (lane < 16) hd += h16[lane * 16 + j] * dwj;
+        }
+        float loss = dw * hd;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            loss += __shfl_down_sync(mask, loss, off);
+        if (lane == 0 && isfinite(loss) && loss < best_loss) {
+            best_loss = loss; best_code = code;
+        }
+    }
+
+    if (lane == 0) {
+        if (best_code == 0) {
+            // A non-finite Hessian should never reach here; preserve a valid artifact with the
+            // ordinary un-clipped amax scale and expose the event to the host diagnostic.
+            best_code = (int)f32_to_e4m3(
+                (amax > 0.f && s_tensor > 0.f) ? amax / 6.f / s_tensor : 0.f);
+            atomicAdd(fallback_count, 1ULL);
+        }
+        qs[(long long)row * (K / 16) + group] = (unsigned char)best_code;
+    }
+}
+
 // out[:,j] = in[:,perm[j]], and out[i,j] = in[perm[i],perm[j]]. The latter permutes the
 // Hessian into the same activation-importance basis as the working weight.
 extern "C" __global__ void gptq_permute_w_b(float* out, const float* in, const int* perm, int M, int K) {

@@ -198,9 +198,15 @@ impl Writer {
 #[derive(Clone)]
 pub struct GptqOpts {
     pub nsamples: usize, pub seqlen: usize, pub damp: f32, pub nclip: usize, pub rotate: bool,
-    pub scale_iters: usize, pub static_act_order: bool,
+    pub scale_iters: usize, pub static_act_order: bool, pub local_hessian: bool,
     pub gptq_groups: Vec<Group>, pub nvfp4_groups: Vec<Group>,   // GPTQ'd / RTN'd; everything else bf16
     pub fp8_groups: Vec<Group>,                                     // row-scaled FP8 (E4M3): the speed/accuracy middle ground
+}
+
+fn validate_opts(opts: &GptqOpts) -> Result<()> {
+    anyhow::ensure!(!opts.local_hessian || opts.static_act_order,
+        "--local-hessian requires static activation order (remove --no-act-order)");
+    Ok(())
 }
 
 /// `igs`: the W4A4 input global scale (6·448 / calibration activation amax), written as
@@ -334,6 +340,7 @@ fn optimize_bf16_scale(gpu: &GpuModel, w_ptr: u64, n: usize, initial: f32, opts:
 /// GPTQ one 2-D weight (bf16 on device at `w_ptr`, [m, k] row-major) with its Hessian.
 fn igs_of(amax: f32) -> Option<f32> { if amax > 0.0 && amax.is_finite() { Some(6.0 * 448.0 / amax) } else { None } }
 fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, hess: &S, opts: &GptqOpts, s_tensor: Option<f32>, x_amax: f32) -> Result<Rec> {
+    validate_opts(opts)?;
     let w32 = gpu.gptq_w32(w_ptr, m, k, opts.rotate);
     let initial_st = s_tensor.unwrap_or_else(|| e4m3_scale_of(gpu.gptq_absmax_f32(&w32, m * k)));
     // Stacked MoE tensors pass their already jointly optimized scale; ordinary matrices optimize
@@ -344,11 +351,12 @@ fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, he
     // RTN (U = I: the sweep then rounds without error feedback, same scales and static groups).
     let mut u: Option<S> = None;
     let mut perm = None;
+    let mut used_damp = opts.damp;
     for damp in [opts.damp, 0.05, 0.10] {
         let (h32, p) = gpu.gptq_h32(hess, k, opts.rotate, damp, opts.static_act_order);
         perm = p;
         match cs.chol_inv_chol(gpu, &h32, k) {
-            Ok(()) => { u = Some(h32); break; }
+            Ok(()) => { used_damp = damp; u = Some(h32); break; }
             Err(e) => eprintln!("[gptq] cholesky failed at damp {damp}: {e} — retrying"),
         }
     }
@@ -360,7 +368,15 @@ fn gptq_2d(gpu: &GpuModel, cs: &mut Cusolver, w_ptr: u64, m: usize, k: usize, he
     let (qw, sc) = if let Some(perm) = perm {
         // Freeze block scales before error feedback, then work in importance order and write codes
         // directly into their original columns. The artifact and serving path remain unchanged.
-        let qs = gpu.gptq_static_scales(&w32, m, k, st, opts.nclip);
+        let qs = if opts.local_hessian {
+            // Inspect every positive finite E4M3 local scale and minimize dw^T H_block dw.
+            // H stays in the original column layout, so scales remain artifact-compatible even
+            // though the GPTQ sweep itself runs in activation-importance order.
+            let (h_local, _) = gpu.gptq_h32(hess, k, opts.rotate, used_damp, false);
+            gpu.gptq_static_scales_hessian(&w32, &h_local, m, k, st)
+        } else {
+            gpu.gptq_static_scales(&w32, m, k, st, opts.nclip)
+        };
         let wp = gpu.gptq_permute_w(&w32, m, k, &perm);
         gpu.gptq_sweep_static(&wp, &u, &perm, &qs, m, k, st)
     } else {
@@ -532,6 +548,7 @@ fn prepare_output_dir(out: &Path, inputs: &[&Path]) -> Result<()> {
 
 // ---------------------------------------------------------------- the driver
 pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts) -> Result<()> {
+    validate_opts(&opts)?;
     prepare_output_dir(out, &[source, base])?;
     if std::env::var("GB10_PLE_OFFLOAD").is_err() { std::env::set_var("GB10_PLE_OFFLOAD", "ssd"); }
     let t_all = std::time::Instant::now();
@@ -547,6 +564,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
              ns, opts.seqlen, opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
              opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(), opts.rotate, opts.damp, opts.nclip,
              opts.scale_iters, if opts.static_act_order { "static" } else { "none" });
+    println!("[gptq] local-Hessian FP8 scale sweep: {}", opts.local_hessian);
     for li in 0..gpu.gptq_num_layers() { gpu.gptq_drop_layer_weights(li); }
     gpu.gptq_sync();
     println!("[gptq] base layer weights dropped (rebuilt per layer from the source); MemAvailable {:.1} GB", mem_available_gb());
@@ -825,6 +843,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     let mut cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
     cj["quantization_config"]["gptq"] = serde_json::json!({ "nsamples": ns, "seqlen": seqlen, "damp": opts.damp, "clip_ratios": opts.nclip,
         "global_scale_optimization": { "type": "alternating_least_squares", "iterations": opts.scale_iters },
+        "local_scale_optimization": if opts.local_hessian { "local_hessian_fp8_sweep" } else { "clip_mse" },
         "activation_order": if opts.static_act_order { "static" } else { "none" },
         "groups": opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
         "rtn_groups": opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
@@ -845,6 +864,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
 pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
                opts: GptqOpts, context_vectors: usize) -> Result<()> {
     use crate::dflash2::{BLOCK as DB, HEAD_DIM, HIDDEN, INTER, N_LAYERS, NUM_HEADS, NUM_KV_HEADS};
+    validate_opts(&opts)?;
     use crate::dflash2::capture::Df2PrimeSink;
     use crate::dflash2::round::Df2Round;
 
@@ -861,7 +881,8 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
         "calib": std::fs::canonicalize(calib)?, "calib_bytes": std::fs::metadata(calib)?.len(),
         "nsamples": opts.nsamples, "seqlen": opts.seqlen, "damp": opts.damp,
         "clip": opts.nclip, "scale_iters": opts.scale_iters,
-        "static_act_order": opts.static_act_order, "context_vectors": context_vectors,
+        "static_act_order": opts.static_act_order, "local_hessian": opts.local_hessian,
+        "context_vectors": context_vectors,
     });
     let mp = cache.join("manifest.json");
     if mp.exists() {
@@ -1027,6 +1048,7 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
         "gptq": { "nsamples": samples.len(), "seqlen": opts.seqlen, "damp": opts.damp,
           "clip_ratios": opts.nclip, "activation_order": if opts.static_act_order { "static" } else { "none" },
           "global_scale_optimization": { "type": "alternating_least_squares", "iterations": opts.scale_iters },
+          "local_scale_optimization": if opts.local_hessian { "local_hessian_fp8_sweep" } else { "clip_mse" },
           "context_vectors_per_sample": context_vectors, "sequential": true },
         "calibration_target": { "model": target.display().to_string(),
           "prefill": "GB10_W4A4_PREFILL=attn,mlp,gdn" },
@@ -1044,6 +1066,7 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
 /// Quantize only the dense LM head of an existing MR-GPTQ artifact. This deliberately reuses the
 /// already-quantized trunk and calibrates on its real outputs, avoiding a second 64-layer GPTQ run.
 pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts) -> Result<()> {
+    validate_opts(&opts)?;
     prepare_output_dir(out, &[source, base])?;
     std::env::remove_var("GB10_W4A4_PREFILL");
     std::env::remove_var("GB10_W4A4_LMHEAD_NARROW");
@@ -1137,6 +1160,7 @@ pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOp
     cj["quantization_config"]["gptq"]["damp"] = serde_json::json!(opts.damp);
     cj["quantization_config"]["gptq"]["clip_ratios"] = serde_json::json!(opts.nclip);
     cj["quantization_config"]["gptq"]["global_scale_optimization"] = serde_json::json!({ "type": "alternating_least_squares", "iterations": opts.scale_iters });
+    cj["quantization_config"]["gptq"]["local_scale_optimization"] = serde_json::json!(if opts.local_hessian { "local_hessian_fp8_sweep" } else { "clip_mse" });
     cj["quantization_config"]["gptq"]["activation_order"] = serde_json::json!(if opts.static_act_order { "static" } else { "none" });
     add(&mut cj["quantization_config"]["transform"]["groups"], "lmhead");
     cj["quantization_config"]["activation_variant"] = serde_json::json!("runtime-selectable-a16-or-a4");
@@ -1660,6 +1684,48 @@ mod tests {
         out
     }
 
+    fn host_hessian_loss(w: &[f32; 16], h: &[f32; 256], s_tensor: f32, code: u8) -> f64 {
+        let scale = quant::e4m3_to_f32(code) * s_tensor;
+        let mut dw = [0.0f64; 16];
+        for i in 0..16 {
+            let q = quant::e2m1_to_f32(quant::f32_to_e2m1(w[i] / scale)) * scale;
+            dw[i] = (w[i] - q) as f64;
+        }
+        let mut loss = 0.0f64;
+        for i in 0..16 {
+            for j in 0..16 {
+                loss += dw[i] * h[i * 16 + j] as f64 * dw[j];
+            }
+        }
+        loss
+    }
+
+    fn host_local_hessian_code(w: &[f32; 16], h: &[f32; 256], s_tensor: f32) -> u8 {
+        (1u8..=126).min_by(|&a, &b| {
+            host_hessian_loss(w, h, s_tensor, a)
+                .total_cmp(&host_hessian_loss(w, h, s_tensor, b))
+                .then_with(|| a.cmp(&b))
+        }).unwrap()
+    }
+
+    fn host_clip_code(w: &[f32; 16], s_tensor: f32) -> u8 {
+        const RATIOS: [f32; 7] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7];
+        let amax = w.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        RATIOS.into_iter().map(|ratio| {
+            quant::f32_to_e4m3(amax * ratio / quant::E2M1_MAX / s_tensor)
+        }).min_by(|&a, &b| {
+            let mse = |code| {
+                let scale = quant::e4m3_to_f32(code) * s_tensor;
+                w.iter().map(|&v| {
+                    let q = quant::e2m1_to_f32(quant::f32_to_e2m1(v / scale)) * scale;
+                    let d = (v - q) as f64;
+                    d * d
+                }).sum::<f64>()
+            };
+            mse(a).total_cmp(&mse(b)).then_with(|| a.cmp(&b))
+        }).unwrap()
+    }
+
     #[test]
     fn static_activation_order_is_descending_stable_and_finite_first() {
         let order = static_activation_order(&[2.0, 9.0, 9.0, f32::NAN, 1.0, f32::INFINITY]);
@@ -1687,5 +1753,25 @@ mod tests {
         assert_eq!(fit.scale, 1.0);
         assert_eq!(fit.final_mse, 0.0);
         assert_eq!(fit.accepted, 0);
+    }
+
+    #[test]
+    fn local_hessian_fp8_sweep_beats_clip_mse_on_its_objective() {
+        let mut w = [0.0f32; 16];
+        w[0] = 0.37;
+        w[1] = -0.43;
+        for (i, v) in w[2..].iter_mut().enumerate() {
+            *v = if i & 1 == 0 { 4.0 + i as f32 * 0.14 } else { -4.3 - i as f32 * 0.11 };
+        }
+        let mut h = [0.0f32; 256];
+        for i in 0..16 { h[i * 16 + i] = if i < 2 { 1.0e6 } else { 1.0 }; }
+        let amax = w.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let s_tensor = e4m3_scale_of(amax);
+        let local = host_local_hessian_code(&w, &h, s_tensor);
+        let clip = host_clip_code(&w, s_tensor);
+        let local_loss = host_hessian_loss(&w, &h, s_tensor, local);
+        let clip_loss = host_hessian_loss(&w, &h, s_tensor, clip);
+        assert_ne!(local, clip, "the weighted fixture must distinguish the two objectives");
+        assert!(local_loss < clip_loss, "local={local_loss:e}, clip={clip_loss:e}");
     }
 }

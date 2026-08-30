@@ -13,6 +13,7 @@ fn load() -> Arc<CudaDevice> {
         "gptq_scale_stats_f32_b",
         "gptq_scale_stats_bf16_b",
         "gptq_static_scales_b",
+        "gptq_static_scales_hessian_b",
         "gptq_permute_w_b",
         "gptq_permute_h_b",
         "gptq_sweep_static_b",
@@ -262,5 +263,85 @@ fn gptq_bf16_rotated_stats_and_hessian_permutation_match_cpu() {
         for c in 0..k {
             assert_eq!(got_h[r * k + c], h[perm[r] as usize * k + perm[c] as usize]);
         }
+    }
+}
+
+fn hessian_loss(w: &[f32], h: &[f32], s_tensor: f32, code: u8) -> f32 {
+    let scale = quant::e4m3_to_f32(code) * s_tensor;
+    let dw: Vec<f32> = w
+        .iter()
+        .map(|&v| v - quant::e2m1_to_f32(quant::f32_to_e2m1(v / scale)) * scale)
+        .collect();
+    let mut loss = 0.0f32;
+    for i in 0..16 {
+        for j in 0..16 {
+            loss += dw[i] * h[i * 16 + j] * dw[j];
+        }
+    }
+    loss
+}
+
+#[test]
+fn gptq_local_hessian_scale_sweep_matches_cpu() {
+    let dev = load();
+    let (m, k) = (2usize, 16usize);
+    let mut w = vec![0.0f32; m * k];
+    for r in 0..m {
+        w[r * k] = 0.37 + r as f32 * 0.08;
+        w[r * k + 1] = -0.43 - r as f32 * 0.06;
+        for i in 2..k {
+            w[r * k + i] = if i & 1 == 0 {
+                4.0 + i as f32 * 0.14 + r as f32 * 0.03
+            } else {
+                -4.3 - i as f32 * 0.11 - r as f32 * 0.02
+            };
+        }
+    }
+    let mut h = vec![0.0f32; k * k];
+    for i in 0..k {
+        h[i * k + i] = if i < 2 { 1.0e6 } else { 1.0 };
+    }
+    let amax = w.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let s_tensor = amax / (quant::E2M1_MAX * quant::E4M3_MAX);
+    let wd = dev.htod_sync_copy(&w).unwrap();
+    let hd = dev.htod_sync_copy(&h).unwrap();
+    let scales = dev.alloc_zeros::<u8>(m).unwrap();
+    let fallbacks = dev.alloc_zeros::<u64>(1).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let f = dev
+        .get_func("gptq_kernels_test", "gptq_static_scales_hessian_b")
+        .unwrap();
+    unsafe {
+        f.launch(
+            cfg,
+            (
+                &scales,
+                &wd,
+                &hd,
+                &fallbacks,
+                m as i32,
+                k as i32,
+                s_tensor.to_bits(),
+            ),
+        )
+        .unwrap();
+    }
+    dev.synchronize().unwrap();
+    assert_eq!(dev.dtoh_sync_copy(&fallbacks).unwrap(), vec![0]);
+    let got = dev.dtoh_sync_copy(&scales).unwrap();
+    for r in 0..m {
+        let row = &w[r * k..(r + 1) * k];
+        let expected = (1u8..=126)
+            .min_by(|&a, &b| {
+                hessian_loss(row, &h, s_tensor, a)
+                    .total_cmp(&hessian_loss(row, &h, s_tensor, b))
+                    .then_with(|| a.cmp(&b))
+            })
+            .unwrap();
+        assert_eq!(got[r], expected, "row {r}");
     }
 }
