@@ -16,7 +16,7 @@ from pathlib import Path
 
 CATEGORIES = (
     "general", "general_long_multiturn", "general_long_context", "code",
-    "multilingual", "tools_structured", "prompt_injection", "vision_multimodal",
+    "multilingual", "tools_structured", "math_reasoning", "prompt_injection", "vision_multimodal",
 )
 
 
@@ -195,10 +195,11 @@ def add_general(pools: Pools, root: Path, rng: random.Random, source_files: list
     for item in reasoning_rows:
         problem, solution = item["problem"], item["solution"]
         answer = str(item.get("answer") or solution.splitlines()[-1])
-        candidates.append((chat(problem, answer, solution), problem + "\n" + solution,
+        pools.add("math_reasoning", chat(problem, answer, solution), problem + "\n" + solution,
             {"source": "open-r1/OpenR1-Math-220k", "source_id": item.get("uuid") or f"row:{item['row_idx']}",
-             "license": "Apache-2.0", "language": "en", "subtype": "verified_reasoning",
-             "original_source": item.get("source", "")}))
+             "license": "Apache-2.0", "language": "en",
+             "subtype": "verified_" + str(item.get("problem_type") or "other").casefold().replace(" ", "_"),
+             "original_source": item.get("source", "")})
     rng.shuffle(candidates)
     for row, text, metadata in candidates:
         pools.add("general", row, text, metadata)

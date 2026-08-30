@@ -13,7 +13,7 @@ Defaults:
   NSAMPLES=512
   SEQLEN=2048
   RESERVE_SEQUENCES=0
-  SEED=20260829
+  SEED=20260830
   BOOTSTRAP=1   # download/clone and checksum missing raw sources
   LONG_NSAMPLES=64
   LONG_SEQLEN=8192
@@ -21,13 +21,14 @@ Defaults:
   EXCLUDE_JSONL= # optional held-out benchmark JSONL
 
 Composition in the exact NSAMPLES * SEQLEN prefix consumed by GPTQ:
-  15% general
   15% general long-context, multi-turn
   25% code (TypeScript/JavaScript, Go, shell, JSON/YAML/TOML,
             Python, Rust, CUDA/C/C++, SQL and web)
   25% multilingual (French, Japanese, Korean, German, Spanish,
                     Chinese, Arabic, Portuguese, Russian and code-switching)
-  15% tools and structured conversations
+  20% tools and structured conversations
+  10% mathematical reasoning (verified solutions, algebra, geometry,
+      combinatorics, number theory, calculus and LaTeX)
    5% defensive prompt-injection examples
 
 The output, its manifest, the 8192-token companion, and OUTPUT_JSONL.sources/
@@ -101,11 +102,11 @@ cargo build --release --bin calib_compose
     --nsamples "$nsamples" \
     --seqlen "$seqlen" \
     --reserve-sequences "$reserve_sequences" \
-    --source "general=15:1024:$staging_dir/general.jsonl" \
     --source "general_long_multiturn=15:2048:$staging_dir/general_long_multiturn.jsonl" \
     --source "code=25:1024:$staging_dir/code.jsonl" \
     --source "multilingual=25:768:$staging_dir/multilingual.jsonl" \
-    --source "tools_structured=15:2048:$staging_dir/tools_structured.jsonl" \
+    --source "tools_structured=20:2048:$staging_dir/tools_structured.jsonl" \
+    --source "math_reasoning=10:2048:$staging_dir/math_reasoning.jsonl" \
     --source "prompt_injection=5:768:$staging_dir/prompt_injection.jsonl"
 
 "$repo_dir/target/release/calib_compose" \

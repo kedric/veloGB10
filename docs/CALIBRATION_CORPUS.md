@@ -11,7 +11,7 @@ cd ~/workspace/veloGB10
 
 scripts/generate_calibration_corpus.sh \
   "$HOME/models/Qwen3.8-27B" \
-  "$HOME/models/calibration-sources/qwen38-calibration-v3.jsonl"
+  "$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl"
 ```
 
 Optional environment variables:
@@ -23,10 +23,10 @@ Optional environment variables:
 
 The default outputs are:
 
-- `qwen38-calibration-v3.jsonl`: 512 x 2048, exact 15% general, 15% long multi-turn,
-  25% code, 25% multilingual, 15% tools/structured, and 5% prompt-injection defense;
-- `qwen38-calibration-v3.long-8192.jsonl`: 64 x 8192 long-context samples;
-- `qwen38-calibration-v3.jsonl.sources/vision_multimodal.jsonl`: optional raw multimodal pool;
+- `qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl`: 512 x 2048, exact 15% long multi-turn, 25% code,
+  25% multilingual, 20% tools/structured, 10% verified mathematical reasoning, and 5% prompt-injection defense;
+- `qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.long-8192.jsonl`: 64 x 8192 long-context samples;
+- `qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl.sources/vision_multimodal.jsonl`: optional raw multimodal pool;
 - one manifest beside each composed corpus plus `sources.manifest.json` for source hashes,
   licensing metadata, deduplication counts, languages, scenarios, and code-language coverage.
 
@@ -43,7 +43,7 @@ CUDA_VISIBLE_DEVICES=0 GB10_PLE_OFFLOAD=ssd \
   --model-dir "$SRC" \
   --base "$BASE" \
   --out "$FINAL" \
-  --calib "$HOME/models/calibration-sources/qwen38-calibration-v3.jsonl" \
+  --calib "$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl" \
   --nsamples 512 \
   --seqlen 2048 \
   --damp 0.01 \
@@ -66,15 +66,15 @@ mkdir -p /tmp/qwen38-igs
 
 ./target/release/gb10_inference --calib-igs \
   --model-dir "$FINAL" --out /tmp/qwen38-igs/main \
-  --calib "$HOME/models/calibration-sources/qwen38-calibration-v3.jsonl" \
+  --calib "$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl" \
   --nsamples 512 --seqlen 2048
 
 ./target/release/gb10_inference --calib-igs \
   --model-dir "$FINAL" --out /tmp/qwen38-igs/long \
-  --calib "$HOME/models/calibration-sources/qwen38-calibration-v3.long-8192.jsonl" \
+  --calib "$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.long-8192.jsonl" \
   --nsamples 64 --seqlen 8192
 
-VISION="$HOME/models/calibration-sources/qwen38-calibration-v3.jsonl.sources/vision_multimodal.jsonl"
+VISION="$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl.sources/vision_multimodal.jsonl"
 VISION_NSAMPLES=$(wc -l < "$VISION" | tr -d ' ')
 if [ "$VISION_NSAMPLES" -gt 0 ]; then
   ./target/release/gb10_inference --calib-igs \
@@ -105,7 +105,7 @@ the artifact:
 ```bash
 scripts/audit_calibration_igs.sh \
   "$FINAL" \
-  "$HOME/models/calibration-sources/qwen38-calibration-v3.jsonl" \
+  "$HOME/models/calibration-sources/qwen38-calibration-v5-mt15-code25-multi25-tools20-math10-pi5.jsonl" \
   /tmp/qwen38-domain-audit
 ```
 

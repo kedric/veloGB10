@@ -111,10 +111,12 @@ A target of approximately 1.3 million tokens is recommended.
 
 Suggested composition:
 
-- 35% general questions, explanations, and reasoning;
-- 25% code, mainly shell, Go, TypeScript, and JSON;
+- 15% general long-context, multi-turn conversations;
+- 25% code, including shell, Go, TypeScript, JSON, Python, Rust, CUDA/C++, SQL, and web;
 - 25% multilingual material;
-- 15% tool calls, structured data, and long-context documents.
+- 20% tool calls and structured conversations;
+- 10% verified mathematical reasoning;
+- 5% defensive prompt-injection examples.
 
 Do not include benchmark samples that will later be used to compare the artifacts.
 
