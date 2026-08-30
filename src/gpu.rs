@@ -20542,8 +20542,10 @@ impl GpuModel {
             Err(_) => configured_a4,
         };
         anyhow::ensure!(self.mxfp4.is_none(), "GB10_W4A4_PREFILL/VERIFY and GB10_MXFP4 are exclusive");
-        let wide = |g: &str| prefill_groups.iter().any(|x| x == g);
-        let narrow = |g: &str| verify_groups.iter().any(|x| x == g);
+        let wide = |g: &str| crate::w4a4::group_on(&prefill_groups, g);
+        let narrow = |g: &str| crate::w4a4::group_on(&verify_groups, g);
+        let gdn_wide = |part: &str| crate::w4a4::gdn_part_on(&prefill_groups, part);
+        let gdn_narrow = |part: &str| crate::w4a4::gdn_part_on(&verify_groups, part);
         let lm = "model.language_model";
         let mut enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut narrow_enabled: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -20573,14 +20575,15 @@ impl GpuModel {
                     add(&fa.o_proj, &[format!("{lp}.self_attn.o_proj")], attn_w, attn_n);
                     if let Some(ix) = &fa.indexer { add(&ix.qk_proj, &[format!("{lp}.self_attn.indexer.index_qk_proj")], attn_w, attn_n); }
                 } }
-                let (gdn_w, gdn_n) = (wide("gdn"), narrow("gdn"));
-                if gdn_w || gdn_n { if let Some(la) = &l.la {
+                let (gdn_in_w, gdn_in_n) = (gdn_wide("gdn-in"), gdn_narrow("gdn-in"));
+                let (gdn_out_w, gdn_out_n) = (gdn_wide("gdn-out"), gdn_narrow("gdn-out"));
+                if gdn_in_w || gdn_in_n || gdn_out_w || gdn_out_n { if let Some(la) = &l.la {
                     let n = |s: &str| format!("{lp}.linear_attn.{s}");
                     match &la.in_proj {
-                        GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")], gdn_w, gdn_n),
-                        GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")], gdn_w, gdn_n); add(z, &[n("in_proj_z")], gdn_w, gdn_n); add(b, &[n("in_proj_b")], gdn_w, gdn_n); add(a, &[n("in_proj_a")], gdn_w, gdn_n); }
+                        GdnIn::Fused(w) => add(w, &[n("in_proj_qkv"), n("in_proj_z"), n("in_proj_b"), n("in_proj_a")], gdn_in_w, gdn_in_n),
+                        GdnIn::Split { qkv, z, b, a } => { add(qkv, &[n("in_proj_qkv")], gdn_in_w, gdn_in_n); add(z, &[n("in_proj_z")], gdn_in_w, gdn_in_n); add(b, &[n("in_proj_b")], gdn_in_w, gdn_in_n); add(a, &[n("in_proj_a")], gdn_in_w, gdn_in_n); }
                     }
-                    add(&la.out_proj, &[n("out_proj")], gdn_w, gdn_n);
+                    add(&la.out_proj, &[n("out_proj")], gdn_out_w, gdn_out_n);
                 } }
                 match &l.mlp {
                     Ffn::Moe(m) => {

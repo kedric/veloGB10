@@ -328,6 +328,8 @@ fn print_help() {
     println!("  --mxfp4=on|off           QWEN: run fp4 decode/verify GEMMs on the native sm_121a");
     println!("                           OMMA path (same NVFP4 artifacts, lossless repack) — DEFAULT");
     println!("                           OFF; on = the tolerance-fork chain (acceptance re-baselined)");
+    println!("  GB10_W4A4_PREFILL=groups W4A4 prefill groups; gdn-in/gdn-out split GDN activation A4.");
+    println!("                           gdn remains an alias enabling both GDN projection sides.");
     println!("  GB10_W4A4_VERIFY=groups  EXPERIMENTAL W4A4 decode+verify; fails the lossless gate.");
     println!("                           Leave unset in production to preserve the W4A16 narrow chain.");
     println!("  GB10_W4A4_N8=0           Restore the wide narrow-path GEMM for performance A/B.");

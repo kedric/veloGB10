@@ -7,7 +7,8 @@
 //! this mode; the binding lossless gate fails, so production must leave this variable unset.
 //!
 //! Env: `GB10_W4A4_PREFILL=1` (groups expert,mlp,attn) or `GB10_W4A4_PREFILL=expert,attn,...`
-//! (any of expert mlp attn gdn hc ple lmhead — the same group names as the quantizer).
+//! (any of expert mlp attn gdn gdn-in gdn-out hc ple lmhead). `gdn` is the backward-compatible
+//! alias for both `gdn-in` (the four recurrent input projections) and `gdn-out` (out_proj).
 //! `GB10_W4A4_VERIFY=1` (attn,mlp,gdn) or a group list enables experimental narrow W4A4.
 //! `GB10_W4A4_N8=0` restores the wide 128-row GEMM for narrow-kernel A/B.
 //! `GB10_W4A4_TRACE=1` logs each dispatch. Per-tensor `input_global_scale` (compressed-tensors) is
@@ -86,6 +87,19 @@ pub fn verify_groups_from_env() -> Option<Vec<String>> {
     groups_from_var("GB10_W4A4_VERIFY", &["attn", "mlp", "gdn"])
 }
 
+#[inline]
+pub fn group_on(groups: &[String], name: &str) -> bool {
+    groups.iter().any(|g| g == name)
+}
+
+/// `gdn` retains the old all-projections behavior while the two granular names let serving keep
+/// the recurrent input or output side in A16 independently. This changes only activation dispatch;
+/// every selected projection continues to use the same MR-GPTQ NVFP4 weight artifact.
+#[inline]
+pub fn gdn_part_on(groups: &[String], part: &str) -> bool {
+    group_on(groups, "gdn") || group_on(groups, part)
+}
+
 impl W4a4State {
     pub fn build(dev: &Arc<CudaDevice>, groups: Vec<String>, enabled: HashSet<u64>, narrow_enabled: HashSet<u64>, x_gs: HashMap<u64, f32>,
                  rows_max: usize, k_max: usize, tiles_max: usize) -> anyhow::Result<Self> {
@@ -116,5 +130,33 @@ impl W4a4State {
     pub fn dense_grid(mf: usize, nt: usize) -> u32 {
         let tm = mf.div_ceil(128); let tn = nt.div_ceil(128);
         (tn.div_ceil(8) * 8 * tm) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gdn_part_on, group_on};
+
+    fn groups(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn gdn_alias_selects_both_parts() {
+        let selected = groups(&["attn", "gdn"]);
+        assert!(gdn_part_on(&selected, "gdn-in"));
+        assert!(gdn_part_on(&selected, "gdn-out"));
+    }
+
+    #[test]
+    fn granular_gdn_groups_are_independent() {
+        let input_only = groups(&["mlp", "gdn-in"]);
+        assert!(gdn_part_on(&input_only, "gdn-in"));
+        assert!(!gdn_part_on(&input_only, "gdn-out"));
+        assert!(group_on(&input_only, "mlp"));
+
+        let output_only = groups(&["gdn-out"]);
+        assert!(!gdn_part_on(&output_only, "gdn-in"));
+        assert!(gdn_part_on(&output_only, "gdn-out"));
     }
 }
