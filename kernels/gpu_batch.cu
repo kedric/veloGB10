@@ -11416,6 +11416,61 @@ extern "C" __global__ void gptq_absmax_b(unsigned int* out, const __nv_bfloat16*
     if ((threadIdx.x & 31) == 0) atomicMax(out, __float_as_uint(v));
 }
 
+// NVFP4 activation headroom calibration. One logical sample is the amax of a contiguous
+// 16-element activation block, matching the dynamic UE4M3 block scale consumed by W4A4. The
+// histogram is logarithmic so corpora with very different activation ranges can be merged by
+// adding counts instead of merging already-rounded global scales.
+//
+// stats layout: [512 log2 histogram bins | zero-block count | non-finite-block count], all u64.
+// `running_max` is the positive f32 bit-pattern, so integer atomicMax has the desired ordering.
+extern "C" __global__ void igs_hist_b(unsigned long long* stats, unsigned int* running_max,
+                                      const __nv_bfloat16* x, long long n) {
+    constexpr int NBINS = 512;
+    constexpr float LOG2_MIN = -40.0f;
+    constexpr float LOG2_MAX = 40.0f;
+    __shared__ unsigned int shist[NBINS];
+    __shared__ unsigned int sextra[2];
+    for (int i = threadIdx.x; i < NBINS; i += blockDim.x) shist[i] = 0;
+    if (threadIdx.x < 2) sextra[threadIdx.x] = 0;
+    __syncthreads();
+
+    const long long block = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long nblocks = (n + 15) / 16;
+    if (block < nblocks) {
+        const long long base = block * 16;
+        float amax = 0.0f;
+        bool invalid = false;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const long long i = base + j;
+            if (i < n) {
+                const float value = __bfloat162float(x[i]);
+                invalid |= !isfinite(value);
+                if (!invalid) amax = fmaxf(amax, fabsf(value));
+            }
+        }
+        if (invalid) {
+            atomicAdd(&sextra[1], 1u);
+        } else if (amax == 0.0f) {
+            atomicAdd(&sextra[0], 1u);
+        } else {
+            atomicMax(running_max, __float_as_uint(amax));
+            const float frac = (log2f(amax) - LOG2_MIN) / (LOG2_MAX - LOG2_MIN);
+            int bin = (int)floorf(frac * (float)NBINS);
+            bin = max(0, min(NBINS - 1, bin));
+            atomicAdd(&shist[bin], 1u);
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < NBINS; i += blockDim.x) {
+        const unsigned int count = shist[i];
+        if (count) atomicAdd(&stats[i], (unsigned long long)count);
+    }
+    if (threadIdx.x < 2 && sextra[threadIdx.x]) {
+        atomicAdd(&stats[NBINS + threadIdx.x], (unsigned long long)sextra[threadIdx.x]);
+    }
+}
+
 // In-place 16-point Hadamard (orthonormal, H/4) on every 16-vector of a [M, K] f32 matrix.
 // axis 0: vectors along the rows (elements row*K + 16b + i) — the K (input) dimension;
 // axis 1: vectors along the columns (elements (16b+i)*K + col) — for the Hessian's row side.

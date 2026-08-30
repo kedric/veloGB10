@@ -711,6 +711,23 @@ fn new_moe_grouped_scratch(dev: &Arc<CudaDevice>, cfg: &Config, p_max: usize) ->
     }
 }
 
+pub const IGS_HIST_BINS: usize = 512;
+pub const IGS_HIST_LOG2_MIN: f32 = -40.0;
+pub const IGS_HIST_LOG2_MAX: f32 = 40.0;
+
+pub(crate) struct IgsTapBuffers {
+    stats: cudarc::driver::CudaSlice<u64>,
+    running_max: cudarc::driver::CudaSlice<u32>,
+}
+
+/// Mergeable activation statistics for one physical NVFP4 GEMM input.
+#[derive(Clone, Debug)]
+pub struct IgsHistogram {
+    pub bins: Vec<u64>,
+    pub running_max: f32,
+    pub zero_blocks: u64,
+    pub invalid_blocks: u64,
+}
 pub struct GpuModel {
     dev: Arc<CudaDevice>,
     blas: CudaBlas,
@@ -772,8 +789,8 @@ pub struct GpuModel {
     pub(crate) w4a4: Option<crate::w4a4::W4a4State>,
     /// `{stem}.input_global_scale` values read from the artifact (compressed-tensors), by stem.
     pub(crate) igs_by_name: std::collections::HashMap<String, f32>,
-    /// `--calib-igs`: armed activation |x| max accumulators by NVFP4 qweight pointer (prefill GEMMs only).
-    pub(crate) igs_tap: std::sync::Mutex<Option<std::collections::HashMap<u64, cudarc::driver::CudaSlice<u32>>>>,
+    /// `--calib-igs`: armed per-block activation histograms by NVFP4 qweight pointer (prefill only).
+    pub(crate) igs_tap: std::sync::Mutex<Option<std::collections::HashMap<u64, IgsTapBuffers>>>,
     mtp: Option<GpuMtpLayer>,
     k: KernelTable,
     bk: HashMap<String, CudaFunction>,
@@ -3323,21 +3340,7 @@ impl GpuModel {
                     let mut keep: Vec<AssembledInner> = Vec::new();
                     let mut queued_bytes = 0usize;
                     let mut queued_copies = 0usize;
-                    let mut dev_bytes: u64 = 0;   // cumulative device-side upload (OOM hunt)
                     while let Ok(a) = rx.recv() {
-                        // Assembly-phase memory probe (122B economy OOM hunt, 2026-08-07): one
-                        // sample per received tensor — VmRSS/MemAvailable localize the climb.
-                        {
-                            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n % 8 == 0 {
-                                let rss = std::fs::read_to_string("/proc/self/status").ok()
-                                    .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).map(|l| l.to_string()));
-                                let avail = std::fs::read_to_string("/proc/meminfo").ok()
-                                    .and_then(|s| s.lines().find(|l| l.starts_with("MemAvailable:")).map(|l| l.to_string()));
-                                eprintln!("[mem] up#{n}: {rss:?} {avail:?} dev={:.1}GB", dev_bytes as f64 / 1e9);
-                            }
-                        }
                         let t = std::time::Instant::now();
                         let w = match a.w {
                             AssembledInner::Q4 { wt, st, gsv, m, k, omma } => {
@@ -3349,7 +3352,6 @@ impl GpuModel {
                                     let qweight = dev_ref.htod_sync_copy(&aimg).unwrap();
                                     let scales  = dev_ref.htod_sync_copy(&sfa).unwrap();
                                     let gs      = dev_ref.htod_sync_copy(&gsv).unwrap();
-                                    dev_bytes += (aimg.len() + sfa.len() + gsv.len() * 4) as u64;
                                     omma_map.insert(*qweight.device_ptr() as u64,
                                                     crate::mxfp4::OmmaEntry::Ptr(*qweight.device_ptr() as u64,
                                                                                  *scales.device_ptr() as u64));
@@ -4161,7 +4163,7 @@ impl GpuModel {
             "ple_dconv_decode_b","ple_dconv_prefill_b","ple_dconv_state_b","ple_slot_copy_b","hc_add_bcast_b",
             "qsa_key_write_b","qsa_score_b","qsa_block_keys_b","qsa_score_prefill_b","qsa_topk_b",
             "gqa_attn_sel_splitk","gqa_attn_sel_splitk_k8v4","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
-            "gptq_bf16_to_f32_b","gptq_absmax_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
+            "gptq_bf16_to_f32_b","gptq_absmax_b","igs_hist_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
             "gptq_silu_mul_gu_b","gptq_rotate_act_b","gptq_scale_stats_f32_b","gptq_scale_stats_bf16_b",
             "gptq_static_scales_b","gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
             "kernel_build_id"];
@@ -20771,21 +20773,36 @@ impl GpuModel {
     }
     pub fn igs_arm(&self, ptrs: &[u64]) {
         let mut m = std::collections::HashMap::new();
-        for &p in ptrs { m.entry(p).or_insert_with(|| self.dev.htod_sync_copy(&[0u32]).unwrap()); }
+        for &p in ptrs {
+            m.entry(p).or_insert_with(|| IgsTapBuffers {
+                stats: self.dev.htod_sync_copy(&vec![0u64; IGS_HIST_BINS + 2]).unwrap(),
+                running_max: self.dev.htod_sync_copy(&[0u32]).unwrap(),
+            });
+        }
         *self.igs_tap.lock().unwrap() = Some(m);
     }
-    /// Disarm and return the accumulated |x| max per pointer.
-    pub fn igs_disarm(&self) -> std::collections::HashMap<u64, f32> {
+    /// Disarm and return mergeable per-block histograms and the literal running max.
+    pub fn igs_disarm(&self) -> std::collections::HashMap<u64, IgsHistogram> {
         self.sync_stream();
         let m = self.igs_tap.lock().unwrap().take().unwrap_or_default();
-        m.iter().map(|(p, a)| { let mut o = [0u32]; unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut o, d(a)).unwrap(); } (*p, f32::from_bits(o[0])) }).collect()
+        m.iter().map(|(p, tap)| {
+            let raw = self.dev.dtoh_sync_copy(&tap.stats).unwrap();
+            let max_bits = self.dev.dtoh_sync_copy(&tap.running_max).unwrap()[0];
+            (*p, IgsHistogram {
+                bins: raw[..IGS_HIST_BINS].to_vec(),
+                running_max: f32::from_bits(max_bits),
+                zero_blocks: raw[IGS_HIST_BINS],
+                invalid_blocks: raw[IGS_HIST_BINS + 1],
+            })
+        }).collect()
     }
     #[inline] fn igs_armed(&self) -> bool { self.igs_tap.lock().unwrap().is_some() }
-    /// Fold `n` bf16 values of `x` into the accumulator of weight `ptr` (no-op when not armed).
+    /// Fold `n` bf16 values into the per-16 activation histogram for weight `ptr`.
     fn igs_tap_x(&self, ptr: u64, x: &B, n: usize) {
         let g = self.igs_tap.lock().unwrap();
         let Some(t) = g.as_ref() else { return; };
-        let Some(a) = t.get(&ptr) else { return; };
-        blaunch!(self, "gptq_absmax_b", grid(n), (256,1,1), 0, (d(a), d(x), n as i64));
+        let Some(tap) = t.get(&ptr) else { return; };
+        blaunch!(self, "igs_hist_b", grid(n.div_ceil(16)), (256,1,1), 0,
+            (d(&tap.stats), d(&tap.running_max), d(x), n as i64));
     }
 }

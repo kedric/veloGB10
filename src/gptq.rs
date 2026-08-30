@@ -22,7 +22,10 @@ use anyhow::{anyhow, Context, Result};
 use half::bf16;
 use cudarc::driver::DevicePtr;
 use base64::Engine;
-use crate::gpu::{GpuModel, GptqTap, GptqHess, W, B, S, Pool, AttnIn, GdnIn, Ffn};
+use crate::gpu::{
+    GpuModel, GptqTap, GptqHess, IgsHistogram, W, B, S, Pool, AttnIn, GdnIn, Ffn,
+    IGS_HIST_BINS, IGS_HIST_LOG2_MIN, IGS_HIST_LOG2_MAX,
+};
 use crate::quant::{self, Group};
 
 // ---------------------------------------------------------------- cuSOLVER (dense Cholesky)
@@ -1199,13 +1202,156 @@ pub fn parse_groups(s: &str) -> Result<Vec<Group>> {
 }
 
 
-/// `--calib-igs`: calibrate the W4A4 activation scales of an EXISTING quantized artifact without
-/// re-quantizing: a plain prefill of the calibration set through the served model, the |x| max of
-/// every NVFP4 GEMM input (after the MR rotation when there is one) captured by qweight pointer,
-/// `input_global_scale = 6*448 / amax` written to `<out>/input_global_scale.json` (stem -> value;
-/// the loader reads it next to the artifact's own `*.input_global_scale` tensors, json wins).
-pub fn calib_igs(model_dir: &Path, out: &Path, calib: &Path, nsamples: usize, seqlen: usize) -> Result<()> {
+/// Policy used to derive the reciprocal runtime input scale from mergeable block-amax statistics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IgsMethod {
+    Max,
+    Headroom,
+}
+
+impl IgsMethod {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "max" => Ok(Self::Max),
+            "headroom" => Ok(Self::Headroom),
+            other => Err(anyhow!("unknown --igs-method {other}; expected max or headroom")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self { Self::Max => "max", Self::Headroom => "headroom" }
+    }
+}
+
+/// NVIDIA-style NVFP4 activation headroom parameters. The artifact stores the reciprocal convention:
+/// `input_global_scale = 6*448/amax`, whereas ModelOpt exports `input_scale = amax/(6*448)`.
+#[derive(Clone, Copy, Debug)]
+pub struct IgsCalibConfig {
+    pub method: IgsMethod,
+    pub anchor_percentile: f32,
+    pub upper_percentile: f32,
+    pub rho: f32,
+}
+
+impl Default for IgsCalibConfig {
+    fn default() -> Self {
+        Self { method: IgsMethod::Headroom, anchor_percentile: 1.0, upper_percentile: 99.99, rho: 16384.0 }
+    }
+}
+
+impl IgsCalibConfig {
+    pub fn validate(self) -> Result<Self> {
+        anyhow::ensure!(self.anchor_percentile > 0.0 && self.anchor_percentile <= 100.0,
+                        "--igs-anchor-percentile must be in (0, 100]");
+        anyhow::ensure!(self.upper_percentile > 0.0 && self.upper_percentile <= 100.0,
+                        "--igs-upper-percentile must be in (0, 100]");
+        anyhow::ensure!(self.rho > 0.0 && self.rho < 28672.0,
+                        "--igs-rho must be in (0, 28672)");
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IgsScaleDiagnostic {
+    input_global_scale: f32,
+    selected_amax: f32,
+    anchor: Option<f32>,
+    upper: f32,
+    span: Option<f32>,
+    has_headroom: bool,
+    range_exceeds_e4m3: bool,
+}
+
+fn igs_hist_bin_index(value: f32) -> usize {
+    let frac = (value.log2() - IGS_HIST_LOG2_MIN) / (IGS_HIST_LOG2_MAX - IGS_HIST_LOG2_MIN);
+    (frac * IGS_HIST_BINS as f32).floor().clamp(0.0, (IGS_HIST_BINS - 1) as f32) as usize
+}
+
+fn igs_hist_bin_center(index: usize) -> f32 {
+    let log2 = IGS_HIST_LOG2_MIN
+        + (index as f32 + 0.5) / IGS_HIST_BINS as f32 * (IGS_HIST_LOG2_MAX - IGS_HIST_LOG2_MIN);
+    2.0f32.powf(log2)
+}
+
+fn igs_hist_percentile(hist: &[u64], percentile: f32, floor_value: Option<f32>) -> Option<f32> {
+    if hist.len() != IGS_HIST_BINS { return None; }
+    let floor_bin = floor_value.filter(|v| *v > 0.0).map(igs_hist_bin_index).unwrap_or(0);
+    let total: u64 = hist[floor_bin..].iter().sum();
+    if total == 0 { return None; }
+    let target = percentile as f64 / 100.0 * total as f64;
+    let mut cumulative = 0u64;
+    for (index, &count) in hist.iter().enumerate().skip(floor_bin) {
+        cumulative = cumulative.saturating_add(count);
+        if cumulative as f64 >= target {
+            return Some(igs_hist_bin_center(index));
+        }
+    }
+    None
+}
+
+fn igs_scale_from_hist(stats: &IgsHistogram, cfg: IgsCalibConfig) -> Option<IgsScaleDiagnostic> {
+    if !stats.running_max.is_finite() || stats.running_max <= 0.0 || stats.invalid_blocks != 0 {
+        return None;
+    }
+    if cfg.method == IgsMethod::Max {
+        return igs_of(stats.running_max).map(|scale| IgsScaleDiagnostic {
+            input_global_scale: scale,
+            selected_amax: stats.running_max,
+            anchor: None,
+            upper: stats.running_max,
+            span: None,
+            has_headroom: false,
+            range_exceeds_e4m3: false,
+        });
+    }
+
+    let upper = if cfg.upper_percentile >= 100.0 {
+        stats.running_max
+    } else {
+        igs_hist_percentile(&stats.bins, cfg.upper_percentile, None).unwrap_or(stats.running_max)
+    };
+    let anchor = igs_hist_percentile(&stats.bins, cfg.anchor_percentile, Some(upper / 1.0e6));
+    let Some(anchor) = anchor.filter(|v| v.is_finite() && *v > 0.0) else {
+        return igs_of(stats.running_max).map(|scale| IgsScaleDiagnostic {
+            input_global_scale: scale,
+            selected_amax: stats.running_max,
+            anchor: None,
+            upper: stats.running_max,
+            span: None,
+            has_headroom: false,
+            range_exceeds_e4m3: false,
+        });
+    };
+    let span = upper / anchor;
+    let selected_amax = upper.max(cfg.rho * anchor);
+    igs_of(selected_amax).map(|scale| IgsScaleDiagnostic {
+        input_global_scale: scale,
+        selected_amax,
+        anchor: Some(anchor),
+        upper,
+        span: Some(span),
+        has_headroom: cfg.rho * anchor > upper,
+        range_exceeds_e4m3: span > 28672.0,
+    })
+}
+
+/// Calibrate W4A4 input scales on an existing final W4 artifact. Statistics are collected after any
+/// MR rotation. The default headroom policy follows NVIDIA's per-16 block-amax histogram method and
+/// emits a mergeable sidecar; `--igs-method max` retains the legacy literal-max behavior.
+pub fn calib_igs(
+    model_dir: &Path,
+    out: &Path,
+    calib: &Path,
+    nsamples: usize,
+    seqlen: usize,
+    igs_cfg: IgsCalibConfig,
+) -> Result<()> {
+    let igs_cfg = igs_cfg.validate()?;
     if std::env::var("GB10_PLE_OFFLOAD").is_err() { std::env::set_var("GB10_PLE_OFFLOAD", "ssd"); }
+    anyhow::ensure!(std::env::var_os("GB10_W4A4_PREFILL").is_none(),
+                    "--calib-igs must collect the unquantized GEMM inputs; unset GB10_W4A4_PREFILL before calibration");
+    anyhow::ensure!(std::env::var_os("GB10_W4A4_VERIFY").is_none(),
+                    "--calib-igs must collect the unquantized GEMM inputs; unset GB10_W4A4_VERIFY before calibration");
     std::fs::create_dir_all(out)?;
     let t_all = std::time::Instant::now();
     let (gpu, cfg) = GpuModel::load_from_dir(&model_dir.to_string_lossy())?;
@@ -1214,8 +1360,9 @@ pub fn calib_igs(model_dir: &Path, out: &Path, calib: &Path, nsamples: usize, se
     let sample_count = vision_samples.as_ref().map_or_else(|| samples.as_ref().unwrap().len(), Vec::len);
     let weights = gpu.nvfp4_weights_by_name();
     let ptrs: Vec<u64> = weights.iter().map(|w| w.1).collect();
-    println!("[calib-igs] {} {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)", sample_count,
-             if vision_samples.is_some() { "vision" } else { "text" }, { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
+    println!("[calib-igs] method={} — {} {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)",
+             igs_cfg.method.name(), sample_count, if vision_samples.is_some() { "vision" } else { "text" },
+             { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
     gpu.igs_arm(&ptrs);
     let mut pool = Pool::new(gpu.gptq_dev().clone());
     let mut state = gpu.new_batch_state(1, 1, seqlen);
@@ -1230,16 +1377,78 @@ pub fn calib_igs(model_dir: &Path, out: &Path, calib: &Path, nsamples: usize, se
             &sample.tokens
         } else { &samples.as_ref().unwrap()[s] };
         let _ = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0, seqlen, 0, 0, nl, None);
-        if (s + 1) % 32 == 0 || s + 1 == sample_count { gpu.gptq_sync(); println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, sample_count, t_all.elapsed().as_secs_f32() / 60.0); }
+        if (s + 1) % 32 == 0 || s + 1 == sample_count {
+            gpu.gptq_sync();
+            println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, sample_count, t_all.elapsed().as_secs_f32() / 60.0);
+        }
     }
-    let amax = gpu.igs_disarm();
-    let mut js = serde_json::Map::new();
-    let (mut n_ok, mut n_zero) = (0, 0);
+
+    let histograms = gpu.igs_disarm();
+    let mut scales = serde_json::Map::new();
+    let mut stem_stats = serde_json::Map::new();
+    let (mut n_ok, mut n_unfed, mut n_invalid, mut n_wide) = (0, 0, 0, 0);
     for (stem, ptr, _k) in &weights {
-        match amax.get(ptr).copied().and_then(igs_of) { Some(g) => { js.insert(stem.clone(), serde_json::json!(g)); n_ok += 1; } None => { n_zero += 1; } }
+        let Some(stats) = histograms.get(ptr) else { n_unfed += 1; continue; };
+        let diag = igs_scale_from_hist(stats, igs_cfg);
+        if stats.invalid_blocks > 0 { n_invalid += 1; }
+        if let Some(d) = &diag {
+            scales.insert(stem.clone(), serde_json::json!(d.input_global_scale));
+            n_ok += 1;
+            if d.range_exceeds_e4m3 { n_wide += 1; }
+        } else {
+            n_unfed += 1;
+        }
+        let nonzero_blocks: u64 = stats.bins.iter().sum();
+        stem_stats.insert(stem.clone(), serde_json::json!({
+            "histogram": stats.bins,
+            "running_max": stats.running_max,
+            "zero_blocks": stats.zero_blocks,
+            "invalid_blocks": stats.invalid_blocks,
+            "nonzero_blocks": nonzero_blocks,
+            "anchor": diag.as_ref().and_then(|d| d.anchor),
+            "upper": diag.as_ref().map(|d| d.upper),
+            "span": diag.as_ref().and_then(|d| d.span),
+            "selected_amax": diag.as_ref().map(|d| d.selected_amax),
+            "input_global_scale": diag.as_ref().map(|d| d.input_global_scale),
+            "has_headroom": diag.as_ref().map(|d| d.has_headroom),
+            "range_exceeds_e4m3": diag.as_ref().map(|d| d.range_exceeds_e4m3),
+        }));
     }
-    std::fs::write(out.join("input_global_scale.json"), serde_json::to_string_pretty(&serde_json::Value::Object(js))?)?;
-    println!("[calib-igs] {n_ok} scales written ({n_zero} weights never fed at this seqlen) → {} in {:.1} min", out.join("input_global_scale.json").display(), t_all.elapsed().as_secs_f32() / 60.0);
+
+    let stats_doc = serde_json::json!({
+        "format": "veloGB10-igs-hist-v2",
+        "scale_convention": "input_global_scale = 2688 / activation_amax",
+        "block_size": 16,
+        "histogram": {
+            "bins": IGS_HIST_BINS,
+            "log2_min": IGS_HIST_LOG2_MIN,
+            "log2_max": IGS_HIST_LOG2_MAX,
+        },
+        "policy": {
+            "method": igs_cfg.method.name(),
+            "anchor_percentile": igs_cfg.anchor_percentile,
+            "upper_percentile": igs_cfg.upper_percentile,
+            "rho": igs_cfg.rho,
+        },
+        "calibration": {
+            "model_dir": model_dir,
+            "corpus": calib,
+            "nsamples": sample_count,
+            "seqlen": seqlen,
+        },
+        "stems": stem_stats,
+    });
+    let stats_path = out.join("input_global_scale.stats.json");
+    std::fs::write(&stats_path, serde_json::to_string_pretty(&stats_doc)? + "\n")?;
+    anyhow::ensure!(n_invalid == 0,
+                    "{n_invalid} stems observed non-finite activations; refusing to write scales (stats: {})",
+                    stats_path.display());
+
+    let scale_path = out.join("input_global_scale.json");
+    std::fs::write(&scale_path, serde_json::to_string_pretty(&serde_json::Value::Object(scales))? + "\n")?;
+    println!("[calib-igs] {n_ok} scales written ({n_unfed} unfed, {n_wide} spans > E4M3 normal range) → {} in {:.1} min",
+             scale_path.display(), t_all.elapsed().as_secs_f32() / 60.0);
+    println!("[calib-igs] mergeable histogram stats → {}", stats_path.display());
     Ok(())
 }
 
@@ -1291,6 +1500,67 @@ pub fn refmt(input: &Path, out: &Path, fp8_groups: &[Group], nvfp4_groups: &[Gro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn igs_headroom_uses_block_distribution_not_literal_outlier() {
+        let mut stats = IgsHistogram {
+            bins: vec![0; IGS_HIST_BINS],
+            running_max: 100.0,
+            zero_blocks: 0,
+            invalid_blocks: 0,
+        };
+        let common_bin = igs_hist_bin_index(1.0);
+        stats.bins[common_bin] = 10_000;
+        stats.bins[igs_hist_bin_index(100.0)] = 1;
+        let diag = igs_scale_from_hist(&stats, IgsCalibConfig::default()).unwrap();
+        let anchor = igs_hist_bin_center(common_bin);
+        assert_eq!(diag.anchor, Some(anchor));
+        assert!((diag.selected_amax - 16384.0 * anchor).abs() < diag.selected_amax * 1e-6);
+        assert!(diag.has_headroom);
+        assert!(!diag.range_exceeds_e4m3);
+    }
+
+    #[test]
+    fn igs_max_mode_preserves_legacy_reciprocal_scale() {
+        let stats = IgsHistogram {
+            bins: vec![0; IGS_HIST_BINS],
+            running_max: 42.0,
+            zero_blocks: 3,
+            invalid_blocks: 0,
+        };
+        let cfg = IgsCalibConfig { method: IgsMethod::Max, ..IgsCalibConfig::default() };
+        let diag = igs_scale_from_hist(&stats, cfg).unwrap();
+        assert_eq!(diag.selected_amax, 42.0);
+        assert!((diag.input_global_scale - 2688.0 / 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn igs_headroom_flags_ranges_no_single_e4m3_global_scale_can_cover() {
+        let mut stats = IgsHistogram {
+            bins: vec![0; IGS_HIST_BINS],
+            running_max: 2.0f32.powi(20),
+            zero_blocks: 0,
+            invalid_blocks: 0,
+        };
+        // Keep the anchor above the deliberate upper/1e6 noise-floor cutoff while still
+        // exceeding the E4M3 normal-range ratio.
+        stats.bins[igs_hist_bin_index(2.0)] = 10_000;
+        stats.bins[igs_hist_bin_index(2.0f32.powi(20))] = 10_000;
+        let diag = igs_scale_from_hist(&stats, IgsCalibConfig::default()).unwrap();
+        assert!(diag.range_exceeds_e4m3);
+        assert!(!diag.has_headroom);
+    }
+
+    #[test]
+    fn igs_rejects_non_finite_activation_blocks() {
+        let stats = IgsHistogram {
+            bins: vec![1; IGS_HIST_BINS],
+            running_max: 1.0,
+            zero_blocks: 0,
+            invalid_blocks: 1,
+        };
+        assert!(igs_scale_from_hist(&stats, IgsCalibConfig::default()).is_none());
+    }
 
     #[test]
     fn pretokenized_calibration_preserves_sample_boundaries() {
