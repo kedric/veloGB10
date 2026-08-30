@@ -4160,7 +4160,7 @@ impl GpuModel {
             "ple_hash_b","ple_ring_commit_b","ple_gather_rows_b","ple_dequant_rows_b","ple_gate_b",
             "ple_dconv_decode_b","ple_dconv_prefill_b","ple_dconv_state_b","ple_slot_copy_b","hc_add_bcast_b",
             "qsa_key_write_b","qsa_score_b","qsa_block_keys_b","qsa_score_prefill_b","qsa_topk_b",
-            "gqa_attn_sel_splitk","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
+            "gqa_attn_sel_splitk","gqa_attn_sel_splitk_k8v4","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
             "gptq_bf16_to_f32_b","gptq_absmax_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
             "gptq_silu_mul_gu_b","gptq_rotate_act_b","gptq_scale_stats_f32_b","gptq_scale_stats_bf16_b",
             "gptq_static_scales_b","gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
@@ -8758,7 +8758,13 @@ impl GpuModel {
             // the K reader swaps to the u32-int8 + fp16-scale dequant (dequant_kv_k8v4's formula),
             // the V channel stays the q4 nibble reader. K rows are 20 B/16, V rows 12 B/16, so
             // the packed kernels carry both row sizes; the launch shapes are unchanged.
-            if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
+            if let Some((sel_ptr, pos_sel_ptr)) = qsa_sel {
+                // qwen4_exp QSA over the k8v4 cache: the selection-list reader with the k8v4 row
+                // dequant (gqa_attn_sel_splitk_k8v4); the reduce below reads the same pos_sel.
+                blaunch!(self, "gqa_attn_sel_splitk_k8v4", ((batch * nh * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
+                    (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
+                     pos_sel_ptr, bs_packed, nh_packed, slot_ids_ptr, sel_ptr, self.qsa_limit() as i32));
+            } else if (hd == 128 || hd == 256) && (2..=8).contains(&gqa_ratio) && !no_gqpack {
                 blaunch!(self, "gqa_attn_splitk_k8v4_gq", ((batch * nkv * ns_grid) as u32,1,1), (hd as u32,1,1), smem,
                     (d(&pm), d(&pl), d(&pa), d(q), kc_ptr, vc_ptr,
                      logical_ptr, bs_packed, nh_packed, slot_ids_ptr, path_ptr, col_pos_start_ptr));
@@ -8804,7 +8810,7 @@ impl GpuModel {
             }
         }
         }
-        let reduce_pos_ptr = match (kv_mode, qsa_sel) { (KVCacheMode::Bf16, Some((_, p))) => p, _ => logical_ptr };
+        let reduce_pos_ptr = match (kv_mode, qsa_sel) { (KVCacheMode::Bf16 | KVCacheMode::K8v4, Some((_, p))) => p, _ => logical_ptr };
         blaunch!(self, "gqa_attn_reduce", ((batch*nh) as u32,1,1), (hd as u32,1,1), 0,
             (d(&attn), d(&pm), d(&pl), d(&pa), reduce_pos_ptr, ns_grid as i32, batch as i32, nh_packed));
         if let Some(qrqs) = tq_qrqs { pool.release(qrqs, batch * nh * 2 * hd); }
@@ -10699,6 +10705,14 @@ impl GpuModel {
                         }
                         let npos = pos_start + n;
                         let budget = self.kv_mirror_budget(kv_stride);
+                        // qwen4_exp QSA on a packed cache (k8v4; qsa_enabled refuses q4/tq): raw keys
+                        // -> the slot's indexer cache, then per-query block selection. The selected
+                        // attention below reads the bf16 dequant (mirror or scratch), never the
+                        // packed rows — the same values the tiled path would read.
+                        let qsa_sel_p: Option<(S, S)> = self.qsa_in(state, fa, li, kv_stride, 0, 0, 0).and_then(|qs| {
+                            let keys_ptr = qs.keys_ptr + (slot * kv_stride * cfg.indexer_head_dim * 2) as u64;
+                            self.qsa_select_prefill(pool, qs.idx, &normed, keys_ptr, kv_stride, pos_start, n, &cos, &sin)
+                        });
                         if npos <= budget && (pos_start > 0 || state.kv_mirror[li][slot].is_some()) {
                             // Mirror arm. The watermark is the whole rule: rows [0, up_to) are
                             // valid, so the range to dequant is [up_to, npos) — a fresh mirror
@@ -10738,7 +10752,9 @@ impl GpuModel {
                                 }
                                 m.up_to = npos;
                             }
-                            if n >= PF_MIN && !prefill_scalar() {
+                            if let Some((sel, pos_sel)) = &qsa_sel_p {
+                                self.qsa_attn_prefill_ptrs(&mut attn, &q, mk, mv, budget, nh, nkv, hd, scale, n, d(sel), d(pos_sel));
+                            } else if n >= PF_MIN && !prefill_scalar() {
                                 self.attn_prefill_tiled(pool, &q, mk, mv, budget, nh, nkv, n, pos_start, &mut attn);
                             } else {
                                 let qt = (hd / 32).max(1);
@@ -10771,7 +10787,9 @@ impl GpuModel {
                                 (d(&vdq), vc_ptr, nkv as i32, kv_stride as i32, hd as i32, npos as i32, 0i32, npos as i32));
                         }
                         let (kqs, vqs) = (d(&kdq), d(&vdq));
-                        if n >= PF_MIN && !prefill_scalar() {
+                        if let Some((sel, pos_sel)) = &qsa_sel_p {
+                            self.qsa_attn_prefill_ptrs(&mut attn, &q, kqs, vqs, npos, nh, nkv, hd, scale, n, d(sel), d(pos_sel));
+                        } else if n >= PF_MIN && !prefill_scalar() {
                             self.attn_prefill_tiled(pool, &q, kqs, vqs, npos, nh, nkv, n, pos_start, &mut attn);
                         } else {
                             let qt = (hd / 32).max(1);
@@ -19726,8 +19744,10 @@ impl GpuModel {
     pub fn qsa_enabled(&self, kv_stride: usize) -> bool {
         if !self.cfg.has_indexer() || kv_stride <= self.qsa_limit() { return false; }
         if std::env::var("GB10_Q4_DENSE_ATTN").is_ok() { return false; }
-        assert!(!(self.kv_quant || self.kv_tq || self.kv_k8v4),
-                "qwen4_exp QSA sparse attention reads a bf16 KV cache: use --kv-cache bf16 (or --max-seq-len <= {})", self.qsa_limit());
+        // k8v4 is served by gqa_attn_sel_splitk_k8v4 (decode/verify) and by the bf16 dequant
+        // mirror/scratch (prefill); q4 and tq have no selection-list reader yet.
+        assert!(!(self.kv_quant || self.kv_tq),
+                "qwen4_exp QSA sparse attention reads a bf16 or k8v4 KV cache: use --kv-cache bf16|k8v4 (or --max-seq-len <= {})", self.qsa_limit());
         true
     }
 

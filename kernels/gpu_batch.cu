@@ -11060,6 +11060,141 @@ extern "C" __global__ void gqa_attn_sel_splitk(
     }
 }
 
+// 6b. gqa_attn_sel_splitk_k8v4 — gqa_attn_sel_splitk over the k8v4 packed cache: K rows of 20 B/16
+//     (int8 codes + fp16 block scale), V rows of 12 B/16 (q4 nibbles + e4m3 block scale). The row
+//     dequant is gqa_attn_splitk_k8v4's, the key set is the column's selection list; split structure,
+//     warp stride, reduction order and merge are the bf16 kernel's verbatim, so gqa_attn_reduce (with
+//     pos = pos_sel) finishes it unchanged and decode == verify col-0 holds as for the dense pair.
+extern "C" __global__ void gqa_attn_sel_splitk_k8v4(
+    float* out_m, float* out_l, float* out_acc,
+    const __nv_bfloat16* q, const unsigned char* k_cache, const unsigned char* v_cache,
+    const int* pos_sel, long long bs_packed, int nh_packed, const int* slot_ids,
+    const int* sel, int sel_max) {
+    const int nh  = nh_packed >> 20;
+    const int hd  = (nh_packed >> 10) & 0x3FF;
+    const int nkv = nh_packed & 0x3FF;
+    const float scale = 1.0f / sqrtf((float)hd);
+    const int gqa_ratio = nh / nkv;
+    const int stride  = (int)(bs_packed & 0x7FFFF);
+    const int ns_grid = (int)((bs_packed >> 19) & 0x3F);
+    const int B       = (int)((bs_packed >> 25) & 0x3F);
+    const long long q_pitch = (bs_packed >> 31) & 0x7FFFF;
+
+    const int blk = blockIdx.x;
+    const int qh = blk / (ns_grid * B);
+    const int rem = blk % (ns_grid * B);
+    const int split = rem / B;
+    const int b = rem % B;
+    const int kvh = qh / gqa_ratio;
+    const int pc = pos_sel[b] + 1;
+    const int slot = slot_ids[b];
+    const int* srow = sel + (long long)b * sel_max;
+
+    const int ns = sk_nsplits(pc);
+    if (split >= ns) return;
+    const int split_size = (pc + ns - 1) / ns;
+    const int start = split * split_size;
+    const int end = min(start + split_size, pc);
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int NW = blockDim.x >> 5;
+    const int DPL = hd >> 5;
+
+    const long long idx = ((long long)b * nh + qh) * ns_grid + split;
+    if (start >= pc) {
+        if (threadIdx.x == 0) { out_m[idx] = -1e30f; out_l[idx] = 0.0f; }
+        if (threadIdx.x < hd) out_acc[idx * hd + threadIdx.x] = 0.0f;
+        return;
+    }
+
+    const __nv_bfloat16* qrow = q + (long long)b * q_pitch + (long long)qh * hd + lane * DPL;
+    float qv[SK_DPL_MAX];
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) qv[i] = (i < DPL) ? b2f(qrow[i]) : 0.0f;
+
+    float m = -1e30f, l = 0.0f;
+    float acc[SK_DPL_MAX];
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) acc[i] = 0.0f;
+
+    const int k_rb = KV8_ROW_BYTES(hd);              // K rows: 20 B/16
+    const int v_rb = KVQ_ROW_BYTES(hd);              // V rows: 12 B/16
+    const int lane_blk = (lane * DPL) / KVQ_BLK;     // the 16-block holding this lane's slice
+    const int lane_off = (lane * DPL) % KVQ_BLK;     // its first code within the block (4-aligned)
+    const long long kvbase = ((long long)slot * nkv + kvh) * stride;
+    const unsigned char* kb = k_cache + kvbase * k_rb + lane_blk * 20;
+    const unsigned char* vb = v_cache + kvbase * v_rb + lane_blk * 12;
+    for (int r = start + warp; r < end; r += NW) {
+        const int t = srow[r];
+        const unsigned char* krow = kb + (long long)t * k_rb;
+        const float ksc = __half2float(__ushort_as_half(*(const unsigned short*)(krow + KVQ_BLK)));
+        const uint32_t* kcodes = (const uint32_t*)(krow + lane_off);   // 4 aligned int8 codes
+        float kdq[SK_DPL_MAX];
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) kdq[i] = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < SK_DPL_MAX / 4; u++) {
+            if (u >= DPL / 4) break;
+            const uint32_t codes = kcodes[u];
+            kdq[u * 4 + 0] = (float)((int8_t)(codes >> 0)) * ksc;
+            kdq[u * 4 + 1] = (float)((int8_t)(codes >> 8)) * ksc;
+            kdq[u * 4 + 2] = (float)((int8_t)(codes >> 16)) * ksc;
+            kdq[u * 4 + 3] = (float)((int8_t)(codes >> 24)) * ksc;
+        }
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) s += qv[i] * kdq[i];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+        s *= scale;
+
+        const float m_new = fmaxf(m, s);
+        const float a_old = __expf(m - m_new), a_cur = __expf(s - m_new);
+        const unsigned char* vrow = vb + (long long)t * v_rb;
+        const float vsc = e4m3_f(vrow[8]);
+        const unsigned short* vcodes = (const unsigned short*)(vrow + lane_off / 2);
+        float vdq[SK_DPL_MAX];
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) vdq[i] = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < SK_DPL_MAX / 4; u++) {
+            if (u >= DPL / 4) break;
+            const int pk = (int)vcodes[u];   // SIGNED: `(pk & 0xF) - 7` in unsigned wraps nibble<7 to ~4.3e9
+            vdq[u * 4 + 0] = (float)((pk & 0xF) - 7) * vsc;
+            vdq[u * 4 + 1] = (float)(((pk >> 4) & 0xF) - 7) * vsc;
+            vdq[u * 4 + 2] = (float)(((pk >> 8) & 0xF) - 7) * vsc;
+            vdq[u * 4 + 3] = (float)(((pk >> 12) & 0xF) - 7) * vsc;
+        }
+        #pragma unroll
+        for (int i = 0; i < SK_DPL_MAX; i++) acc[i] = acc[i] * a_old + a_cur * vdq[i];
+        m = m_new;
+        l = l * a_old + a_cur;
+    }
+
+    extern __shared__ float sh[];
+    float* sacc = sh;
+    float* sm   = sh + NW * hd;
+    float* sl   = sm + NW;
+    #pragma unroll
+    for (int i = 0; i < SK_DPL_MAX; i++) if (i < DPL) sacc[warp * hd + lane * DPL + i] = acc[i];
+    if (lane == 0) { sm[warp] = m; sl[warp] = l; }
+    __syncthreads();
+
+    if (threadIdx.x < hd) {
+        const int d = threadIdx.x;
+        float mg = -1e30f;
+        for (int w = 0; w < NW; w++) mg = fmaxf(mg, sm[w]);
+        float num = 0.0f, den = 0.0f;
+        for (int w = 0; w < NW; w++) {
+            const float a = __expf(sm[w] - mg);
+            num += sacc[w * hd + d] * a;
+            den += sl[w] * a;
+        }
+        out_acc[idx * hd + d] = num;
+        if (d == 0) { out_m[idx] = mg; out_l[idx] = den; }
+    }
+}
+
 // 7. gqa_attn_sel_prefill — causal prefill attention over per-query selection lists (one warp per
 //    query, its whole softmax in registers, gqa_attn_prefill's arithmetic). Prefill is outside the
 //    batch-invariance contract, so no split structure is needed. k/v pointers are the SLOT base.
