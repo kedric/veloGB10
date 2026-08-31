@@ -22,6 +22,11 @@ coverage statistics, hashes, and whether ACDM used a true task reference or the 
 Run from the repository root. `RESERVE_SEQUENCES` adds candidates beyond the exact GPTQ token
 budget; those extra records are available to COLA/ACDM without changing the final budget.
 
+For the public-only v9 recipe (pinned revisions, SHA-256 verification, no local checkout content,
+and an entirely Rust data-transformation path), use
+[`PUBLIC_CALIBRATION_DATASETS.md`](PUBLIC_CALIBRATION_DATASETS.md) instead of the legacy recipe
+shown below.
+
 ```bash
 export SRC="$HOME/models/Qwen3.8-Flash-Next"
 export CANDIDATES="$HOME/models/calibration-sources/qwen38-maca-candidates.jsonl"

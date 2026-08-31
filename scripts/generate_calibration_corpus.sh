@@ -95,9 +95,10 @@ fi
 if [ -n "$exclude_jsonl" ]; then
     set -- "$@" --exclude-jsonl "$exclude_jsonl"
 fi
-python3 "$script_dir/prepare_calibration_sources.py" "$@"
-
 cd "$repo_dir"
+cargo build --release --bin calib_sources
+"$repo_dir/target/release/calib_sources" prepare "$@"
+
 cargo build --release --bin calib_compose
 
 set -- "$repo_dir/target/release/calib_compose" \

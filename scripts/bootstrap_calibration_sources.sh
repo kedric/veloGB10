@@ -8,6 +8,7 @@ fi
 
 source_root=$1
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(dirname -- "$script_dir")
 mkdir -p "$source_root"
 
 fetch_file() {
@@ -81,12 +82,12 @@ verify_file() {
 }
 
 fetch_file \
-    "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz?download=true" \
+    "https://huggingface.co/datasets/allenai/c4/resolve/1588ec454efa1a09f29cd18ddd04fe05fc8653a2/en/c4-train.00000-of-01024.json.gz?download=true" \
     "$source_root/c4/en/c4-train.00000-of-01024.json.gz" \
     "8ef8d75b0e045dec4aa5123a671b4564466b0707086a7ed1ba8721626dfffbc9"
 
 fetch_file \
-    "https://huggingface.co/datasets/FreedomIntelligence/alpaca-gpt4-french/resolve/main/alpaca-gpt4-french.json?download=true" \
+    "https://huggingface.co/datasets/FreedomIntelligence/alpaca-gpt4-french/resolve/79a2b0a3341c2bd4fcfa581eaf32f571d6eaa6cf/alpaca-gpt4-french.json?download=true" \
     "$source_root/alpaca-fr/alpaca-gpt4-french.json" \
     "a4ff954113efc92131129a65153650de37a4bea217af815d61ece0d2e9b00dcc"
 
@@ -110,7 +111,20 @@ fetch_git "https://github.com/koalaman/shellcheck.git" \
 fetch_git "https://github.com/microsoft/TypeScript-Website.git" \
     "$source_root/code/typescript-website" "d16dc2dc9bb11406f608c5ac1476c32a5bc806d9"
 
-python3 "$script_dir/fetch_calibration_api.py" --output-root "$source_root"
+# Public Apache-2.0 snapshots used by the v9 public recipe. Their immutable
+# Hub revisions and SHA-256 values avoid any machine-local input.
+fetch_file \
+    "https://huggingface.co/datasets/interstellarninja/toolace_sequential_tool_use_reasoning/resolve/d403e800de96bd7fec58902eddf431a485522a2f/data/train-00000-of-00001.parquet?download=true" \
+    "$source_root/toolace/sequential-tool-use.parquet" \
+    "51b600ae99d55fa36da7902876c21a219ddcea8db2a6f2a9376989dc8912741e"
+
+fetch_file \
+    "https://huggingface.co/datasets/Johin/function-calling-dataset/resolve/ef3f5c4ce7cbf80b55f017fdb8695226cfad0976/data/train.jsonl?download=true" \
+    "$source_root/johin/function-calling.jsonl" \
+    "8a7f9113159588e99f71fa53af919184ef469b02b770f3f0a0c7252762381618"
+
+cargo build --manifest-path "$repo_dir/Cargo.toml" --release --bin calib_sources
+"$repo_dir/target/release/calib_sources" fetch-api --output-root "$source_root"
 verify_file "$source_root/aya/aya-six-languages.jsonl" \
     "f4b36c268ddd3b46fab0936511614d868f04679db07508361c640fe24840249f"
 verify_file "$source_root/openr1/openr1-math-reasoning.jsonl" \
