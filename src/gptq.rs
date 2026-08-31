@@ -23,7 +23,7 @@ use half::bf16;
 use cudarc::driver::DevicePtr;
 use base64::Engine;
 use crate::gpu::{
-    GpuModel, GptqTap, GptqHess, IgsHistogram, W, B, S, Pool, AttnIn, GdnIn, Ffn,
+    GpuModel, GptqTap, GptqHess, IgsHistogram, CalibLayerProfile, W, B, S, Pool, AttnIn, GdnIn, Ffn,
     IGS_HIST_BINS, IGS_HIST_LOG2_MIN, IGS_HIST_LOG2_MAX,
 };
 use crate::quant::{self, Group};
@@ -636,7 +636,11 @@ pub fn profile_calibration(
     let manifest = serde_json::json!({
         "format": "veloGB10-calibration-profile-manifest-v1",
         "model_dir": std::fs::canonicalize(model_dir)?,
-        "candidate_corpus": std::fs::canonicalize(calib)?,
+        "candidate_corpus": if calib.to_string_lossy() == "random" {
+            serde_json::Value::String("random".to_string())
+        } else {
+            serde_json::to_value(std::fs::canonicalize(calib)?)?
+        },
         "output": out,
         "samples": samples.len(),
         "total_tokens": total_tokens,
@@ -652,6 +656,212 @@ pub fn profile_calibration(
     println!(
         "[calib-profile] wrote {} profiles / {total_tokens} tokens -> {}",
         samples.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+/// Profile a BF16 source checkpoint one layer at a time while using a quantized artifact only as
+/// the memory-resident model skeleton. This is the profiling analogue of sequential GPTQ: all base
+/// layer weights are dropped, source BF16 layers are installed one at a time, and each candidate's
+/// hidden stream is retained between layers. The base still supplies the PLE table, matching the
+/// actual GPTQ path for qwen4_exp without ever making the full source checkpoint resident.
+pub fn profile_calibration_sequential(
+    source: &Path,
+    base: &Path,
+    calib: &Path,
+    out: &Path,
+    nsamples: usize,
+    max_seqlen: usize,
+    layers: &[usize],
+    sketch_dim: usize,
+) -> Result<()> {
+    anyhow::ensure!(!out.exists(), "refusing to overwrite {}", out.display());
+    anyhow::ensure!(
+        nsamples > 0 && max_seqlen > 0,
+        "profile sample count and max sequence length must be positive"
+    );
+    anyhow::ensure!(
+        (1..=256).contains(&sketch_dim),
+        "--profile-sketch-dim must be 1..256"
+    );
+    if std::env::var("GB10_PLE_OFFLOAD").is_err() {
+        std::env::set_var("GB10_PLE_OFFLOAD", "ssd");
+    }
+    anyhow::ensure!(
+        std::env::var_os("GB10_W4A4_PREFILL").is_none(),
+        "--calib-profile requires unquantized activations; unset GB10_W4A4_PREFILL"
+    );
+
+    let t0 = std::time::Instant::now();
+    let src = ShardReader::open(source)?;
+    let (mut gpu, cfg) = GpuModel::load_from_dir(&base.to_string_lossy())?;
+    gpu.gptq_reset_rotation();
+    anyhow::ensure!(
+        matches!(cfg.family, crate::qwen::Family::Qwen35 | crate::qwen::Family::Qwen4Exp),
+        "sequential calibration profiling is not implemented for {:?}",
+        cfg.family
+    );
+    let profile_layers: Vec<usize> = if layers.is_empty() {
+        let points = cfg.num_layers.min(8).max(1);
+        let mut auto: Vec<usize> = (0..points)
+            .map(|index| index * (cfg.num_layers - 1) / points.saturating_sub(1).max(1))
+            .collect();
+        auto.sort_unstable();
+        auto.dedup();
+        auto
+    } else {
+        layers.to_vec()
+    };
+    anyhow::ensure!(
+        profile_layers.iter().all(|&layer| layer < cfg.num_layers),
+        "profile layers {profile_layers:?} exceed model depth {}",
+        cfg.num_layers
+    );
+    let samples = calib_tokens_mode(
+        base,
+        calib,
+        nsamples,
+        max_seqlen,
+        cfg.vocab_size,
+        true,
+    )?;
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+
+    for li in 0..gpu.gptq_num_layers() {
+        gpu.gptq_drop_layer_weights(li);
+    }
+    gpu.gptq_sync();
+
+    // Layer 0 must begin from the source embedding rather than the base's RTN embedding. The
+    // lm_head/final mixer are never reached by this profiling pass and can be released.
+    let embed_name = "model.language_model.embed_tokens.weight";
+    let (_, embed_host) = src.read_bf16(embed_name)?;
+    let embed = gpu.gptq_w_bf16(&embed_host);
+    drop(embed_host);
+    gpu.gptq_install_nonlayer(Some(embed), None, None);
+
+    let ns = samples.len();
+    let mut hidden: Vec<Option<B>> = (0..ns).map(|_| None).collect();
+    let mut activations: Vec<Vec<CalibLayerProfile>> =
+        (0..ns).map(|_| Vec::with_capacity(profile_layers.len())).collect();
+    let mut experts: Vec<std::collections::BTreeMap<usize, Vec<u64>>> =
+        (0..ns).map(|_| std::collections::BTreeMap::new()).collect();
+    let mut pool = Pool::new(gpu.gptq_dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, max_seqlen);
+
+    println!(
+        "[calib-profile-sequential] {} candidates / {total_tokens} tokens; BF16 source layers, base skeleton {}; activation layers {:?}",
+        ns,
+        base.display(),
+        profile_layers
+    );
+    for li in 0..cfg.num_layers {
+        let layer_t0 = std::time::Instant::now();
+        install_source_bf16_layer(&mut gpu, &cfg, &src, li)?;
+        let capture_activation = profile_layers.contains(&li);
+        for s in 0..ns {
+            let tap = GptqTap {
+                profile_enabled: true,
+                profile_layers: if capture_activation { vec![li] } else { Vec::new() },
+                profile_sketch_dim: sketch_dim,
+                sample_weight: 1.0,
+                ..Default::default()
+            };
+            gpu.gptq_arm(tap);
+            gpu.zero_slot_state(&mut state, 0, max_seqlen);
+            let inc = hidden[s].take();
+            let (_, outb) = gpu.prefill_batch_range(
+                &mut pool,
+                &samples[s],
+                &mut state,
+                0,
+                max_seqlen,
+                0,
+                li,
+                li + 1,
+                inc,
+            );
+            hidden[s] = Some(outb);
+            let tap = gpu
+                .gptq_disarm()
+                .context("sequential calibration profile tap disappeared")?;
+            activations[s].extend(tap.profile_activations);
+            experts[s].extend(tap.profile_expert_counts);
+            if (s + 1) % 128 == 0 || s + 1 == ns {
+                gpu.gptq_sync();
+                println!(
+                    "[calib-profile-sequential] layer {li}/{}: {}/{} candidates ({:.1} min)",
+                    cfg.num_layers - 1,
+                    s + 1,
+                    ns,
+                    t0.elapsed().as_secs_f32() / 60.0
+                );
+            }
+        }
+        gpu.gptq_drop_layer_weights(li);
+        gpu.gptq_sync();
+        println!(
+            "[calib-profile-sequential] layer {li}/{} complete in {:.1}s; MemAvailable {:.1} GB",
+            cfg.num_layers - 1,
+            layer_t0.elapsed().as_secs_f32(),
+            mem_available_gb()
+        );
+    }
+
+    drop(hidden);
+    drop(state);
+    drop(pool);
+    drop(gpu);
+
+    let incomplete = PathBuf::from(format!("{}.incomplete", out.display()));
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&incomplete)?);
+    for index in 0..ns {
+        let expert_rows: Vec<serde_json::Value> = std::mem::take(&mut experts[index])
+            .into_iter()
+            .map(|(layer, counts)| serde_json::json!({ "layer": layer, "counts": counts }))
+            .collect();
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "format": "veloGB10-calibration-profile-v1",
+                "sample_index": index,
+                "sequence_length": samples[index].len(),
+                "activations": std::mem::take(&mut activations[index]),
+                "experts": expert_rows,
+            }),
+        )?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&incomplete, out)?;
+    let manifest = serde_json::json!({
+        "format": "veloGB10-calibration-profile-manifest-v1",
+        "mode": "sequential_bf16_layers",
+        "model_dir": std::fs::canonicalize(source)?,
+        "base_model": std::fs::canonicalize(base)?,
+        "candidate_corpus": if calib.to_string_lossy() == "random" {
+            serde_json::Value::String("random".to_string())
+        } else {
+            serde_json::to_value(std::fs::canonicalize(calib)?)?
+        },
+        "output": out,
+        "samples": ns,
+        "total_tokens": total_tokens,
+        "max_seqlen": max_seqlen,
+        "activation_layers": profile_layers,
+        "sketch": { "type": "signed_count_sketch_of_mean_pooled_channels", "dimension": sketch_dim },
+        "expert_counts": if cfg.is_moe { "all_moe_layers_topk_routes" } else { "dense_model" },
+        "base_supplied": ["model_skeleton", "ple_table"],
+    });
+    std::fs::write(
+        format!("{}.manifest.json", out.display()),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    println!(
+        "[calib-profile-sequential] wrote {ns} profiles / {total_tokens} tokens in {:.1} min -> {}",
+        t0.elapsed().as_secs_f32() / 60.0,
         out.display()
     );
     Ok(())
@@ -1508,6 +1718,70 @@ fn install_layer(gpu: &mut GpuModel, li: usize, is_attn: bool, lp: &str, ws: &mu
     }
 }
 
+/// Read and install exactly one source layer in BF16. The layer structure comes from the already
+/// loaded base artifact; only its weights are replaced. Keeping this separate from Hessian setup
+/// lets calibration profiling reuse the same out-of-core layer traversal as GPTQ.
+fn install_source_bf16_layer(
+    gpu: &mut GpuModel,
+    cfg: &crate::qwen::Config,
+    src: &ShardReader,
+    li: usize,
+) -> Result<()> {
+    let lp = format!("model.language_model.layers.{li}");
+    let is_attn = matches!(cfg.layer_types[li], crate::qwen::LayerType::FullAttention);
+    let mut names = Vec::new();
+    {
+        let layer = gpu.gptq_layer(li);
+        if is_attn {
+            for tensor in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                names.push(format!("{lp}.self_attn.{tensor}.weight"));
+            }
+            if layer.fa.as_ref().unwrap().indexer.is_some() {
+                names.push(format!("{lp}.self_attn.indexer.index_qk_proj.weight"));
+            }
+        } else {
+            for tensor in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"] {
+                names.push(format!("{lp}.linear_attn.{tensor}.weight"));
+            }
+        }
+        match &layer.mlp {
+            Ffn::Moe(_) => {
+                names.push(format!("{lp}.mlp.experts.gate_up_proj"));
+                names.push(format!("{lp}.mlp.experts.down_proj"));
+                for tensor in ["gate_proj", "up_proj", "down_proj"] {
+                    names.push(format!("{lp}.mlp.shared_expert.{tensor}.weight"));
+                }
+                names.push(format!("{lp}.mlp.gate.weight"));
+            }
+            Ffn::Dense(_) => {
+                for tensor in ["gate_proj", "up_proj", "down_proj"] {
+                    names.push(format!("{lp}.mlp.{tensor}.weight"));
+                }
+            }
+        }
+        if layer.hc.is_some() {
+            for connection in ["attn_hyper_connection", "mlp_hyper_connection"] {
+                for tensor in ["input_mix_weight_down", "input_mix_weight_up"] {
+                    names.push(format!("{lp}.{connection}.{tensor}.weight"));
+                }
+            }
+        }
+        if layer.ple.is_some() {
+            for tensor in ["key_proj", "value_proj"] {
+                names.push(format!("{lp}.ple.{tensor}.weight"));
+            }
+        }
+    }
+
+    let mut weights = HashMap::new();
+    for name in names {
+        let (_, host) = src.read_bf16(&name)?;
+        weights.insert(name, W::Bf16(gpu.gptq_upload_bf16(&host)));
+    }
+    install_layer(gpu, li, is_attn, &lp, &mut weights);
+    Ok(())
+}
+
 pub fn parse_groups(s: &str) -> Result<Vec<Group>> {
     s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(|t| match t {
         "expert" => Ok(Group::Expert), "attn" => Ok(Group::Attn), "mlp" => Ok(Group::Mlp), "gdn" => Ok(Group::Gdn),
@@ -1670,11 +1944,20 @@ pub fn calib_igs(
     let t_all = std::time::Instant::now();
     let (gpu, cfg) = GpuModel::load_from_dir(&model_dir.to_string_lossy())?;
     let vision_samples = vision_calib_samples(model_dir, calib, nsamples, seqlen)?;
-    let samples = if vision_samples.is_none() { Some(calib_tokens(model_dir, calib, nsamples, seqlen, cfg.vocab_size)?) } else { None };
+    // Text calibration corpora may be MaCa sample-aligned JSONL with mixed sequence lengths.
+    // `seqlen` is the state/allocation ceiling, not a requirement that every row be padded to it.
+    let samples = if vision_samples.is_none() {
+        Some(calib_tokens_mode(model_dir, calib, nsamples, seqlen, cfg.vocab_size, true)?)
+    } else {
+        None
+    };
     let sample_count = vision_samples.as_ref().map_or_else(|| samples.as_ref().unwrap().len(), Vec::len);
+    let total_tokens: usize = vision_samples
+        .as_ref()
+        .map_or_else(|| samples.as_ref().unwrap().iter().map(Vec::len).sum(), |rows| rows.iter().map(|row| row.tokens.len()).sum());
     let weights = gpu.nvfp4_weights_by_name();
     let ptrs: Vec<u64> = weights.iter().map(|w| w.1).collect();
-    println!("[calib-igs] method={} — {} {} samples × {seqlen} tokens over {} NVFP4 weights ({} stems)",
+    println!("[calib-igs] method={} — {} {} samples / {total_tokens} tokens (max seqlen {seqlen}) over {} NVFP4 weights ({} stems)",
              igs_cfg.method.name(), sample_count, if vision_samples.is_some() { "vision" } else { "text" },
              { let mut p = ptrs.clone(); p.sort(); p.dedup(); p.len() }, weights.len());
     gpu.igs_arm(&ptrs);
@@ -1752,6 +2035,7 @@ pub fn calib_igs(
             "corpus": calib,
             "nsamples": sample_count,
             "seqlen": seqlen,
+            "total_tokens": total_tokens,
         },
         "stems": stem_stats,
     });

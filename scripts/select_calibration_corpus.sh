@@ -31,8 +31,7 @@ repo_dir=$(dirname -- "$script_dir")
 cd "$repo_dir"
 cargo build --release --bin gb10_inference --bin calib_select
 
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} GB10_PLE_OFFLOAD=${GB10_PLE_OFFLOAD:-ssd} \
-"$repo_dir/target/release/gb10_inference" --calib-profile \
+set -- "$repo_dir/target/release/gb10_inference" --calib-profile \
     --model-dir "$profile_model_dir" \
     --calib "$candidates" \
     --out "$profiles" \
@@ -40,6 +39,10 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} GB10_PLE_OFFLOAD=${GB10_PLE_OFFL
     --seqlen "$max_seqlen" \
     --profile-layers "${PROFILE_LAYERS:-auto}" \
     --profile-sketch-dim "${PROFILE_SKETCH_DIM:-16}"
+if [ -n "${PROFILE_BASE:-}" ]; then
+    set -- "$@" --base "$PROFILE_BASE"
+fi
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} GB10_PLE_OFFLOAD=${GB10_PLE_OFFLOAD:-ssd} "$@"
 
 set -- "$repo_dir/target/release/calib_select" \
     --candidates "$candidates" \

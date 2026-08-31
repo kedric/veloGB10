@@ -310,6 +310,7 @@ fn print_help() {
         "                           (--model-dir <artifact> --calib <jsonl> --out <profiles.jsonl>"
     );
     println!("                            --nsamples N --seqlen MAX --profile-layers auto|0,8,... --profile-sketch-dim 16)");
+    println!("                           add --base <nvfp4> to stream --model-dir BF16 one layer at a time");
     println!("  --maca                  Accept variable-length pre-tokenized calibration rows and normalize");
     println!("                           every sequence's Hessian contribution by 1 / sequence_length");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
@@ -396,6 +397,7 @@ fn main() {
     if args.iter().any(|a| a == "--calib-profile") {
         let model = parse_arg(&args, "--model-dir")
             .expect("--calib-profile requires --model-dir <artifact>");
+        let base = parse_arg(&args, "--base");
         let calib = parse_arg(&args, "--calib").expect("--calib-profile requires --calib <jsonl>");
         let out =
             parse_arg(&args, "--out").expect("--calib-profile requires --out <profiles.jsonl>");
@@ -413,15 +415,29 @@ fn main() {
         let dim = parse_arg(&args, "--profile-sketch-dim")
             .and_then(|s| s.parse().ok())
             .unwrap_or(16);
-        if let Err(error) = gb10_inference::gptq::profile_calibration(
-            std::path::Path::new(model),
-            std::path::Path::new(calib),
-            std::path::Path::new(out),
-            ns,
-            sl,
-            &layers,
-            dim,
-        ) {
+        let result = if let Some(base) = base {
+            gb10_inference::gptq::profile_calibration_sequential(
+                std::path::Path::new(model),
+                std::path::Path::new(base),
+                std::path::Path::new(calib),
+                std::path::Path::new(out),
+                ns,
+                sl,
+                &layers,
+                dim,
+            )
+        } else {
+            gb10_inference::gptq::profile_calibration(
+                std::path::Path::new(model),
+                std::path::Path::new(calib),
+                std::path::Path::new(out),
+                ns,
+                sl,
+                &layers,
+                dim,
+            )
+        };
+        if let Err(error) = result {
             eprintln!("ERROR: --calib-profile failed: {error:#}");
             std::process::exit(1);
         }

@@ -29,6 +29,7 @@ shown below.
 
 ```bash
 export SRC="$HOME/models/Qwen3.8-Flash-Next"
+export BASE="$HOME/models/Qwen3.8-Flash-Next-NVFP4-base"
 export CANDIDATES="$HOME/models/calibration-sources/qwen38-maca-candidates.jsonl"
 export CALIB="$HOME/models/calibration-sources/qwen38-maca-cola-acdm-moe.jsonl"
 
@@ -50,6 +51,7 @@ Profiling must see the original BF16 activations. Disable serving-only W4A4 rout
 
 ```bash
 export PROFILE_MODEL="$SRC"
+export PROFILE_BASE="$BASE"
 unset GB10_W4A4_PREFILL GB10_W4A4_VERIFY
 
 CUDA_VISIBLE_DEVICES=0 \
@@ -63,6 +65,13 @@ SELECTION_SEED=20260831 \
 scripts/select_calibration_corpus.sh \
   "$PROFILE_MODEL" "$CANDIDATES" "$CALIB"
 ```
+
+For checkpoints that do not fit resident in BF16, `PROFILE_BASE` enables exact sequential
+layer profiling: the NVFP4 base supplies only the memory-resident skeleton and PLE table, all
+of its transformer layers are dropped, then one source BF16 layer at a time is loaded and run
+over the candidate pool. Hidden states stay resident between layers. COLA sketches therefore see
+the same BF16-layer trajectory used by sequential GPTQ, while peak memory remains bounded by the
+base skeleton, one BF16 layer, and the candidate hidden states.
 
 `PROFILE_LAYERS=auto` samples up to eight layers across the network. For an MoE model, exact expert
 routing counts are still captured at every layer reached by the profiler. The selector preserves
@@ -88,7 +97,6 @@ Read the actual selected count and maximum length from the generated manifests i
 512 fixed-size rows.
 
 ```bash
-export BASE="$HOME/models/Qwen3.8-Flash-Next-NVFP4-base"
 export FINAL="$HOME/models/Qwen3.8-Flash-Next-MR-GPTQ-NVFP4-maca"
 
 NSAMPLES=$(jq -er '.selected_count' "$CALIB.manifest.json")
