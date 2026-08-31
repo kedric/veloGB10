@@ -139,6 +139,30 @@ fn partial_overlap(s: &str, marker: &str) -> usize {
 
 fn partial_think_overlap(s: &str, marker: &str) -> usize { partial_overlap(s, marker) }
 
+/// Whether generation starts inside an unclosed think block in the prompt that was ACTUALLY
+/// rendered. This must not be inferred from the model family: Qwen normally primes `<think>`, but
+/// `reasoning_effort=no_think` renders the same family with thinking disabled. Conversely hy_v3 can
+/// start either inside or outside its think block depending on the request.
+fn prompt_ends_inside_think(prompt: &str, think_open: &str) -> bool {
+    // Only the generation-prompt suffix is authoritative. Searching the whole rendered conversation
+    // would let a literal `<think>` in the user's text alter the stream state.
+    prompt.trim_end().ends_with(think_open)
+}
+
+/// Map the union accepted by the HTTP/CLI surface onto the vocabulary of the active template.
+/// In particular, OpenAI's `high` must never mean "disable thinking" (the old mapping did exactly
+/// that for Qwen, which also made the streaming-state bug intermittent across clients).
+fn normalize_reasoning_effort(effort: &str, hy_v3: bool) -> &str {
+    match effort {
+        "high" | "xhigh" if hy_v3 => "high",
+        "medium" if hy_v3 => "high",
+        "high" => "xhigh",
+        "xhigh" | "medium" | "low" => effort,
+        "no_think" | "minimal" | "none" | "off" | "" => "no_think",
+        other => other,
+    }
+}
+
 /// The opening marker of a tool call. While streaming we must never forward this (or a partial prefix
 /// of it) to the client as CONTENT: a harness would render raw XML in the chat and never invoke the
 /// tool. Once it appears, content emission stops and the rest is buffered for the tool_calls delta.
@@ -296,16 +320,15 @@ async fn chat_completions(
     // convention (minimal|low|medium|high) onto a family-agnostic low/high only when a value is
     // given. When NEITHER the request nor --reasoning-effort specifies one, pass None so the model's
     // own template default wins (xhigh for Qwen, low for hy_v3) — never a hardcoded guess.
+    let hy_v3 = !state.tokenizer.think_tags().2;
     let effort: Option<&str> = req.reasoning_effort.as_deref()
         .or(state.reasoning_effort.as_deref())
         .map(|e| {
-            let n = match e {
-                // Qwen3.5 native values pass through verbatim.
-                "xhigh" | "medium" | "low" => e,
-                // OpenAI convention -> nearest native level.
-                "high" | "no_think" | "minimal" | "none" | "off" | "" => "no_think",
-                other => other,
-            };
+            let n = normalize_reasoning_effort(e, hy_v3);
+            if n != e {
+                eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for {}",
+                          if hy_v3 { "hy_v3" } else { "Qwen" });
+            }
             if !matches!(n, "xhigh" | "medium" | "low" | "no_think" | "high") {
                 eprintln!("[req] reasoning_effort '{e}' not a known level (passing through verbatim)");
             }
@@ -494,12 +517,15 @@ async fn chat_completions(
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
         let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
-        // Think markers + the initial reasoning/content state, from the model's vocab: qwen is
-        // primed into a think block (starts in reasoning); hy_v3's no_think prompt closes the empty
-        // block itself (starts as content) — but with reasoning_effort low|high the hy3 template
-        // primes `…assistant<think:opensource>` too, so the stream also starts INSIDE the block.
-        let (think_open, think_close, family_primed) = tokenizer.think_tags();
-        let starts_in_reasoning = family_primed || matches!(effort, Some("low") | Some("high"));
+        // Resolve markers from the model's vocab, but derive the initial state from the prompt that
+        // was ACTUALLY rendered. Family-based inference is wrong for request-level no-think: Qwen's
+        // family default is a primed `<think>` block, while `reasoning_effort=no_think` renders a
+        // plain assistant prompt. The old inference consequently streamed the whole normal answer as
+        // `reasoning_content` because no `</think>` was ever supposed to arrive. Inspecting the
+        // generation-prompt suffix also handles hy_v3 and forced tool-call prefixes without special
+        // cases, while ignoring literal markers in user messages.
+        let (think_open, think_close, _) = tokenizer.think_tags();
+        let starts_in_reasoning = prompt_ends_inside_think(&prompt, think_open);
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
@@ -771,7 +797,7 @@ pub fn create_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod context_budget_tests {
-    use super::{esc, generation_room};
+    use super::{esc, generation_room, normalize_reasoning_effort, prompt_ends_inside_think};
 
     #[test]
     fn mtp_headroom_is_reserved_before_clamping() {
@@ -803,5 +829,50 @@ mod context_budget_tests {
         assert_eq!(parsed["delta"]["content"], text);
         assert!(!payload.contains('\t'), "JSON payload must not contain literal tabs");
         assert!(!payload.contains('\r'), "JSON payload must not contain literal CRs");
+    }
+
+    #[test]
+    fn streaming_state_follows_the_rendered_prompt_not_the_model_family() {
+        assert!(prompt_ends_inside_think(
+            "<|im_start|>assistant\n<think>\n",
+            "<think>",
+        ));
+
+        // Qwen with reasoning_effort=no_think: same tokenizer family, but the template does not
+        // prime a think block. A normal answer must therefore stream through `content`.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>assistant\n",
+            "<think>",
+        ));
+
+        // Forced tool calls explicitly close the template's primed block before their prefix.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=",
+            "<think>",
+        ));
+
+        // hy_v3 uses different markers and can be rendered in either state as well.
+        assert!(prompt_ends_inside_think(
+            "assistant<think:opensource>",
+            "<think:opensource>",
+        ));
+        assert!(!prompt_ends_inside_think(
+            "assistant<think:opensource></think:opensource>",
+            "<think:opensource>",
+        ));
+
+        // A literal marker in user content must not prime a no-think generation.
+        assert!(!prompt_ends_inside_think(
+            "<|im_start|>user\nplease print <think><|im_end|>\n<|im_start|>assistant\n",
+            "<think>",
+        ));
+    }
+
+    #[test]
+    fn reasoning_effort_high_stays_a_thinking_level() {
+        assert_eq!(normalize_reasoning_effort("high", false), "xhigh");
+        assert_eq!(normalize_reasoning_effort("high", true), "high");
+        assert_eq!(normalize_reasoning_effort("medium", true), "high");
+        assert_eq!(normalize_reasoning_effort("minimal", false), "no_think");
     }
 }
