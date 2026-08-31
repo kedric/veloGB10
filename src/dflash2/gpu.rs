@@ -152,7 +152,17 @@ pub(crate) fn upload_norm(dev: &Arc<CudaDevice>, data: &[f32]) -> CudaSlice<f32>
 impl Df2Gpu {
     /// Load the artifact + upload weights + build RoPE tables + allocate scratch for `max_c`.
     pub fn load(dir: &str, max_c: usize) -> Result<Self> {
-        let art = crate::dflash2::load::load(dir, Some(crate::dflash2::REAL_SHA256))?;
+        Self::load_pinned(dir, max_c, None)
+    }
+
+    /// `load` with an explicit artifact sha256 pin override (see `round::load_pinned`).
+    pub fn load_pinned(dir: &str, max_c: usize, sha_pin: Option<&str>) -> Result<Self> {
+        let pin: Option<&str> = match sha_pin {
+            Some("off") => None,
+            Some(hex) => Some(hex),
+            None => Some(crate::dflash2::REAL_SHA256),
+        };
+        let art = crate::dflash2::load::load(dir, pin)?;
         let w = &art.weights;
         let cfg = Dflash2Config::default();
         let max_pos = max_c + BLOCK + 1;

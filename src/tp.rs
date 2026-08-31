@@ -184,6 +184,13 @@ pub struct TpConfig {
     /// loads the SAME artifact bytes at the SAME path — the round's drafts must be bit-identical
     /// across ranks or the verify all-reduces diverge.
     pub df2_draft_dir: String,
+    /// S9F+ (2026-08-29): the head's `--sha256 <hex|off>` override for the DFlash2 artifact pin.
+    /// None = the published REAL_SHA256 pin (default). Some("off") = no sha check (the
+    /// inventory/shape/dtype guard still runs). Some(hex) = pin to that exact artifact hash.
+    /// Ships so the node loads the same artifact under the same pin — a one-sided pin is a
+    /// round-load mismatch (head loads, node refuses, or vice versa) and must never happen.
+    #[serde(default)]
+    pub df2_sha_pin: Option<String>,
     /// P2 (v13): head's `--df2-round-shard <on|off>` — shard the DFlash2 drafter round across
     /// the TP ranks (qkv/gate/up col-split, o/down K-split, per-head ring KV, two trunk-class
     /// all-reduce sites per layer on the round's stream, in-capture). SPMD-critical: a one-sided
@@ -290,6 +297,7 @@ impl TpConfig {
             // (the node falls back to the Mtp source, the pre-S9F behavior).
             spec_source: String::new(),
             df2_draft_dir: String::new(),
+            df2_sha_pin: None,
             df2_round_shard: false,
             df2_prose_lane_greedy: false,
         }

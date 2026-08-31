@@ -3,6 +3,22 @@
 High-level release notes for veloGB10. Minor bug fixes and small optimizations are grouped under
 generic language where they aren't individually notable.
 
+## v0.5.1 — Vision robustness, reasoning-effort, graceful-load fixes
+
+- **Vision generalization + boot fix.** The GPU vision tower now bootstraps opportunistically: a
+  non-vision or geometry-incompatible model serves text-only instead of crashing at startup (fixes a
+  v0.5.0 boot crash on non-27B packs). Vision is generalized across the Qwen3.5/3.8 VL family, so
+  all vision-tower models serve images.
+- **OpenAI `reasoning_effort`.** Full level table (`none/low/medium/high/xhigh/max`) with
+  per-family normalization, plus `--reasoning-effort`; the `high` mapping no longer silently drops
+  thinking (regression fix).
+- **Tool-call + reasoning-mode fix.** Tool-call markup is held back in reasoning mode too, fixing a
+  first-call double-emit leak.
+- **Graceful model-load exit.** Corrupted / stale / wrong-format checkpoints exit with a clear
+  actionable message instead of a panic/OOM/core-dump.
+- **`--output-prompts [n]`** — human-readable chat-request logging; `--vision-cpu` now listed in
+  `--help`. Minor bug fixes and optimizations.
+
 ## v0.5.0 — Vision support
 
 - **Vision support.** Image input is now supported end-to-end on a GPU vision tower

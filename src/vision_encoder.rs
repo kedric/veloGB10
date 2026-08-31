@@ -10,12 +10,12 @@
 //! (correctity-first) vision serving path. The GPU port (V2) replaces the heavy matmuls.
 
 use base64::Engine;
-use crate::vision_tower::{VisualTower, HIDDEN, HEAD_DIM, INTER, MERGE, OUT_HIDDEN, PATCH, IN_CH, TEMPORAL};
+use crate::vision_tower::{VisualTower};
 
-/// Vision rotary: inv_freq length = (head_dim//2)/2 = 18 (mirrors Qwen3VLVisionRotaryEmbedding).
-fn vision_inv_freq() -> Vec<f64> {
-    let dim = (HEAD_DIM / 2) as f64; // 36
-    (0..HEAD_DIM / 4).map(|i| 10000.0f64.powf(-(2.0 * i as f64) / dim)).collect()
+/// Vision rotary: inv_freq length = (head_dim//2)/2 (mirrors Qwen3VLVisionRotaryEmbedding).
+fn vision_inv_freq(hd: usize) -> Vec<f64> {
+    let dim = (hd / 2) as f64;
+    (0..hd / 4).map(|i| 10000.0f64.powf(-(2.0 * i as f64) / dim)).collect()
 }
 
 fn layernorm(x: &[f32], w: &[f32], b: &[f32], n: usize) -> Vec<f32> {
@@ -64,9 +64,9 @@ fn gemm_vec(x: &[f32], wt: &[f32], b: &[f32], out: &mut [f32], inn: usize, outn:
     }
 }
 
-pub fn pos_embed_bilinear(w: &[f32], gh: usize, gw: usize, num_side: usize) -> Vec<f32> {
+pub fn pos_embed_bilinear(w: &[f32], gh: usize, gw: usize, num_side: usize, hidden: usize, merge: usize) -> Vec<f32> {
     let n = gh * gw;
-    let mut pe = vec![0.0f32; n * HIDDEN];
+    let mut pe = vec![0.0f32; n * hidden];
     let mut hfl = vec![0usize; gh];
     let mut hfr = vec![0.0f32; gh];
     let mut wfl = vec![0usize; gw];
@@ -86,11 +86,11 @@ pub fn pos_embed_bilinear(w: &[f32], gh: usize, gw: usize, num_side: usize) -> V
     let hcel = |i: usize| (hfl[i] + 1).min(num_side - 1);
     let wcel = |i: usize| (wfl[i] + 1).min(num_side - 1);
     let mut reorder = Vec::with_capacity(n);
-    for hi in 0..gh / MERGE {
-        for wi in 0..gw / MERGE {
-            for mh in 0..MERGE {
-                for mw in 0..MERGE {
-                    reorder.push((hi * MERGE + mh) * gw + (wi * MERGE + mw));
+    for hi in 0..gh / merge {
+        for wi in 0..gw / merge {
+            for mh in 0..merge {
+                for mw in 0..merge {
+                    reorder.push((hi * merge + mh) * gw + (wi * merge + mw));
                 }
             }
         }
@@ -107,21 +107,21 @@ pub fn pos_embed_bilinear(w: &[f32], gh: usize, gw: usize, num_side: usize) -> V
             (hcy * num_side + wcx, hf * wf),
         ];
         for (gi, wt) in corners {
-            for d in 0..HIDDEN {
-                pe[tok * HIDDEN + d] += w[gi * HIDDEN + d] * wt;
+            for d in 0..hidden {
+                pe[tok * hidden + d] += w[gi * hidden + d] * wt;
             }
         }
     }
     pe
 }
 
-fn vision_position_ids(gh: usize, gw: usize) -> Vec<[usize; 2]> {
+fn vision_position_ids(gh: usize, gw: usize, merge: usize) -> Vec<[usize; 2]> {
     let mut pos = Vec::with_capacity(gh * gw);
-    for hi in 0..gh / MERGE {
-        for wi in 0..gw / MERGE {
-            for mh in 0..MERGE {
-                for mw in 0..MERGE {
-                    pos.push([hi * MERGE + mh, wi * MERGE + mw]);
+    for hi in 0..gh / merge {
+        for wi in 0..gw / merge {
+            for mh in 0..merge {
+                for mw in 0..merge {
+                    pos.push([hi * merge + mh, wi * merge + mw]);
                 }
             }
         }
@@ -129,22 +129,21 @@ fn vision_position_ids(gh: usize, gw: usize) -> Vec<[usize; 2]> {
     pos
 }
 
-pub fn vision_cos_sin(gh: usize, gw: usize) -> (Vec<f32>, Vec<f32>) {
+pub fn vision_cos_sin(gh: usize, gw: usize, hd: usize, merge: usize) -> (Vec<f32>, Vec<f32>) {
     let n = gh * gw;
-    let hd = HEAD_DIM;
-    let inv = vision_inv_freq();
-    let nu = inv.len(); // 18
-    let pos = vision_position_ids(gh, gw);
+    let inv = vision_inv_freq(hd);
+    let nu = inv.len();
+    let pos = vision_position_ids(gh, gw, merge);
     let mut cos = vec![0.0f32; n * hd];
     let mut sin = vec![0.0f32; n * hd];
     for (tok, [py, px]) in pos.iter().enumerate() {
-        // ang = [py*inv (18) | px*inv (18)] -> 36
+        // ang = [py*inv | px*inv] -> hd/2
         let mut ang = vec![0.0f64; hd / 2];
         for j in 0..nu {
             ang[j] = *py as f64 * inv[j];
             ang[nu + j] = *px as f64 * inv[j];
         }
-        // emb = [ang(36) | ang(36)] -> 72
+        // emb = [ang | ang] -> hd
         for d in 0..hd / 2 {
             let a = ang[d];
             cos[tok * hd + d] = a.cos() as f32;
@@ -166,87 +165,89 @@ fn rotate_half_hd(q: &[f32], hd: usize) -> Vec<f32> {
 }
 
 impl VisualTower {
-    /// CPU forward. `pixel_values`: [N, 1536] f32 flatten; `(gh, gw)` patch grid.
-    /// Returns merged embeddings [N/4, OUT_HIDDEN].
+    /// CPU forward. `pixel_values`: [N, wpv] f32 flatten; `(gh, gw)` patch grid.
+    /// Returns merged embeddings [N/merge², out_hidden].
     pub fn forward_cpu(&self, pixel_values: &[f32], gh: usize, gw: usize) -> Vec<f32> {
+        let d = self.dims;
+        let (hidden, inter, merge) = (d.hidden, d.inter, d.merge);
+        let hd = d.head_dim();
+        let wpv = d.wpv();
+        let mi = d.merge_inter();
         let n = gh * gw;
-        assert_eq!(pixel_values.len(), n * IN_CH * TEMPORAL * PATCH * PATCH);
-        let wpv = IN_CH * TEMPORAL * PATCH * PATCH; // 1536
-        let hd = HEAD_DIM;
+        assert_eq!(pixel_values.len(), n * wpv, "pixel_values len");
 
-        // 1. patch_embed [N,1536] @ [1536,1152]^T + b
-        let mut h = vec![0.0f32; n * HIDDEN];
+        // 1. patch_embed [N,wpv] @ [wpv,hidden]^T + b
+        let mut h = vec![0.0f32; n * hidden];
         for i in 0..n {
             let row = &pixel_values[i * wpv..(i + 1) * wpv];
-            for o in 0..HIDDEN {
+            for o in 0..hidden {
                 let w = &self.patch_embed_w[o * wpv..(o + 1) * wpv];
                 let mut acc = self.patch_embed_b[o];
                 for k in 0..wpv {
                     acc += row[k] * w[k];
                 }
-                h[i * HIDDEN + o] = acc;
+                h[i * hidden + o] = acc;
             }
         }
         // 2. pos-embed bilinear
-        let num_side = ((crate::vision_tower::NUM_POS) as f64).sqrt() as usize;
-        let pe = pos_embed_bilinear(&self.pos_embed_w, gh, gw, num_side);
+        let pe = pos_embed_bilinear(&self.pos_embed_w, gh, gw, d.num_side(), hidden, merge);
         for i in 0..n {
-            for d in 0..HIDDEN {
-                h[i * HIDDEN + d] += pe[i * HIDDEN + d];
+            for dd in 0..hidden {
+                h[i * hidden + dd] += pe[i * hidden + dd];
             }
         }
         // 3. rotary cos/sin
-        let (cos, sin) = vision_cos_sin(gh, gw);
+        let (cos, sin) = vision_cos_sin(gh, gw, hd, merge);
 
         // 4. blocks
         for blk in &self.blocks {
-            let norm1 = layernorm(&h, &blk.norm1_w, &blk.norm1_b, HIDDEN);
-            let attn_out = block_attn(blk, &norm1, &cos, &sin, n, hd);
+            let norm1 = layernorm(&h, &blk.norm1_w, &blk.norm1_b, hidden);
+            let attn_out = block_attn(blk, &norm1, &cos, &sin, n, hd, d.heads, hidden, inter);
             for i in 0..h.len() {
                 h[i] += attn_out[i];
             }
-            let norm2 = layernorm(&h, &blk.norm2_w, &blk.norm2_b, HIDDEN);
-            let mut fc1 = vec![0.0f32; n * INTER];
-            gemm_vec(&norm2, &blk.fc1_w, &blk.fc1_b, &mut fc1, HIDDEN, INTER, n);
+            let norm2 = layernorm(&h, &blk.norm2_w, &blk.norm2_b, hidden);
+            let mut fc1 = vec![0.0f32; n * inter];
+            gemm_vec(&norm2, &blk.fc1_w, &blk.fc1_b, &mut fc1, hidden, inter, n);
             for v in fc1.iter_mut() {
                 *v = gelu_tanh(*v);
             }
-            let mut fc2 = vec![0.0f32; n * HIDDEN];
-            gemm_vec(&fc1, &blk.fc2_w, &blk.fc2_b, &mut fc2, INTER, HIDDEN, n);
+            let mut fc2 = vec![0.0f32; n * hidden];
+            gemm_vec(&fc1, &blk.fc2_w, &blk.fc2_b, &mut fc2, inter, hidden, n);
             for i in 0..h.len() {
                 h[i] += fc2[i];
             }
         }
 
-        // 5. merger: layernorm -> view [N,1152] -> [N/4, 4608] -> fc1 -> gelu -> fc2 -> [N/4,5120]
-        let ln = layernorm(&h, &self.merger_norm_w, &self.merger_norm_b, HIDDEN);
-        let tn = n / (MERGE * MERGE);
-        let mut m = vec![0.0f32; tn * 4608];
+        // 5. merger: layernorm -> view [N,hidden] -> [N/merge², mi] -> fc1 -> gelu -> fc2 -> [N/merge²,out]
+        let ln = layernorm(&h, &self.merger_norm_w, &self.merger_norm_b, hidden);
+        let tn = n / (merge * merge);
+        let mut m = vec![0.0f32; tn * mi];
         for r in 0..tn {
-            for g in 0..MERGE * MERGE {
-                let src = (r * 4 + g) * HIDDEN;
-                for d in 0..HIDDEN {
-                    m[r * 4608 + g * HIDDEN + d] = ln[src + d];
+            for g in 0..merge * merge {
+                let src = (r * merge * merge + g) * hidden;
+                for dd in 0..hidden {
+                    m[r * mi + g * hidden + dd] = ln[src + dd];
                 }
             }
         }
-        let mut fc1 = vec![0.0f32; tn * 4608];
-        gemm_vec(&m, &self.merger_fc1_w, &self.merger_fc1_b, &mut fc1, 4608, 4608, tn);
+        let mut fc1 = vec![0.0f32; tn * mi];
+        gemm_vec(&m, &self.merger_fc1_w, &self.merger_fc1_b, &mut fc1, mi, mi, tn);
         for v in fc1.iter_mut() {
             *v = gelu(*v);
         }
-        let mut out = vec![0.0f32; tn * OUT_HIDDEN];
-        gemm_vec(&fc1, &self.merger_fc2_w, &self.merger_fc2_b, &mut out, 4608, OUT_HIDDEN, tn);
+        let mut out = vec![0.0f32; tn * d.out_hidden];
+        gemm_vec(&fc1, &self.merger_fc2_w, &self.merger_fc2_b, &mut out, mi, d.out_hidden, tn);
         out
     }
 }
 
-/// Vision self-attention block (norm1 applied). qkv -> reshape [N,3,16,72] -> rope -> full
+/// Vision self-attention block (norm1 applied). qkv -> reshape [N,3,heads,hd] -> rope -> full
 /// attention (N tokens, not causal) -> proj.
-fn block_attn(blk: &crate::vision_tower::VisualBlock, x: &[f32], cos: &[f32], sin: &[f32], n: usize, hd: usize) -> Vec<f32> {
-    let heads = crate::vision_tower::HEADS; // 16
-    let mut qkv = vec![0.0f32; n * 3 * HIDDEN];
-    gemm_vec(x, &blk.qkv_w, &blk.qkv_b, &mut qkv, HIDDEN, 3 * HIDDEN, n);
+fn block_attn(blk: &crate::vision_tower::VisualBlock, x: &[f32], cos: &[f32], sin: &[f32],
+              n: usize, hd: usize, heads: usize, hidden: usize, inter: usize) -> Vec<f32> {
+    let mut qkv = vec![0.0f32; n * 3 * hidden];
+    gemm_vec(x, &blk.qkv_w, &blk.qkv_b, &mut qkv, hidden, 3 * hidden, n);
     let mut q = vec![0.0f32; n * heads * hd];
     let mut k = vec![0.0f32; n * heads * hd];
     let mut v = vec![0.0f32; n * heads * hd];
@@ -292,8 +293,8 @@ fn block_attn(blk: &crate::vision_tower::VisualBlock, x: &[f32], cos: &[f32], si
             }
         }
     }
-    let mut proj = vec![0.0f32; n * HIDDEN];
-    gemm_vec(&out, &blk.proj_w, &blk.proj_b, &mut proj, HIDDEN, HIDDEN, n);
+    let mut proj = vec![0.0f32; n * hidden];
+    gemm_vec(&out, &blk.proj_w, &blk.proj_b, &mut proj, hidden, hidden, n);
     proj
 }
 
@@ -325,9 +326,9 @@ pub struct VisionOutput {
 /// Decode a `data:` image URL (or a bare base64), preprocess it, and run the vision tower.
 /// Returns the merged embeddings to splice at the language embed layer.
 pub fn process_data_url(tower: &VisualTower, data_url: &str) -> anyhow::Result<VisionOutput> {
-    let pre = preprocess_data_url(data_url)?;
+    let pre = preprocess_data_url(data_url, &tower.preproc)?;
     let merged = tower.forward_cpu(&pre.pixel_values, pre.grid_h, pre.grid_w);
-    let tn = (pre.grid_h * pre.grid_w) / (crate::vision_tower::MERGE * crate::vision_tower::MERGE);
+    let tn = (pre.grid_h * pre.grid_w) / (tower.dims.merge * tower.dims.merge);
     Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn })
 }
 
@@ -335,15 +336,15 @@ pub fn process_data_url(tower: &VisualTower, data_url: &str) -> anyhow::Result<V
 /// Same decode + preprocess as `process_data_url`; only the forward is `GpuVisualTower` instead of
 /// `forward_cpu`. The GPU tower must already be built (`GpuVisualTower::new`).
 pub fn process_data_url_gpu(gvt: &mut crate::vision_gpu::GpuVisualTower, data_url: &str) -> anyhow::Result<VisionOutput> {
-    let pre = preprocess_data_url(data_url)?;
+    let pre = preprocess_data_url(data_url, &gvt.host().preproc)?;
     let (merged, _states) = gvt.forward(&pre.pixel_values, pre.grid_h, pre.grid_w, false)?;
-    let tn = (pre.grid_h * pre.grid_w) / (crate::vision_tower::MERGE * crate::vision_tower::MERGE);
+    let tn = (pre.grid_h * pre.grid_w) / (gvt.host().dims.merge * gvt.host().dims.merge);
     Ok(VisionOutput { merged, grid_h: pre.grid_h, grid_w: pre.grid_w, num_tokens: tn })
 }
 
 /// Decode + preprocess a `data:` URL into the flatten `pixel_values` + grid (the CPU and GPU paths
 /// share this; only the tower forward differs).
-fn preprocess_data_url(data_url: &str) -> anyhow::Result<crate::vision_preproc::PreprocessedImage> {
+fn preprocess_data_url(data_url: &str, cfg: &crate::vision_preproc::VisionPreprocConfig) -> anyhow::Result<crate::vision_preproc::PreprocessedImage> {
     use anyhow::anyhow;
     let b64 = data_url
         .split("base64,")
@@ -352,8 +353,7 @@ fn preprocess_data_url(data_url: &str) -> anyhow::Result<crate::vision_preproc::
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
     let img = image::load_from_memory(&bytes)?.to_rgb8();
     let (w, h) = img.dimensions();
-    let cfg = crate::vision_preproc::QWEN27B_PREPROC;
-    Ok(crate::vision_preproc::preprocess_image(h as usize, w as usize, img.as_raw(), &cfg))
+    Ok(crate::vision_preproc::preprocess_image(h as usize, w as usize, img.as_raw(), cfg))
 }
 
 /// A region of the token stream occupied by one image's merged embeddings.
@@ -364,23 +364,22 @@ pub struct ImageSpan {
     pub num_tokens: usize,
 }
 
-/// Expand each `image_pad` (248056) placeholder in `tokens` into `n = grid_h*grid_w/merge^2`
+/// Expand each `image_pad` placeholder in `tokens` into `n = grid_h*grid_w/merge²`
 /// copies — the number of merged image tokens the vision tower emits — and record the span of each.
 /// This is the CPU-side prerequisite for the model-path splice: the expanded token stream has the
 /// same length as the merged-embedding rows, and each span tells the prefill where to overwrite.
 ///
 /// `image_token_count` must be in the same order as the images in the rendered prompt.
-pub fn expand_image_pads(tokens: &[u32], image_token_count: &[usize]) -> (Vec<u32>, Vec<ImageSpan>) {
-    const IMAGE_PAD: u32 = 248056;
+pub fn expand_image_pads(tokens: &[u32], image_token_count: &[usize], image_pad: u32) -> (Vec<u32>, Vec<ImageSpan>) {
     let mut out = Vec::with_capacity(tokens.len());
     let mut spans = Vec::new();
     let mut img = 0usize;
     for &t in tokens {
-        if t == IMAGE_PAD && img < image_token_count.len() {
+        if t == image_pad && img < image_token_count.len() {
             let n = image_token_count[img];
             let start = out.len();
             for _ in 0..n {
-                out.push(IMAGE_PAD);
+                out.push(image_pad);
             }
             spans.push(ImageSpan { start, num_tokens: n });
             img += 1;
@@ -420,7 +419,7 @@ pub fn prepare_vision_request(
         counts.push(o.num_tokens);
         embeds.extend_from_slice(&o.merged);
     }
-    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts);
+    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts, tower.image_pad);
     Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
 }
 
@@ -443,6 +442,6 @@ pub fn prepare_vision_request_gpu(
         counts.push(o.num_tokens);
         embeds.extend_from_slice(&o.merged);
     }
-    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts);
+    let (expanded_tokens, spans) = expand_image_pads(prompt_tokens, &counts, gvt.host().image_pad);
     Ok(PreparedVision { expanded_tokens, image_embeds: embeds, spans })
 }

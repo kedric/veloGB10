@@ -31,6 +31,10 @@ pub struct AppState {
     /// which is the only value guaranteed to be valid for that family. A request's
     /// `reasoning_effort` field overrides per request.
     pub reasoning_effort: Option<String>,
+    /// `--output-prompts [cap]`: log every chat-completion request in human-readable form
+    /// (effective params, one line per turn, rendered-prompt excerpt up to `cap` chars).
+    /// 0 = off (default).
+    pub output_prompts: usize,
     /// KV cache depth, in positions. NOTHING used to check a prompt against it: an over-long prompt
     /// ran `write_kv_prefill` straight past the end of the cache and corrupted the next allocation.
     pub max_seq_len: usize,
@@ -124,6 +128,70 @@ fn esc(t: &str) -> String {
 
 /// Longest suffix of `s` that is a proper (partial) prefix of `marker` — text that could be the start
 /// of the marker arriving across decode chunks, and so must be held back rather than forwarded.
+/// `--output-prompts [cap]` — log the chat-completion call in human-readable form: effective
+/// parameters, one line per message turn, and the exact rendered prompt the model sees
+/// (excerpt up to `cap` chars; RUST_INFER_DUMP_PROMPT=1 still writes the full string to /tmp
+/// for diffing). Diagnostic output only; nothing here touches the serving path.
+#[allow(clippy::too_many_arguments)]
+fn log_request_human(
+    req: &ChatCompletionRequest,
+    effort: Option<&str>,
+    prompt: &str,
+    prompt_tokens: usize,
+    cap: usize,
+    model_name: &str,
+    render_ms: f64,
+) {
+    let opt_f32 = |v: &Option<f32>| v.map(|x| x.to_string()).unwrap_or_else(|| "default".into());
+    eprintln!("[prompt] ══ chat completion request ({model_name}) ════════════════════════════");
+    eprintln!("  stream={}  max_tokens={}  seed={}",
+        req.stream,
+        req.max_tokens.map(|t| t.to_string()).unwrap_or_else(|| "server-default".into()),
+        req.seed.map(|s| s.to_string()).unwrap_or_else(|| "-".into()));
+    eprintln!("  temperature={}  top_p={}  top_k={}", req.temperature, req.top_p, req.top_k);
+    eprintln!("  penalties: repetition={}  presence={}  frequency={}",
+        opt_f32(&req.repetition_penalty), opt_f32(&req.presence_penalty), opt_f32(&req.frequency_penalty));
+    eprintln!("  reasoning_effort={} (effective: {})  stop={:?}  include_usage={}",
+        req.reasoning_effort.as_deref().unwrap_or("-"),
+        effort.unwrap_or("template-default"),
+        req.stop,
+        req.stream_options.as_ref().map(|s| s.include_usage).unwrap_or(false));
+    match &req.tools {
+        Some(ts) if !ts.is_empty() => {
+            let names: Vec<&str> = ts.iter().filter_map(|t| t.get("function")
+                .and_then(|f| f.get("name")).and_then(|n| n.as_str())).collect();
+            eprintln!("  tools ({}): {}", ts.len(), names.join(", "));
+        }
+        _ => eprintln!("  tools: none"),
+    }
+    eprintln!("  messages ({}):", req.messages.len());
+    for (i, m) in req.messages.iter().enumerate() {
+        let mut line = format!("    {}. {:9}", i + 1, m.role);
+        if let Some(c) = &m.content {
+            let flat: String = c.chars().map(|ch| if ch == '\n' { '⏎' } else { ch }).collect();
+            let n = flat.chars().count();
+            let head: String = flat.chars().take(160).collect();
+            line.push_str(&format!(" ({n} ch): {head}{}", if n > 160 { " …" } else { "" }));
+        }
+        if let Some(tc) = &m.tool_calls {
+            let names: Vec<&str> = tc.iter().map(|c| c.function.name.as_str()).collect();
+            line.push_str(&format!("  [tool_calls: {}]", names.join(", ")));
+        }
+        if !m.images.is_empty() { line.push_str(&format!("  [{} image(s)]", m.images.len())); }
+        if let Some(id) = &m.tool_call_id { line.push_str(&format!("  [result of {id}]")); }
+        eprintln!("{line}");
+    }
+    let total = prompt.chars().count();
+    let trunc = cap.min(total);
+    eprintln!("[prompt] rendered prompt: {prompt_tokens} tokens, {total} chars ({render_ms:.1} ms render):");
+    let head: String = prompt.chars().take(trunc).collect();
+    for l in head.lines() { eprintln!("    | {l}"); }
+    if total > trunc {
+        eprintln!("    … (+{} more chars of {total} — full dump: RUST_INFER_DUMP_PROMPT=1)", total - trunc);
+    }
+    eprintln!("[prompt] ══════════════════════════════════════════════════════════════════");
+}
+
 fn partial_overlap(s: &str, marker: &str) -> usize {
     (1..marker.len()).rev().find(|&k| s.ends_with(&marker[..k])).unwrap_or(0)
 }
@@ -278,22 +346,38 @@ async fn chat_completions(
     //   - hy_v3's template accepts `no_think|low|high` (default low), and its Rust dsv4 path treats
     //     None/"" as low.
     //   - Qwen3.5's template accepts `xhigh|medium|low` (default xhigh) and RAISES on anything else.
-    // Forward the client's value verbatim when it is one of the Qwen values; normalize the OpenAI
-    // convention (minimal|low|medium|high) onto a family-agnostic low/high only when a value is
-    // given. When NEITHER the request nor --reasoning-effort specifies one, pass None so the model's
-    // own template default wins (xhigh for Qwen, low for hy_v3) — never a hardcoded guess.
+    // Forward the client's value verbatim when it is valid for THIS family's template; convert
+    // the OpenAI API convention onto the nearest native level. When NEITHER the request nor
+    // --reasoning-effort specifies one, pass None so the model's own template default wins
+    // (xhigh for Qwen 3.8, low for hy_v3) — never a hardcoded guess.
+    //
+    // Qwen 3.8 native (the ONLY values its template accepts; anything else raises => 500):
+    //   xhigh (default) | medium | low          ["no_think"/"off" => enable_thinking=false]
+    // OpenAI API -> Qwen 3.8 (owner spec 2026-08-30):
+    //   none    -> thinking off      (latency-critical; no reasoning)
+    //   low     -> low               (efficient reasoning)
+    //   medium  -> medium            (balanced; OpenAI's default)
+    //   high    -> xhigh             (hard reasoning)
+    //   xhigh   -> xhigh             (deep research)
+    //   max     -> xhigh             (maximum)
+    // hy_v3 native: no_think | low | high  =>  none->no_think, low->low, medium/high/xhigh/max->high
+    //
+    // REGRESSION FIX (2026-08-30): the 289e1a1 refactor lumped "high" into the no_think arm,
+    // so every OpenAI-convention client sending reasoning_effort=high silently LOST thinking.
+    let (_, think_close_tag, _) = state.tokenizer.think_tags();
+    let hy_family = think_close_tag != "</think>";
     let effort: Option<&str> = req.reasoning_effort.as_deref()
         .or(state.reasoning_effort.as_deref())
         .map(|e| {
-            let n = match e {
-                // Qwen3.5 native values pass through verbatim.
-                "xhigh" | "medium" | "low" => e,
-                // OpenAI convention -> nearest native level.
-                "high" | "no_think" | "minimal" | "none" | "off" | "" => "no_think",
-                other => other,
+            let n = match (e, hy_family) {
+                ("high", true) | ("medium", true) | ("xhigh", true) | ("max", true) => "high",
+                ("high", false) | ("xhigh", false) | ("max", false) => "xhigh",
+                ("low", _) | ("medium", false) => e,
+                ("no_think", _) | ("none", _) | ("minimal", _) | ("off", _) | ("", _) => "no_think",
+                (other, _) => other,
             };
-            if !matches!(n, "xhigh" | "medium" | "low" | "no_think" | "high") {
-                eprintln!("[req] reasoning_effort '{e}' not a known level (passing through verbatim)");
+            if n != e {
+                eprintln!("[req] reasoning_effort '{e}' normalized to '{n}' for this model family");
             }
             n
         });
@@ -364,6 +448,11 @@ async fn chat_completions(
     }
 
     let prompt_len = prompt_tokens.len();
+
+    if state.output_prompts > 0 {
+        let mname = req.model.clone().unwrap_or_else(|| state.model_name.clone());
+        log_request_human(&req, effort, &prompt, prompt_len, state.output_prompts, &mname, render_ms);
+    }
 
     // Where to snapshot the GDN state: the message boundary, i.e. this prompt without its trailing
     // generation prompt. Everything up to here is what the NEXT turn replays verbatim. Rendering the
@@ -459,12 +548,22 @@ async fn chat_completions(
         let t0 = std::time::Instant::now();
         let req_tools = req.tools.clone();
         let include_usage = req.stream_options.as_ref().map(|o| o.include_usage).unwrap_or(true);
-        // Think markers + the initial reasoning/content state, from the model's vocab: qwen is
-        // primed into a think block (starts in reasoning); hy_v3's no_think prompt closes the empty
-        // block itself (starts as content) — but with reasoning_effort low|high the hy3 template
-        // primes `…assistant<think:opensource>` too, so the stream also starts INSIDE the block.
-        let (think_open, think_close, family_primed) = tokenizer.think_tags();
-        let starts_in_reasoning = family_primed || matches!(effort, Some("low") | Some("high"));
+        // Think markers + the initial reasoning/content state. Derive the start mode from the
+        // RENDERED PROMPT TAIL, not a family constant: qwen's template primes an OPEN think block
+        // when thinking (prompt ends with `<think>`), but its no-think branch (enable_thinking=
+        // false — effort none/no_think/off) emits a CLOSED empty block `<think>\n\n</think>\n\n`,
+        // so that stream starts in CONTENT. A family-constant `primed` mislabeled the direct
+        // answer as reasoning_content forever (content stayed empty; the model card's non-thinking
+        // mode is real and respected by the model — verified sync+bf16 2026-08-30). hy_v3 keeps
+        // the effort arm: its low|high template primes `…assistant<think:opensource>` even when
+        // the tail check can't see it.
+        let (think_open, think_close, _) = tokenizer.think_tags();
+        // trim_end: the primed form is `<think>\n` — the trailing newline must not defeat the
+        // tail check (a plain ends_with(think_open) sent thinking streams to content: exactly
+        // the 35b4b15 follow-up bug). The no-think tail `<think>\n\n</think>\n\n` trims to
+        // `</think>` and stays content.
+        let starts_in_reasoning = prompt.trim_end().ends_with(think_open)
+            || matches!(effort, Some("low") | Some("high"));
 
         let stream = async_stream::stream! {
             yield Ok::<Event, axum::Error>(Event::default().data(
@@ -523,10 +622,29 @@ async fn chat_completions(
                                             content_emitted = safe_end;
                                         } else {
                                             let overlap = partial_think_overlap(&acc, think_close);
-                                            let safe = acc.len() - overlap;
-                                            if safe > reason_emitted {
-                                                yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe])));
-                                                reason_emitted = safe;
+                                            let safe = (acc.len() - overlap).max(reason_emitted);
+                                            // Tool-call hold-back in REASONING mode too. A model
+                                            // that calls a tool without ever emitting `</think>`
+                                            // (qwen's first-turn behavior on trivial calls: the
+                                            // template primes `<think>` and the model jumps
+                                            // straight to the call) stays in this branch, which
+                                            // had NO TOOL_OPEN hold-back — the raw call markup
+                                            // streamed out as reasoning_content while
+                                            // finalize_parsed ALSO emitted the structured
+                                            // tool_calls delta: the client saw the same call
+                                            // twice (2026-08-30 user report). Same contract as
+                                            // the content branch below: once TOOL_OPEN appears,
+                                            // reasoning emission stops; the buffer is either
+                                            // parsed into the tool_calls delta or surfaced
+                                            // post-loop by held_back_remainder.
+                                            let region = &acc[reason_emitted..safe];
+                                            let safe_end = match region.find(TOOL_OPEN) {
+                                                Some(i) => reason_emitted + i,
+                                                None => safe - partial_overlap(region, TOOL_OPEN),
+                                            };
+                                            if safe_end > reason_emitted {
+                                                yield Ok(Event::default().data(reasoning_chunk(&completion_id, created, &model_name, &acc[reason_emitted..safe_end])));
+                                                reason_emitted = safe_end;
                                             }
                                         }
                                     }
@@ -599,7 +717,10 @@ async fn chat_completions(
                 }
                 yield Ok(Event::default().data(tool_calls_chunk(&completion_id, created, &model_name, &tool_calls)));
                 finish = fin;
-            } else if let Some(held) = crate::tools::held_back_remainder(&acc, content_emitted) {
+            // Watermark is whichever cursor is live: in reasoning mode content_emitted stays 0
+            // and the held-back span lives after reason_emitted (tool call before any
+            // </think>) — using content_emitted alone would re-emit the whole request's text.
+            } else if let Some(held) = crate::tools::held_back_remainder(&acc, reason_emitted.max(content_emitted)) {
                 // A tool-call marker was held back but nothing parsed: surface the buffered text
                 // as content, exactly what the non-streaming mode returns for the same output.
                 yield Ok(Event::default().data(content_chunk(&completion_id, created, &model_name, held)));

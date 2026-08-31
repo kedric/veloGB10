@@ -622,6 +622,75 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// An image's content identity inside a slot's cached sequence: the token-span start plus a hash
+/// of the merged embeddings that were actually spliced there. The slot-level prefix reuse matches
+/// purely on token identity, and two images of the same resolution expand to IDENTICAL `image_pad`
+/// token runs — so a token-only prefix key would happily reuse image N's spliced KV/state for image
+/// N+1. This fingerprint is the image-content half of that key.
+#[derive(Clone, Copy)]
+struct ImageIdentity {
+    start: usize,        // token-span start in the EXPANDED stream
+    hash: u64,           // FNV-1a over the image's merged-embedding bytes
+}
+
+/// The per-image content identities for a request's concatenated `image_embeds` (f32 merged
+/// embeddings, concatenated in `spans` order). Empty when the request carries no images. A hash of
+/// the RAW f32 merged embeddings (the bytes the prefill converts to bf16 and splices) is the most
+/// faithful content key: the same image always yields the same embeddings, a different image
+/// essentially never does.
+fn request_image_identities(
+    embeds: Option<&Vec<f32>>,
+    spans: &[crate::vision_encoder::ImageSpan],
+) -> Vec<ImageIdentity> {
+    // Row width = the vision out width (== text hidden for every supported tower). Derive it
+    // from the request itself: len == sum(spans.num_tokens) * width, so ANY tower geometry
+    // (0.8b 1024 … 27B 5120) is handled without plumbing model-specific constants.
+    let total: usize = spans.iter().map(|s| s.num_tokens).sum();
+    let out_h = if total > 0 {
+        embeds.map(|e| e.len() / total).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    let Some(emb) = embeds else { return out; };
+    let mut off = 0usize;
+    for s in spans {
+        let n = s.num_tokens;
+        let row0 = off * out_h;
+        let row1 = (off + n) * out_h;
+        let slice = if row1 <= emb.len() { &emb[row0..row1] }
+                    else if row0 < emb.len() { &emb[row0..emb.len()] }
+                    else { &[][..] };
+        // Hash the f32 bit patterns directly (no `from_raw_parts` on a possibly-empty slice).
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &v in slice {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        out.push(ImageIdentity { start: s.start, hash: h });
+        off += n;
+    }
+    out
+}
+
+/// True iff reusing the prefix `[0, l)` from a slot is safe for this request's images: every image
+/// whose span begins inside the reused prefix (`start < l`) must match the slot's recorded image at
+/// the same position. A differing image at a reused position means the slot's KV/GDN state was built
+/// from the OLD image — reusing it would replay that image's content.
+fn images_compatible(slot_imgs: &[ImageIdentity], req_imgs: &[ImageIdentity], l: usize) -> bool {
+    for r in req_imgs {
+        if r.start < l {
+            match slot_imgs.iter().find(|s| s.start == r.start) {
+                Some(s) if s.hash == r.hash => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 /// Greedy tree accept-walk. Follow the target's argmax down the tree: at the current node, if any child
 /// carries the token the target predicts (`preds[current]`), descend into it; else stop. Column 0 is the
 /// committed token (always the start). This is the tree generalisation of the chain "accept longest
@@ -697,6 +766,11 @@ pub struct BatchScheduler {
     /// state we held. The prompt boundary is exactly where those misses want to resume, so we keep a
     /// second, older state there. KV needs no snapshot: it is position-addressable and still valid.
     slot_ckpt_seq: Vec<Vec<u32>>,
+    /// Image-content identities (start + merged-embedding hash) inside each slot's `slot_cache` /
+    /// `slot_ckpt_seq`. Parallel to those token sequences; the prefix-reuse matcher consults them so
+    /// a changed image at a reused position breaks the reuse (see [`ImageIdentity`] / [`images_compatible`]).
+    slot_cache_images: Vec<Vec<ImageIdentity>>,
+    slot_ckpt_images: Vec<Vec<ImageIdentity>>,
     /// First of `max_batch` state slots holding the prompt checkpoints (lane i -> prompt_ckpt_slot + i).
     prompt_ckpt_slot: usize,
     /// Prompt-lookup draft n-gram order (0 = off). When the last `ngram_draft` tokens of a lane's
@@ -1020,6 +1094,8 @@ impl BatchScheduler {
             free_slots: (0..max_batch).rev().collect(),
             slot_cache: vec![Vec::new(); max_batch],
             slot_ckpt_seq: vec![Vec::new(); max_batch],
+            slot_cache_images: vec![Vec::new(); max_batch],
+            slot_ckpt_images: vec![Vec::new(); max_batch],
             prompt_ckpt_slot,
             prefix_cache,
             ngram_draft,
@@ -1411,6 +1487,10 @@ impl BatchScheduler {
         // cannot resume from a point the state never occupied. Prefer the longer.
         #[derive(Clone, Copy, PartialEq)]
         enum From_ { Live, Ckpt }
+        // Image-content identities for this request (empty for text-only). A prefix candidate whose
+        // reused range includes a DIFFERENT image is discarded below, so the visual content of the
+        // shared prefix is never replayed from a stale image.
+        let req_imgs = request_image_identities(req.image_embeds.as_ref(), &req.image_spans);
         let best = if !self.prefix_cache { None } else { self.free_slots.iter().enumerate()
             .flat_map(|(i, &sl)| {
                 let live = common_prefix_len(&self.slot_cache[sl], &req.prompt);
@@ -1418,7 +1498,12 @@ impl BatchScheduler {
                 [(i, sl, live, From_::Live, self.slot_cache[sl].len()),
                  (i, sl, ckpt, From_::Ckpt, self.slot_ckpt_seq[sl].len())]
             })
-            .filter(|&(_, _, l, _, seq_len)| l > 0 && l == seq_len && l < req.prompt.len())
+            .filter(|&(_, sl, l, from, seq_len)|
+                l > 0 && l == seq_len && l < req.prompt.len()
+                && match from {
+                    From_::Live => images_compatible(&self.slot_cache_images[sl], &req_imgs, l),
+                    From_::Ckpt => images_compatible(&self.slot_ckpt_images[sl], &req_imgs, l),
+                })
             .max_by_key(|&(_, _, l, _, _)| l) };
 
         let (phys, reuse, from) = match best {
@@ -1522,6 +1607,7 @@ impl BatchScheduler {
             // or a later Live pick would resume from a state the slot no longer holds.
             if from == Some(From_::Ckpt) {
                 self.slot_cache[phys] = self.slot_ckpt_seq[phys].clone();
+                self.slot_cache_images[phys] = self.slot_ckpt_images[phys].clone();
             }
             self.free_slots.push(phys);
             let _ = tx.send(TokEvent::Finish { reason: "context_length_exceeded".to_string() });
@@ -1682,6 +1768,8 @@ impl BatchScheduler {
             if Some(w1) == ckpt_at {
                 self.gpu.copy_gdn_slot(&self.state, phys, self.prompt_ckpt_slot + phys);
                 self.slot_ckpt_seq[phys] = prompt[..w1].to_vec();
+                self.slot_ckpt_images[phys] = req_imgs.iter()
+                    .filter(|x| x.start < w1).copied().collect();
             }
             w0 = w1;
         }
@@ -1694,10 +1782,12 @@ impl BatchScheduler {
             // already cached). Snapshot where we ended; it is still the prompt boundary for THIS prompt.
             self.gpu.copy_gdn_slot(&self.state, phys, self.prompt_ckpt_slot + phys);
             self.slot_ckpt_seq[phys] = prompt.clone();
+            self.slot_ckpt_images[phys] = req_imgs.clone();
         }
 
         // The slot's state now reflects the whole prompt. Decode extends this as tokens commit.
         self.slot_cache[phys] = prompt.clone();
+        self.slot_cache_images[phys] = req_imgs.clone();
         // S5F: the DFlash2 prime is done — the prefill capture must not run for later lanes or
         // requests (it is a per-admit arm, disarmed here regardless of success).
         if will_use_df2 { self.gpu.set_df2_prime_off(); }
@@ -3818,5 +3908,69 @@ mod mtp_policy_tests {
         let hz = [0.80, 0.95, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99];
         let hist = run(&mut p, &hz, MTP_EVAL_WINDOW as usize + 8, 4);
         assert!(hist.iter().all(|&d| d == 3), "up-switched without clearing the margin; history {hist:?}");
+    }
+}
+
+/// Cross-image-contamination: the slot-level prefix reuse must be keyed on image CONTENT, not just
+/// token identity. Two images of the same resolution expand to identical `image_pad` runs, so a
+/// token-only key would replay image N's spliced visual content for image N+1. These test the pure
+/// host-side keying helpers (the GPU splice offset itself is covered by the end-to-end gate).
+#[cfg(test)]
+mod vision_image_cache_tests {
+    use super::{request_image_identities, images_compatible};
+    use crate::vision_encoder::ImageSpan;
+    use crate::vision_tower::OUT_HIDDEN;
+
+    fn span(start: usize, n: usize) -> ImageSpan { ImageSpan { start, num_tokens: n } }
+
+    /// Build a deterministic concatenated embeds buffer for two images of width OUT_HIDDEN.
+    fn two_image_embeds(n0: usize, n1: usize) -> (Vec<f32>, Vec<ImageSpan>) {
+        let mut e = Vec::new();
+        let mut seed = 0x12345678u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) - 0.5
+        };
+        for _ in 0..n0 * OUT_HIDDEN { e.push(next()); }
+        for _ in 0..n1 * OUT_HIDDEN { e.push(next()); }
+        (e, vec![span(60, n0), span(60 + n0, n1)])
+    }
+
+    #[test]
+    fn identities_are_deterministic_and_positioned() {
+        let (emb, spans) = two_image_embeds(4, 5);
+        let ids = request_image_identities(Some(&emb), &spans);
+        assert_eq!(ids.len(), 2, "two images -> two identities");
+        assert_eq!(ids[0].start, 60);
+        assert_eq!(ids[1].start, 60 + 4);
+        let ids2 = request_image_identities(Some(&emb), &spans);
+        assert_eq!(ids[0].hash, ids2[0].hash);
+        assert_eq!(ids[1].hash, ids2[1].hash);
+        // Different content at image 1 -> different hash. Use a perturbation large enough to
+        // change the f32 bits (the LCG values are ~2^30, where the f32 ULP is ~256, so a +0.5
+        // would round away).
+        let mut emb2 = emb.clone();
+        emb2[4 * OUT_HIDDEN] = -12345.678;
+        let ids3 = request_image_identities(Some(&emb2), &spans);
+        assert_eq!(ids3[0].hash, ids[0].hash, "image 0 unchanged");
+        assert_ne!(ids3[1].hash, ids[1].hash, "image 1 changed -> hash must differ");
+        assert!(request_image_identities(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn compatibility_detects_a_changed_image_in_the_reused_prefix() {
+        let (emb, spans) = two_image_embeds(4, 5);
+        let img_old = request_image_identities(Some(&emb), &spans);
+        assert!(images_compatible(&img_old, &img_old, 80), "identical image key must match");
+        assert!(images_compatible(&img_old, &[], 80), "text-only request may reuse any prefix");
+        // A request with a DIFFERENT image at position 60 (inside the reused prefix) must NOT reuse.
+        let mut emb_c = emb.clone();
+        emb_c[5] = -12345.678;
+        let img_new = request_image_identities(Some(&emb_c), &spans);
+        assert!(!images_compatible(&img_old, &img_new, 80), "changed image in the reused prefix must break reuse");
+        // An image wholly in the SUFFIX (start >= l) imposes no constraint.
+        let (_, spans_suffix) = (emb_c.clone(), vec![span(70, 4), span(80, 5)]);
+        let img_sfx = request_image_identities(Some(&emb_c), &spans_suffix);
+        assert!(images_compatible(&img_old, &img_sfx, 60), "image wholly in the suffix imposes no constraint");
     }
 }
