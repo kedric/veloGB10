@@ -1973,7 +1973,18 @@ pub fn calib_igs(
             state.vision_spans = sample.spans.clone();
             &sample.tokens
         } else { &samples.as_ref().unwrap()[s] };
-        let _ = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0, seqlen, 0, 0, nl, None);
+        let sample_seqlen = toks.len();
+        let _ = gpu.prefill_batch_range(
+            &mut pool,
+            toks,
+            &mut state,
+            0,
+            sample_seqlen,
+            0,
+            0,
+            nl,
+            None,
+        );
         if (s + 1) % 32 == 0 || s + 1 == sample_count {
             gpu.gptq_sync();
             println!("[calib-igs] {}/{} samples, {:.1} min", s + 1, sample_count, t_all.elapsed().as_secs_f32() / 60.0);
