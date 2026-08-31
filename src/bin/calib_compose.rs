@@ -28,10 +28,13 @@ struct Source {
     max_document_tokens: usize,
     chunks: Vec<Chunk>,
     cursor: usize,
+    chunk_offset: usize,
     consumed: usize,
     scheduled: usize,
     used_documents: BTreeSet<String>,
     metadata_tokens: BTreeMap<String, usize>,
+    window_tokens: BTreeMap<usize, usize>,
+    trajectory_packing: bool,
 }
 
 struct Args {
@@ -43,6 +46,7 @@ struct Args {
     maca_lengths: Option<Vec<usize>>,
     token_budget: Option<usize>,
     reserve_sequences: usize,
+    trajectory_packing: bool,
 }
 
 #[derive(Default)]
@@ -114,6 +118,7 @@ fn parse_args() -> Result<Args> {
              \x20 --maca-lengths LIST     e.g. 256,512,1024,2048,4096\n\
              \x20 --token-budget N        default: nsamples * seqlen\n\
              \x20 --reserve-sequences N   default: 0\n\
+             \x20 --trajectory-packing    keep conversation windows adjacent and consume chunks continuously\n\
              \nWith --maca-lengths, sequence counts are derived under a fixed token budget.\n\
              Each JSONL output record is one exact, pre-tokenized sample."
         );
@@ -186,6 +191,7 @@ fn parse_args() -> Result<Args> {
         maca_lengths,
         token_budget,
         reserve_sequences: optional(&raw, "--reserve-sequences", 0)?,
+        trajectory_packing: raw.iter().any(|arg| arg == "--trajectory-packing"),
     })
 }
 
@@ -242,6 +248,7 @@ fn load_chunks(
     path: &Path,
     max_document_tokens: usize,
     separator: u32,
+    trajectory_packing: bool,
 ) -> Result<Vec<Chunk>> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut documents = Vec::new();
@@ -263,32 +270,53 @@ fn load_chunks(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}:{}", path.display(), line_index + 1));
-        documents.push((ids, source_id, metadata));
+        documents.push((
+            ids,
+            source_id,
+            metadata,
+            record.get("messages").and_then(Value::as_array).is_some(),
+        ));
     }
     if documents.is_empty() {
         bail!("{} produced no documents", path.display());
     }
-    // Diversity first: all first windows, then all second windows, etc. A prefix
-    // of the pool therefore covers as many distinct documents as possible.
-    let rounds = documents
-        .iter()
-        .map(|(ids, _, _)| ids.len().div_ceil(max_document_tokens))
-        .max()
-        .unwrap_or(0);
     let mut chunks = Vec::new();
-    for window in 0..rounds {
-        let start = window * max_document_tokens;
-        for (ids, source_id, metadata) in &documents {
-            if start >= ids.len() {
-                continue;
+    let conversation_aligned = trajectory_packing && documents.iter().all(|document| document.3);
+    if conversation_aligned {
+        // Tool and chat trajectories must reach their observations and final
+        // answers. Keep every document's windows adjacent instead of consuming
+        // the first window of every document before ever seeing a tail.
+        for (ids, source_id, metadata, _) in &documents {
+            for (window, part) in ids.chunks(max_document_tokens).enumerate() {
+                chunks.push(Chunk {
+                    ids: part.to_vec(),
+                    source_id: source_id.clone(),
+                    window,
+                    metadata: metadata.clone(),
+                });
             }
-            let end = (start + max_document_tokens).min(ids.len());
-            chunks.push(Chunk {
-                ids: ids[start..end].to_vec(),
-                source_id: source_id.clone(),
-                window,
-                metadata: metadata.clone(),
-            });
+        }
+    } else {
+        // Plain documents and repository files remain diversity-first.
+        let rounds = documents
+            .iter()
+            .map(|(ids, _, _, _)| ids.len().div_ceil(max_document_tokens))
+            .max()
+            .unwrap_or(0);
+        for window in 0..rounds {
+            let start = window * max_document_tokens;
+            for (ids, source_id, metadata, _) in &documents {
+                if start >= ids.len() {
+                    continue;
+                }
+                let end = (start + max_document_tokens).min(ids.len());
+                chunks.push(Chunk {
+                    ids: ids[start..end].to_vec(),
+                    source_id: source_id.clone(),
+                    window,
+                    metadata: metadata.clone(),
+                });
+            }
         }
     }
     Ok(chunks)
@@ -310,23 +338,41 @@ fn take_from_source(source: &mut Source, amount: usize) -> Result<(Vec<u32>, Val
         bail!("source {} has no chunks", source.name);
     }
     let chunk = &source.chunks[source.cursor % source.chunks.len()];
-    let used = amount.min(chunk.ids.len());
+    let start = if source.trajectory_packing {
+        source.chunk_offset
+    } else {
+        0
+    };
+    let used = amount.min(chunk.ids.len() - start);
     if used == 0 {
         bail!("source {} yielded an empty chunk", source.name);
     }
-    let ids = chunk.ids[..used].to_vec();
-    source.cursor += 1;
+    let ids = chunk.ids[start..start + used].to_vec();
+    if source.trajectory_packing {
+        source.chunk_offset += used;
+    }
+    if !source.trajectory_packing || source.chunk_offset == chunk.ids.len() {
+        source.cursor += 1;
+        source.chunk_offset = 0;
+    }
     source.used_documents.insert(chunk.source_id.clone());
     for key in metadata_key_values(&chunk.metadata) {
         *source.metadata_tokens.entry(key).or_default() += used;
     }
-    let provenance = json!({
+    *source.window_tokens.entry(chunk.window).or_default() += used;
+    let mut provenance = json!({
         "category": source.name,
         "source_id": chunk.source_id,
         "window": chunk.window,
         "tokens": used,
         "metadata": chunk.metadata,
     });
+    if source.trajectory_packing {
+        provenance
+            .as_object_mut()
+            .unwrap()
+            .insert("window_offset".into(), json!(start));
+    }
     Ok((ids, provenance))
 }
 
@@ -478,10 +524,21 @@ fn main() -> Result<()> {
     let separator = tok.encode("\n\n", false)?.first().copied().unwrap_or(198);
     let mut sources = Vec::new();
     for (name, target, max_document_tokens, path) in args.sources {
-        let chunks = load_chunks(&tok, &path, max_document_tokens, separator)?;
+        let chunks = load_chunks(
+            &tok,
+            &path,
+            max_document_tokens,
+            separator,
+            args.trajectory_packing,
+        )?;
         println!(
-            "[compose] {name}: {} diversity-first chunks from {}",
+            "[compose] {name}: {} {} chunks from {}",
             chunks.len(),
+            if args.trajectory_packing {
+                "trajectory-aware"
+            } else {
+                "diversity-first"
+            },
             path.display()
         );
         sources.push(Source {
@@ -491,10 +548,13 @@ fn main() -> Result<()> {
             max_document_tokens,
             chunks,
             cursor: 0,
+            chunk_offset: 0,
             consumed: 0,
             scheduled: 0,
             used_documents: BTreeSet::new(),
             metadata_tokens: BTreeMap::new(),
+            window_tokens: BTreeMap::new(),
+            trajectory_packing: args.trajectory_packing,
         });
     }
     let mut quotas: Vec<usize> = sources
@@ -570,10 +630,15 @@ fn main() -> Result<()> {
                 "actual_percent": *count as f64 * 100.0 / consumed_tokens as f64,
                 "max_document_tokens": source.max_document_tokens,
                 "available_chunks": source.chunks.len(),
-                "used_chunks": source.cursor,
+                "used_chunks": source.cursor + usize::from(source.chunk_offset > 0),
                 "full_reuses": source.cursor / source.chunks.len(),
                 "unique_documents": source.used_documents.len(),
                 "metadata_tokens": source.metadata_tokens,
+                "window_tokens": source.window_tokens,
+                "late_window_tokens": source.window_tokens.iter()
+                    .filter(|(window, _)| **window > 0)
+                    .map(|(_, tokens)| *tokens)
+                    .sum::<usize>(),
             })
         })
         .collect();
@@ -599,6 +664,7 @@ fn main() -> Result<()> {
         "length_histogram": length_histogram,
         "hessian_sequence_normalization": if args.maca_lengths.is_some() { "1/sequence_length" } else { "none" },
         "reserve_sequences": args.reserve_sequences,
+        "trajectory_packing": args.trajectory_packing,
         "consumed_tokens": consumed_tokens,
         "records": schedule.len() + args.reserve_sequences,
         "categories": categories,
@@ -645,5 +711,74 @@ mod tests {
     #[test]
     fn maca_schedule_rejects_unrepresentable_budget() {
         assert!(maca_schedule(&[256, 512], 257).is_err());
+    }
+
+    #[test]
+    fn partial_chunk_consumption_resumes_at_the_exact_suffix() {
+        let mut source = Source {
+            name: "test".into(),
+            target: 1.0,
+            path: PathBuf::from("test.jsonl"),
+            max_document_tokens: 8,
+            chunks: vec![Chunk {
+                ids: vec![10, 11, 12, 13, 14],
+                source_id: "doc".into(),
+                window: 0,
+                metadata: json!({"scenario":"continuity"}),
+            }],
+            cursor: 0,
+            chunk_offset: 0,
+            consumed: 0,
+            scheduled: 0,
+            used_documents: BTreeSet::new(),
+            metadata_tokens: BTreeMap::new(),
+            window_tokens: BTreeMap::new(),
+            trajectory_packing: true,
+        };
+
+        assert_eq!(take_from_source(&mut source, 3).unwrap().0, [10, 11, 12]);
+        assert_eq!(source.cursor, 0);
+        assert_eq!(source.chunk_offset, 3);
+        assert_eq!(take_from_source(&mut source, 3).unwrap().0, [13, 14]);
+        assert_eq!(source.cursor, 1);
+        assert_eq!(source.chunk_offset, 0);
+    }
+
+    #[test]
+    fn v9_packing_keeps_legacy_chunk_advance() {
+        let mut source = Source {
+            name: "test".into(),
+            target: 1.0,
+            path: PathBuf::from("test.jsonl"),
+            max_document_tokens: 8,
+            chunks: vec![
+                Chunk {
+                    ids: vec![10, 11, 12, 13, 14],
+                    source_id: "first".into(),
+                    window: 0,
+                    metadata: json!({}),
+                },
+                Chunk {
+                    ids: vec![20, 21],
+                    source_id: "second".into(),
+                    window: 0,
+                    metadata: json!({}),
+                },
+            ],
+            cursor: 0,
+            chunk_offset: 0,
+            consumed: 0,
+            scheduled: 0,
+            used_documents: BTreeSet::new(),
+            metadata_tokens: BTreeMap::new(),
+            window_tokens: BTreeMap::new(),
+            trajectory_packing: false,
+        };
+
+        let (first, provenance) = take_from_source(&mut source, 3).unwrap();
+        assert_eq!(first, [10, 11, 12]);
+        assert_eq!(source.cursor, 1);
+        assert!(provenance.get("window_offset").is_none());
+        assert_eq!(take_from_source(&mut source, 3).unwrap().0, [20, 21]);
     }
 }

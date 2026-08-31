@@ -1,6 +1,7 @@
 # Public, reproducible calibration corpora
 
-`scripts/generate_public_v9_calibration_corpus.sh` builds the v9 corpus without reading a
+`scripts/generate_public_v9_calibration_corpus.sh` and
+`scripts/generate_public_v10_calibration_corpus.sh` build the v9 and v10 corpora without reading a
 developer checkout, personal files, benchmark prompts or mutable dataset revisions. The complete
 data path is implemented in Rust: `calib_sources` acquires the pinned API slices, reads
 JSON/JSONL/Gzip/Parquet-Snappy, normalizes the conversations, deduplicates them and emits the
@@ -63,3 +64,49 @@ evaluation JSONL through the existing `EXCLUDE_JSONL` mechanism whenever applica
 
 Run `scripts/select_calibration_corpus.sh` and then the MaCa MR-GPTQ recipe in
 `MACA_COLA_ACDM_MOE_CALIBRATION.md` using the candidate corpus it emits.
+
+## Generate the reliability-focused v10 corpus
+
+V10 keeps the same pinned public inputs but changes their normalization and token allocation to
+cover the failure families seen in held-out agent/tool evaluations without copying evaluation
+prompts. ToolACE rows are converted from XML-like transcripts to native `tool_calls` and matching
+tool messages; incomplete, unmatched, or malformed trajectories are rejected. Johin argument
+shapes are inferred across verified calls so the emitted schemas contain property types, required
+fields, and `additionalProperties: false`.
+
+```bash
+cd ~/workspace/veloGB10
+
+SEED=20260901 \
+scripts/generate_public_v10_calibration_corpus.sh \
+  "$HOME/models/Qwen3.8-27B" \
+  "$HOME/models/calibration-sources/qwen38-calibration-v10-public-candidates.jsonl"
+```
+
+The exact 1,048,576-token MaCa prefix is:
+
+- 14% long multi-turn;
+- 20% code;
+- 18% multilingual;
+- 18% structured tools;
+- 12% complete public agentic trajectories;
+- 8% public function-schema examples;
+- 5% verified math reasoning;
+- 5% prompt-injection defence.
+
+The structured-tool pool contains 16 balanced, generic reliability families: direct, sequential
+and parallel calls; no-tool restraint; authorization and cancellation; malformed-response
+fallback; asynchronous polling; stateful correction; exactly-once verification after an ambiguous
+commit; accumulating constraints; schema restraint; precondition checking; information reveal;
+and untrusted-output handling. Constructed v10 variants bypass only corpus-to-corpus
+near-duplicate removal; exact duplicates and held-out benchmark exclusions still apply.
+
+V10 passes `--trajectory-packing` to `calib_compose`. Conversation windows remain adjacent and a
+partially consumed chunk resumes at its exact token offset, so later tool observations and final
+answers are reachable. The manifest records `trajectory_packing`, per-window token counts, and
+`late_window_tokens`; audit those fields before GPTQ. The low-level `calib_sources prepare`
+command defaults to profile v9 for compatibility, while the v10 wrapper explicitly passes
+`--profile v10`.
+
+Calibration preserves activation/Hessian regions; it does not teach new behavior. When a failure
+persists, compare the BF16 or W4A16 baseline with the quantized model before changing the corpus.

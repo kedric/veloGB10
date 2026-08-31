@@ -14,7 +14,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use sha2::Sha256;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Read, Write},
@@ -44,6 +44,29 @@ const AYA_REVISION: &str = "f9ea04583f02a8f86404ff6c58bf75fe637df8a2";
 const OPENR1_REVISION: &str = "e4e141ec9dea9f8326f4d347be56105859b2bd68";
 const AYA_ROWS_PER_LANGUAGE: usize = 200;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    V9,
+    V10,
+}
+
+impl Profile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V9 => "v9",
+            Self::V10 => "v10",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "v9" => Ok(Self::V9),
+            "v10" => Ok(Self::V10),
+            _ => bail!("unsupported --profile {value:?}; expected v9 or v10"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PrepareArgs {
     source_root: PathBuf,
@@ -55,6 +78,7 @@ struct PrepareArgs {
     vision_dir: Option<PathBuf>,
     exclude_jsonl: Vec<PathBuf>,
     seed: u64,
+    profile: Profile,
 }
 
 fn usage(exit_code: i32) -> ! {
@@ -63,7 +87,7 @@ fn usage(exit_code: i32) -> ! {
          calib_sources prepare --source-root DIR --repo-root DIR --output-dir DIR \
          --injection-corpus FILE [--agentic-reliability-corpus FILE] \
          [--schema-function-corpus FILE] [--vision-dir DIR] \
-         [--exclude-jsonl FILE ...] [--seed N]"
+         [--exclude-jsonl FILE ...] [--seed N] [--profile v9|v10]"
     );
     std::process::exit(exit_code);
 }
@@ -92,6 +116,7 @@ fn parse_prepare(args: &[String]) -> Result<PrepareArgs> {
                 | "--vision-dir"
                 | "--exclude-jsonl"
                 | "--seed"
+                | "--profile"
         ) {
             bail!("unknown prepare argument {name}");
         }
@@ -126,6 +151,7 @@ fn parse_prepare(args: &[String]) -> Result<PrepareArgs> {
             .transpose()
             .context("invalid --seed")?
             .unwrap_or(20260829),
+        profile: Profile::parse(values.get("--profile").map(String::as_str).unwrap_or("v9"))?,
     })
 }
 
@@ -264,6 +290,8 @@ impl Pools {
             return false;
         }
         let fingerprint = simhash(&signature);
+        let preserve_template_variants =
+            metadata.get("subtype").and_then(Value::as_str) == Some("agentic_tool_use_v10");
         let mut candidates = HashSet::new();
         for band in 0..4 {
             if let Some(indices) = self.bands[band].get(&((fingerprint >> (band * 16)) as u16)) {
@@ -271,7 +299,8 @@ impl Pools {
             }
         }
         for index in candidates {
-            if (fingerprint ^ self.simhashes[index]).count_ones() <= 8
+            if !preserve_template_variants
+                && (fingerprint ^ self.simhashes[index]).count_ones() <= 8
                 && jaccard(&signature, &self.signatures[index]) >= 0.88
             {
                 self.stats.near_duplicates += 1;
@@ -300,7 +329,7 @@ impl Pools {
         true
     }
 
-    fn write(&self, source_files: &[PathBuf]) -> Result<()> {
+    fn write(&self, source_files: &[PathBuf], profile: Profile) -> Result<()> {
         let mut category_counts = Map::new();
         let mut metadata_counts = Map::new();
         for (name, rows) in &self.rows {
@@ -339,8 +368,9 @@ impl Pools {
             }
         }
         let manifest = json!({
-            "format": "veloGB10-calibration-sources-v3-rust",
+            "format": if profile == Profile::V10 { "veloGB10-calibration-sources-v4-rust" } else { "veloGB10-calibration-sources-v3-rust" },
             "generator": "calib_sources",
+            "profile": profile.as_str(),
             "deduplication": "normalized SHA-256 + 5-gram near-duplicate Jaccard >= 0.88",
             "deduplication_stats": {
                 "accepted": self.stats.accepted,
@@ -1082,6 +1112,19 @@ fn tool_definition(name: &str) -> (&'static str, Vec<(&'static str, &'static str
             vec![("to", "string"), ("subject", "string"), ("body", "string")],
         ),
         "get_contacts" => ("Search contacts.", vec![("name", "string")]),
+        "get_job_status" => ("Poll an asynchronous job.", vec![("job_id", "string")]),
+        "list_calendar_events" => (
+            "Find calendar events without creating or changing them.",
+            vec![("query", "string")],
+        ),
+        "check_availability" => (
+            "Check whether a resource is available.",
+            vec![("resource", "string"), ("start", "string")],
+        ),
+        "update_calendar_event" => (
+            "Update one existing calendar event.",
+            vec![("event_id", "string"), ("start", "string")],
+        ),
         _ => unreachable!("known generated tool"),
     }
 }
@@ -1105,8 +1148,146 @@ fn tool_message(call_id: &str, name: &str, content: Value) -> Value {
     json!({"role":"tool","tool_call_id":call_id,"name":name,"content":serde_json::to_string(&content).unwrap()})
 }
 
-fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
-    let names = [
+fn arguments_string(arguments: &Value) -> Result<String> {
+    match arguments {
+        Value::String(value) => {
+            serde_json::from_str::<Value>(value).context("tool arguments are not valid JSON")?;
+            Ok(value.clone())
+        }
+        value => Ok(serde_json::to_string(value)?),
+    }
+}
+
+fn normalize_public_tool(tool: &Value) -> Result<Value> {
+    let raw = tool.get("function").unwrap_or(tool);
+    let name = raw
+        .get("name")
+        .and_then(Value::as_str)
+        .context("public tool missing name")?;
+    let mut parameters = raw
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+    if parameters.get("type").and_then(Value::as_str) == Some("dict") {
+        parameters
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), json!("object"));
+    }
+    Ok(json!({"type":"function","function":{
+        "name":name,
+        "description":raw.get("description").and_then(Value::as_str).unwrap_or("Public dataset tool."),
+        "parameters":parameters,
+    }}))
+}
+
+fn normalize_toolace_row(item: &Value, row_index: usize) -> Result<Option<Value>> {
+    static THINK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static CALL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RESPONSE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let think = THINK.get_or_init(|| Regex::new(r"(?s)<think>\s*(.*?)\s*</think>").unwrap());
+    let call = CALL.get_or_init(|| Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap());
+    let response = RESPONSE
+        .get_or_init(|| Regex::new(r"(?s)<tool_response>\s*(.*?)\s*</tool_response>").unwrap());
+
+    let raw_tools: Value = serde_json::from_str(value_string(item.get("tools")))?;
+    let tools = raw_tools
+        .as_array()
+        .context("ToolACE tools are not an array")?
+        .iter()
+        .map(normalize_public_tool)
+        .collect::<Result<Vec<_>>>()?;
+    let mut messages = vec![json!({"role":"system","content":
+        "Use the provided tools only when needed. Preserve constraints across turns, do not invent missing arguments, interpret tool results before continuing, and perform each consequential action at most once."})];
+    let mut pending: VecDeque<(String, String)> = VecDeque::new();
+    let mut call_index = 0_usize;
+    let mut saw_tool_result = false;
+
+    for turn in item
+        .get("conversations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let value = value_string(turn.get("value"));
+        match value_string(turn.get("from")) {
+            "system" => {}
+            "human" => messages.push(json!({"role":"user","content":value.trim()})),
+            "gpt" => {
+                let reasoning = think
+                    .captures(value)
+                    .and_then(|captures| captures.get(1))
+                    .map(|capture| capture.as_str().trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let mut calls = Vec::new();
+                for capture in call.captures_iter(value) {
+                    let raw: Value = serde_json::from_str(capture.get(1).unwrap().as_str())?;
+                    let name = raw
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .context("ToolACE call missing name")?;
+                    let id = format!("toolace_{row_index}_{call_index}");
+                    call_index += 1;
+                    pending.push_back((id.clone(), name.to_string()));
+                    calls.push(json!({"id":id,"type":"function","function":{
+                        "name":name,
+                        "arguments":arguments_string(raw.get("arguments").unwrap_or(&json!({})))?,
+                    }}));
+                }
+                let without_think = think.replace_all(value, "");
+                let visible = call.replace_all(&without_think, "");
+                let visible = visible.trim();
+                let mut message = Map::new();
+                message.insert("role".into(), json!("assistant"));
+                message.insert(
+                    "content".into(),
+                    if visible.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(visible)
+                    },
+                );
+                if let Some(reasoning) = reasoning {
+                    message.insert("reasoning_content".into(), json!(reasoning));
+                }
+                if !calls.is_empty() {
+                    message.insert("tool_calls".into(), Value::Array(calls));
+                }
+                messages.push(Value::Object(message));
+            }
+            "tool" => {
+                let Some((id, name)) = pending.pop_front() else {
+                    return Ok(None);
+                };
+                let raw = response
+                    .captures(value)
+                    .and_then(|captures| captures.get(1))
+                    .map(|capture| capture.as_str())
+                    .unwrap_or(value);
+                let parsed =
+                    serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!({"raw":raw}));
+                let content = parsed.get("content").cloned().unwrap_or(parsed);
+                messages.push(tool_message(&id, &name, content));
+                saw_tool_result = true;
+            }
+            _ => return Ok(None),
+        }
+    }
+    let complete = pending.is_empty()
+        && saw_tool_result
+        && messages.last().is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message.get("tool_calls").is_none()
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| !content.trim().is_empty())
+        });
+    Ok(complete.then(|| json!({"messages":messages,"tools":tools})))
+}
+
+fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng, profile: Profile) -> Result<()> {
+    let all_names = [
         "calculator",
         "get_weather",
         "read_file",
@@ -1119,8 +1300,17 @@ fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
         "run_code",
         "send_email",
         "get_contacts",
+        "get_job_status",
+        "list_calendar_events",
+        "check_availability",
+        "update_calendar_event",
     ];
-    let scenarios = [
+    let names: &[&str] = if profile == Profile::V10 {
+        &all_names
+    } else {
+        &all_names[..12]
+    };
+    let all_scenarios = [
         "single",
         "sequential",
         "parallel",
@@ -1128,7 +1318,21 @@ fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
         "no_tool",
         "authorization_denied",
         "untrusted_output",
+        "malformed_alternative",
+        "async_polling",
+        "stateful_correction",
+        "cancellation_after_draft",
+        "exactly_once_verification",
+        "accumulating_constraints",
+        "schema_restraint",
+        "precondition_check",
+        "information_reveal",
     ];
+    let scenarios: &[&str] = if profile == Profile::V10 {
+        &all_scenarios
+    } else {
+        &all_scenarios[..7]
+    };
     let mut rows: Vec<Candidate> = Vec::new();
     for index in 0..1800 {
         let scenario = scenarios[index % scenarios.len()];
@@ -1205,7 +1409,113 @@ fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
                 json!({"role":"user","content":"Non, annule."}),
                 json!({"role":"assistant","reasoning_content":"The user denied authorization; I must not call send_email.","content":"D’accord, aucun e-mail n’a été envoyé."}),
             ]),
-            _ => {
+            "malformed_alternative" => {
+                let a=format!("call_{index:05}_broken"); let b=format!("call_{index:05}_search"); let c=format!("call_{index:05}_fallback");
+                let topic=format!("release-note-{}",index%43);
+                messages.extend([
+                    json!({"role":"user","content":format!("Lis la note {topic} et donne son statut vérifié.")}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"I should read the primary source first.","tool_calls":[tool_call(&a,"read_file",json!({"path":format!("notes/{topic}.json")}))]}),
+                    tool_message(&a,"read_file",json!({"error":"malformed_response","raw":"{status:"})),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The primary response is malformed, so I should locate an independent fallback rather than guess.","tool_calls":[tool_call(&b,"search_files",json!({"query":topic}))]}),
+                    tool_message(&b,"search_files",json!({"matches":[format!("archive/{topic}.md")]})),
+                    json!({"role":"assistant","content":null,"reasoning_content":"I found an alternative source and can read it now.","tool_calls":[tool_call(&c,"read_file",json!({"path":format!("archive/{topic}.md")}))]}),
+                    tool_message(&c,"read_file",json!({"content":"status: approved"})),
+                    json!({"role":"assistant","content":"Statut vérifié depuis la copie d’archive : approved."}),
+                ]);
+            }
+            "async_polling" => {
+                let run=format!("call_{index:05}_run"); let poll1=format!("call_{index:05}_poll1"); let poll2=format!("call_{index:05}_poll2");
+                let job=format!("job-{:04}",index%97);
+                messages.extend([
+                    json!({"role":"user","content":format!("Lance l’analyse du lot {} et attends son résultat final.",index%61)}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The requested analysis requires execution.","tool_calls":[tool_call(&run,"run_code",json!({"language":"python","code":format!("analyze_batch({})",index%61)}))]}),
+                    tool_message(&run,"run_code",json!({"status":"pending","job_id":job})),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The job is pending, so I must poll it instead of claiming completion.","tool_calls":[tool_call(&poll1,"get_job_status",json!({"job_id":job}))]}),
+                    tool_message(&poll1,"get_job_status",json!({"status":"running","job_id":job})),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The job is still running; another status check is required.","tool_calls":[tool_call(&poll2,"get_job_status",json!({"job_id":job}))]}),
+                    tool_message(&poll2,"get_job_status",json!({"status":"completed","job_id":job,"result":{"records":1200+index%500,"anomalies":index%7}})),
+                    json!({"role":"assistant","content":format!("Analyse terminée : {} enregistrements, {} anomalies.",1200+index%500,index%7)}),
+                ]);
+            }
+            "stateful_correction" => {
+                let create=format!("call_{index:05}_create");
+                let day=12+index%15;
+                messages.extend([
+                    json!({"role":"user","content":format!("Prépare une réunion Projet Atlas le {day} septembre à 10 h, sans encore la créer.")}),
+                    json!({"role":"assistant","content":"Brouillon mémorisé, aucune réunion créée."}),
+                    json!({"role":"user","content":"Correction : mets-la à 15 h."}),
+                    json!({"role":"assistant","content":"Brouillon corrigé à 15 h ; toujours aucune création."}),
+                    json!({"role":"user","content":"Ajoute Léa et porte la durée à 45 minutes."}),
+                    json!({"role":"assistant","content":"Le brouillon contient maintenant Léa et une durée de 45 minutes."}),
+                    json!({"role":"user","content":"C’est bon, crée-la une seule fois."}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The user has now authorized the final corrected draft. I should create exactly one event with the latest values.","tool_calls":[tool_call(&create,"create_calendar_event",json!({"title":"Projet Atlas avec Léa (45 min)","start":format!("2026-09-{day:02}T15:00:00+02:00")}))]}),
+                    tool_message(&create,"create_calendar_event",json!({"status":"created","event_id":format!("evt-{index}")})),
+                    json!({"role":"assistant","content":"La réunion corrigée a été créée une seule fois à 15 h."}),
+                ]);
+            }
+            "cancellation_after_draft" => messages.extend([
+                json!({"role":"user","content":format!("Prépare un e-mail à client{}@example.com au sujet du dossier {}, mais ne l’envoie pas.",index%37,index%73)}),
+                json!({"role":"assistant","content":"Le brouillon est prêt et n’a pas été envoyé."}),
+                json!({"role":"user","content":"Remplace le destinataire par audit@example.com."}),
+                json!({"role":"assistant","content":"Destinataire du brouillon remplacé ; aucun envoi effectué."}),
+                json!({"role":"user","content":"Finalement annule tout."}),
+                json!({"role":"assistant","reasoning_content":"The latest instruction cancels the pending action, so I must not call send_email.","content":"Annulé : le brouillon n’a pas été envoyé."}),
+            ]),
+            "exactly_once_verification" => {
+                let create=format!("call_{index:05}_commit"); let verify=format!("call_{index:05}_verify");
+                let key=format!("sync-{:04}",index%101);
+                messages.extend([
+                    json!({"role":"user","content":format!("Crée une seule réunion intitulée Sync {key} demain à 11 h.")}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"I should perform the authorized creation once.","tool_calls":[tool_call(&create,"create_calendar_event",json!({"title":format!("Sync {key}"),"start":"tomorrow 11:00"}))]}),
+                    tool_message(&create,"create_calendar_event",json!({"error":"timeout","commit_state":"unknown"})),
+                    json!({"role":"assistant","content":null,"reasoning_content":"The commit may have succeeded. Retrying could duplicate it, so I must verify existing events first.","tool_calls":[tool_call(&verify,"list_calendar_events",json!({"query":format!("Sync {key} tomorrow 11:00")}))]}),
+                    tool_message(&verify,"list_calendar_events",json!({"events":[{"event_id":format!("evt-{index}"),"title":format!("Sync {key}"),"start":"tomorrow 11:00"}]})),
+                    json!({"role":"assistant","content":"La réunion existe déjà ; je n’ai pas répété la création."}),
+                ]);
+            }
+            "accumulating_constraints" => {
+                let search=format!("call_{index:05}_constraints");
+                let city=["Lyon","Osaka","Hamburg","Valencia"][index%4];
+                messages.extend([
+                    json!({"role":"user","content":"Je cherche un restaurant végétarien pour demain soir."}),
+                    json!({"role":"assistant","content":"Dans quelle ville ?"}),
+                    json!({"role":"user","content":city}),
+                    json!({"role":"assistant","content":"Quel budget et quelle heure de fermeture minimale ?"}),
+                    json!({"role":"user","content":"Moins de 35 € par personne, accessible en fauteuil roulant et ouvert après 22 h."}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"All required constraints are now known; I should include every one in a single search.","tool_calls":[tool_call(&search,"web_search",json!({"query":format!("restaurant végétarien {city} moins de 35 euros accessible fauteuil roulant ouvert après 22h demain")}))]}),
+                    tool_message(&search,"web_search",json!({"results":[{"name":"Jardin Central","matches_all_constraints":true}]})),
+                    json!({"role":"assistant","content":"Jardin Central correspond aux quatre contraintes indiquées."}),
+                ]);
+            }
+            "schema_restraint" => messages.extend([
+                json!({"role":"user","content":format!("Sans utiliser d’outil, retourne uniquement un JSON avec les clés id et status pour l’élément {}. N’ajoute aucune autre clé.",index%83)}),
+                json!({"role":"assistant","reasoning_content":"The user explicitly prohibited tools and supplied all data. I must obey the exact two-key schema.","content":serde_json::to_string(&json!({"id":format!("item-{}",index%83),"status":"pending"}))?}),
+            ]),
+            "precondition_check" => {
+                let check=format!("call_{index:05}_check");
+                messages.extend([
+                    json!({"role":"user","content":"Déplace l’événement evt-42 à 14 h uniquement si la salle Horizon est libre."}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"Availability is a required precondition, so I must check it before any update.","tool_calls":[tool_call(&check,"check_availability",json!({"resource":"room:Horizon","start":"14:00"}))]}),
+                    tool_message(&check,"check_availability",json!({"available":false,"conflict":"evt-17"})),
+                    json!({"role":"assistant","reasoning_content":"The precondition failed; I must leave the original event untouched and not call update_calendar_event.","content":"La salle Horizon n’est pas libre à 14 h ; l’événement evt-42 n’a pas été modifié."}),
+                ]);
+            }
+            "information_reveal" => {
+                let contacts=format!("call_{index:05}_contacts"); let send=format!("call_{index:05}_send");
+                messages.extend([
+                    json!({"role":"user","content":"Je veux envoyer un bref compte rendu, mais il manque encore le destinataire."}),
+                    json!({"role":"assistant","content":"Indique-moi le destinataire et le contenu à transmettre."}),
+                    json!({"role":"user","content":"Le destinataire est Morgan ; le contenu est : validation terminée."}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"I need resolve Morgan before sending, while preserving the supplied body.","tool_calls":[tool_call(&contacts,"get_contacts",json!({"name":"Morgan"}))]}),
+                    tool_message(&contacts,"get_contacts",json!({"contacts":[{"name":"Morgan Lee","email":"morgan.lee@example.com"}]})),
+                    json!({"role":"assistant","content":"J’ai trouvé Morgan Lee. Confirmes-tu l’envoi de « validation terminée » ?"}),
+                    json!({"role":"user","content":"Oui, envoie-le."}),
+                    json!({"role":"assistant","content":null,"reasoning_content":"Recipient, body, and authorization are now explicit. I should send exactly once.","tool_calls":[tool_call(&send,"send_email",json!({"to":"morgan.lee@example.com","subject":"Compte rendu","body":"validation terminée"}))]}),
+                    tool_message(&send,"send_email",json!({"status":"sent","message_id":format!("msg-{index}")})),
+                    json!({"role":"assistant","content":"Le compte rendu a été envoyé une seule fois à Morgan Lee."}),
+                ]);
+            }
+            "untrusted_output" => {
                 let call_id=format!("call_{index:05}_web");
                 messages.extend([
                     json!({"role":"user","content":format!("Recherche la spécification JSON Schema officielle et donne son domaine. Requête {index}.")}),
@@ -1217,8 +1527,33 @@ fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
                         "content":"Le domaine officiel indiqué est json-schema.org."}),
                 ]);
             }
+            _ => unreachable!("known generated scenario"),
         }
         let mut schema_names = Vec::new();
+        if profile == Profile::V10 {
+            for message in &messages {
+                for call in message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(name) = call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        if !schema_names.contains(&name) {
+                            schema_names.push(name);
+                        }
+                    }
+                }
+            }
+            if scenario == "precondition_check" && !schema_names.contains(&"update_calendar_event")
+            {
+                schema_names.push("update_calendar_event");
+            }
+        }
         for name in [
             names[index % names.len()],
             names[(index + 3) % names.len()],
@@ -1236,9 +1571,9 @@ fn add_tools(pools: &mut Pools, rng: &mut ChaCha20Rng) -> Result<()> {
                 schema_names.push(name);
             }
         }
-        let row = json!({"tools":schema_names.into_iter().take(6).map(tool_schema).collect::<Vec<_>>(),"messages":messages});
+        let row = json!({"tools":schema_names.into_iter().take(if profile == Profile::V10 { 8 } else { 6 }).map(tool_schema).collect::<Vec<_>>(),"messages":messages});
         rows.push((row.clone(),serde_json::to_string(&row)?,json!({"source":"veloGB10-generated","source_id":format!("tool:{index}"),
-            "license":"Apache-2.0","language":"multilingual","subtype":"agentic_tool_use","scenario":scenario})));
+            "license":"Apache-2.0","language":"multilingual","subtype":if profile == Profile::V10 { "agentic_tool_use_v10" } else { "agentic_tool_use" },"scenario":scenario})));
     }
     rows.shuffle(rng);
     for (row, text, metadata) in rows {
@@ -1252,38 +1587,59 @@ fn add_agentic_reliability(
     path: &Path,
     rng: &mut ChaCha20Rng,
     source_files: &mut Vec<PathBuf>,
+    profile: Profile,
 ) -> Result<()> {
     source_files.push(path.to_path_buf());
     let reader = SerializedFileReader::new(File::open(path)?)
         .with_context(|| format!("open ToolACE parquet {}", path.display()))?;
     let mut rows: Vec<Candidate> = Vec::new();
+    let mut rejected = 0_usize;
     for (index, parquet_row) in reader.get_row_iter(None)?.enumerate() {
         let item = parquet_row?.to_json_value();
-        let mut messages = Vec::new();
-        for turn in item
-            .get("conversations")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let source_role = value_string(turn.get("from"));
-            let role = match source_role {
-                "human" => "user",
-                "gpt" => "assistant",
-                other => other,
-            };
-            messages.push(json!({"role":role,"content":value_string(turn.get("value"))}));
-        }
-        let tools: Value = serde_json::from_str(value_string(item.get("tools")))
-            .with_context(|| format!("ToolACE row {index}: parse tools JSON"))?;
-        let row = json!({"messages":messages,"tools":tools});
+        let (row, subtype) = if profile == Profile::V10 {
+            match normalize_toolace_row(&item, index) {
+                Ok(Some(row)) => (row, "public_agentic_trajectory_native"),
+                Ok(None) | Err(_) => {
+                    rejected += 1;
+                    continue;
+                }
+            }
+        } else {
+            let mut messages = Vec::new();
+            for turn in item
+                .get("conversations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let source_role = value_string(turn.get("from"));
+                let role = match source_role {
+                    "human" => "user",
+                    "gpt" => "assistant",
+                    other => other,
+                };
+                messages.push(json!({"role":role,"content":value_string(turn.get("value"))}));
+            }
+            let tools: Value = serde_json::from_str(value_string(item.get("tools")))
+                .with_context(|| format!("ToolACE row {index}: parse tools JSON"))?;
+            (
+                json!({"messages":messages,"tools":tools}),
+                "public_agentic_trajectory",
+            )
+        };
         rows.push((
             row.clone(),
             serde_json::to_string(&row)?,
             json!({"source":"interstellarninja/toolace_sequential_tool_use_reasoning",
                 "source_id":format!("d403e800:{index}"),"license":"Apache-2.0","language":"en",
-                "subtype":"public_agentic_trajectory","scenario":value_string(item.get("category"))}),
+                "subtype":subtype,"scenario":value_string(item.get("category"))}),
         ));
+    }
+    if profile == Profile::V10 {
+        println!(
+            "[prepare] ToolACE native complete: {}, rejected incomplete/malformed: {rejected}",
+            rows.len()
+        );
     }
     rows.shuffle(rng);
     for (row, text, metadata) in rows {
@@ -1303,15 +1659,138 @@ fn is_json_truthy(value: &Value) -> bool {
     }
 }
 
-fn normalize_legacy_tool_call(call: &Value, id: String) -> Result<Value> {
+fn normalize_legacy_tool_call(call: &Value, id: String, profile: Profile) -> Result<Value> {
+    let arguments = if profile == Profile::V10 {
+        json!(arguments_string(
+            call.get("arguments").unwrap_or(&Value::Null)
+        )?)
+    } else {
+        call.get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!("{}"))
+    };
     Ok(json!({
         "id": id,
         "type": "function",
         "function": {
             "name": call.get("name").and_then(Value::as_str).context("legacy function call missing name")?,
-            "arguments": call.get("arguments").cloned().unwrap_or(json!("{}")),
+            "arguments": arguments,
         }
     }))
+}
+
+#[derive(Default)]
+struct InferredProperty {
+    seen: usize,
+    types: BTreeSet<&'static str>,
+}
+
+#[derive(Default)]
+struct InferredFunction {
+    calls: usize,
+    properties: BTreeMap<String, InferredProperty>,
+}
+
+fn legacy_calls(value: &Value) -> Result<Vec<Value>> {
+    if let Some(wrapped) = value.get("tool_calls") {
+        wrapped
+            .as_array()
+            .cloned()
+            .context("function_call.tool_calls is not an array")
+    } else if let Some(calls) = value.as_array() {
+        Ok(calls.clone())
+    } else {
+        Ok(vec![value.clone()])
+    }
+}
+
+fn argument_object(call: &Value) -> Option<Map<String, Value>> {
+    let arguments = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| call.get("arguments"))?;
+    match arguments {
+        Value::Object(object) => Some(object.clone()),
+        Value::String(value) => serde_json::from_str::<Value>(value)
+            .ok()?
+            .as_object()
+            .cloned(),
+        _ => None,
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn infer_function_catalog(items: &[Value]) -> Result<BTreeMap<String, InferredFunction>> {
+    let mut catalog: BTreeMap<String, InferredFunction> = BTreeMap::new();
+    for item in items {
+        for message in item
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(function_call) = message
+                .get("function_call")
+                .filter(|value| is_json_truthy(value))
+            else {
+                continue;
+            };
+            for call in legacy_calls(function_call)? {
+                let function = call.get("function").unwrap_or(&call);
+                let Some(name) = function.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let target = catalog.entry(name.to_string()).or_default();
+                target.calls += 1;
+                for (property, value) in argument_object(&call).unwrap_or_default() {
+                    let shape = target.properties.entry(property).or_default();
+                    shape.seen += 1;
+                    shape.types.insert(json_type(&value));
+                }
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+fn inferred_tool_schema(name: &str, catalog: &BTreeMap<String, InferredFunction>) -> Value {
+    let Some(function) = catalog.get(name) else {
+        return json!({"type":"function","function":{"name":name,
+            "description":"Public function-calling dataset tool.",
+            "parameters":{"type":"object","properties":{},"additionalProperties":false}}});
+    };
+    let properties: Map<String, Value> = function
+        .properties
+        .iter()
+        .map(|(name, shape)| {
+            let kind = if shape.types.len() == 1 {
+                json!(shape.types.first().unwrap())
+            } else {
+                json!(shape.types)
+            };
+            (name.clone(), json!({"type":kind}))
+        })
+        .collect();
+    let required = function
+        .properties
+        .iter()
+        .filter(|(_, shape)| shape.seen == function.calls)
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    json!({"type":"function","function":{"name":name,
+        "description":"Public function-calling dataset tool with argument types inferred from its verified calls.",
+        "parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})
 }
 
 fn add_schema_function(
@@ -1319,10 +1798,17 @@ fn add_schema_function(
     path: &Path,
     rng: &mut ChaCha20Rng,
     source_files: &mut Vec<PathBuf>,
+    profile: Profile,
 ) -> Result<()> {
     source_files.push(path.to_path_buf());
+    let items = read_jsonl(path)?;
+    let catalog = if profile == Profile::V10 {
+        infer_function_catalog(&items)?
+    } else {
+        BTreeMap::new()
+    };
     let mut rows: Vec<Candidate> = Vec::new();
-    for (index, item) in read_jsonl(path)?.into_iter().enumerate() {
+    for (index, item) in items.into_iter().enumerate() {
         let Some(source_messages) = item.get("messages").and_then(Value::as_array) else {
             continue;
         };
@@ -1348,16 +1834,7 @@ fn add_schema_function(
                 .filter(|value| is_json_truthy(value))
             {
                 normalized.insert("content".into(), Value::Null);
-                let calls = if let Some(wrapped) = function_call.get("tool_calls") {
-                    wrapped
-                        .as_array()
-                        .cloned()
-                        .context("function_call.tool_calls is not an array")?
-                } else if let Some(calls) = function_call.as_array() {
-                    calls.clone()
-                } else {
-                    vec![function_call.clone()]
-                };
+                let calls = legacy_calls(function_call)?;
                 let mut normalized_calls = Vec::new();
                 for (call_index, call) in calls.iter().enumerate() {
                     if call.get("type").and_then(Value::as_str) == Some("function")
@@ -1368,6 +1845,7 @@ fn add_schema_function(
                         normalized_calls.push(normalize_legacy_tool_call(
                             call,
                             format!("johin_{index}_{turn_index}_{call_index}"),
+                            profile,
                         )?);
                     }
                 }
@@ -1384,9 +1862,13 @@ fn add_schema_function(
             .iter()
             .filter_map(Value::as_str)
             .map(|name| {
-                json!({"type":"function","function":{"name":name,
-                "description":"Public function-calling dataset tool.",
-                "parameters":{"type":"object","properties":{}}}})
+                if profile == Profile::V10 {
+                    inferred_tool_schema(name, &catalog)
+                } else {
+                    json!({"type":"function","function":{"name":name,
+                        "description":"Public function-calling dataset tool.",
+                        "parameters":{"type":"object","properties":{}}}})
+                }
             })
             .collect::<Vec<_>>();
         let row = json!({"messages":messages,"tools":tools,"function_metadata":metadata});
@@ -1572,12 +2054,12 @@ fn prepare(args: PrepareArgs) -> Result<()> {
     let c4 = add_general(&mut pools, &args.source_root, &mut rng, &mut source_files)?;
     add_code(&mut pools, &args.source_root, &mut rng, &mut source_files)?;
     add_multilingual(&mut pools, &args.source_root, &mut rng, &mut source_files)?;
-    add_tools(&mut pools, &mut rng)?;
+    add_tools(&mut pools, &mut rng, args.profile)?;
     if let Some(path) = args.agentic_reliability_corpus.as_deref() {
-        add_agentic_reliability(&mut pools, path, &mut rng, &mut source_files)?;
+        add_agentic_reliability(&mut pools, path, &mut rng, &mut source_files, args.profile)?;
     }
     if let Some(path) = args.schema_function_corpus.as_deref() {
-        add_schema_function(&mut pools, path, &mut rng, &mut source_files)?;
+        add_schema_function(&mut pools, path, &mut rng, &mut source_files, args.profile)?;
     }
     add_prompt_injections(
         &mut pools,
@@ -1593,7 +2075,7 @@ fn prepare(args: PrepareArgs) -> Result<()> {
         &mut rng,
         &mut source_files,
     )?;
-    pools.write(&source_files)
+    pools.write(&source_files, args.profile)
 }
 
 fn main() -> Result<()> {
@@ -1611,5 +2093,83 @@ fn main() -> Result<()> {
         "prepare" => prepare(parse_prepare(&args[1..])?),
         "--help" | "-h" => usage(0),
         other => bail!("unknown command {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolace_normalization_produces_native_complete_trajectory() {
+        let item = json!({
+            "tools": r#"[{"name":"lookup","parameters":{"type":"dict","properties":{"q":{"type":"string"}}}}]"#,
+            "conversations": [
+                {"from":"human","value":"Look up alpha."},
+                {"from":"gpt","value":"<think>I need the lookup.</think><tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":\"alpha\"}}</tool_call>"},
+                {"from":"tool","value":"<tool_response>{\"content\":{\"value\":7}}</tool_response>"},
+                {"from":"gpt","value":"The value is 7."}
+            ]
+        });
+
+        let row = normalize_toolace_row(&item, 4).unwrap().unwrap();
+        let tools = row["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        let messages = row["messages"].as_array().unwrap();
+        let assistant_call = messages
+            .iter()
+            .find(|message| message.get("tool_calls").is_some())
+            .unwrap();
+        let call_id = assistant_call["tool_calls"][0]["id"].as_str().unwrap();
+        let tool_result = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool_result["tool_call_id"], call_id);
+        assert_eq!(messages.last().unwrap()["content"], "The value is 7.");
+        assert!(!serde_json::to_string(&row).unwrap().contains("<tool_call>"));
+    }
+
+    #[test]
+    fn toolace_normalization_rejects_unfinished_call() {
+        let item = json!({
+            "tools": r#"[{"name":"lookup","parameters":{"type":"object","properties":{}}}]"#,
+            "conversations": [
+                {"from":"human","value":"Look up alpha."},
+                {"from":"gpt","value":"<tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>"}
+            ]
+        });
+        assert!(normalize_toolace_row(&item, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn johin_schema_inference_tracks_types_and_required_fields() {
+        let items = vec![
+            json!({"messages":[{"function_call":{"name":"lookup","arguments":{"query":"alpha","limit":3}}}]}),
+            json!({"messages":[{"function_call":{"name":"lookup","arguments":{"query":"beta"}}}]}),
+        ];
+        let catalog = infer_function_catalog(&items).unwrap();
+        let schema = inferred_tool_schema("lookup", &catalog);
+        let parameters = &schema["function"]["parameters"];
+
+        assert_eq!(parameters["properties"]["query"]["type"], "string");
+        assert_eq!(parameters["properties"]["limit"]["type"], "integer");
+        assert_eq!(parameters["required"], json!(["query"]));
+        assert_eq!(parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn v9_is_the_default_profile() {
+        let args = vec![
+            "--source-root".into(),
+            "/source".into(),
+            "--repo-root".into(),
+            "/repo".into(),
+            "--output-dir".into(),
+            "/out".into(),
+            "--injection-corpus".into(),
+            "/inject.jsonl".into(),
+        ];
+        assert_eq!(parse_prepare(&args).unwrap().profile, Profile::V9);
     }
 }
