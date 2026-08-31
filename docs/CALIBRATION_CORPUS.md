@@ -168,7 +168,9 @@ Each output directory contains both `input_global_scale.json` and the mergeable
 the union; do not take the minimum of already-derived headroom scales:
 
 ```bash
-python3 scripts/merge_igs_scales.py \
+cargo build --release --bin calib_igs
+
+target/release/calib_igs merge \
   --output "$FINAL/input_global_scale.json" \
   /tmp/qwen38-igs-v5/main/input_global_scale.json \
   /tmp/qwen38-igs-v5/long/input_global_scale.json

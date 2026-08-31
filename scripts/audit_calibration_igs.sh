@@ -12,6 +12,7 @@ output_dir=$3
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
 binary="$repo_dir/target/release/gb10_inference"
+igs_binary="$repo_dir/target/release/calib_igs"
 
 if [ ! -f "$model_dir/config.json" ] || [ ! -f "$corpus" ]; then
     echo "missing model config or corpus" >&2
@@ -26,8 +27,9 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 seqlen=$(jq -r '.input_ids | length' "$corpus" | head -n 1)
 case "$seqlen" in ''|*[!0-9]*) echo "corpus has no valid input_ids" >&2; exit 1 ;; esac
 
-if [ ! -x "$binary" ]; then
-    cargo build --release --manifest-path "$repo_dir/Cargo.toml" --bin gb10_inference
+if [ ! -x "$binary" ] || [ ! -x "$igs_binary" ]; then
+    cargo build --release --manifest-path "$repo_dir/Cargo.toml" \
+        --bin gb10_inference --bin calib_igs
 fi
 mkdir -p "$output_dir"
 
@@ -49,6 +51,6 @@ for category in $(jq -r '.primary_category' "$corpus" | sort -u); do
         --seqlen "$seqlen"
 done
 
-python3 "$script_dir/summarize_igs_audit.py" \
+"$igs_binary" audit \
     --root "$output_dir" \
     --output "$output_dir/report.json"
