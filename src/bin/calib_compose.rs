@@ -40,6 +40,8 @@ struct Args {
     sources: Vec<(String, f64, usize, PathBuf)>,
     nsamples: usize,
     seqlen: usize,
+    maca_lengths: Option<Vec<usize>>,
+    token_budget: Option<usize>,
     reserve_sequences: usize,
 }
 
@@ -109,8 +111,11 @@ fn parse_args() -> Result<Args> {
              \nOptions:\n\
              \x20 --nsamples N            default: 512\n\
              \x20 --seqlen N              default: 2048\n\
+             \x20 --maca-lengths LIST     e.g. 256,512,1024,2048,4096\n\
+             \x20 --token-budget N        default: nsamples * seqlen\n\
              \x20 --reserve-sequences N   default: 0\n\
-             \nEach JSONL output record is one exact, pre-tokenized sample."
+             \nWith --maca-lengths, sequence counts are derived under a fixed token budget.\n\
+             Each JSONL output record is one exact, pre-tokenized sample."
         );
         std::process::exit(0);
     }
@@ -140,14 +145,80 @@ fn parse_args() -> Result<Args> {
     if output.exists() {
         bail!("refusing to overwrite {}", output.display());
     }
+    let maca_lengths = raw
+        .iter()
+        .position(|arg| arg == "--maca-lengths")
+        .map(|index| -> Result<Vec<usize>> {
+            let value = raw
+                .get(index + 1)
+                .context("missing value after --maca-lengths")?;
+            let mut lengths: Vec<usize> = value
+                .split(',')
+                .map(|part| {
+                    part.parse::<usize>()
+                        .with_context(|| format!("invalid MaCa length {part:?}"))
+                })
+                .collect::<Result<_>>()?;
+            lengths.sort_unstable();
+            lengths.dedup();
+            if lengths.is_empty() || lengths[0] == 0 {
+                bail!("--maca-lengths must contain positive lengths");
+            }
+            Ok(lengths)
+        })
+        .transpose()?;
+    let token_budget = raw
+        .iter()
+        .position(|arg| arg == "--token-budget")
+        .map(|index| {
+            raw.get(index + 1)
+                .context("missing value after --token-budget")?
+                .parse::<usize>()
+                .context("invalid --token-budget")
+        })
+        .transpose()?;
     Ok(Args {
         model_dir: PathBuf::from(required(&raw, "--model-dir")?),
         output,
         sources,
         nsamples: optional(&raw, "--nsamples", 512)?,
         seqlen: optional(&raw, "--seqlen", 2048)?,
+        maca_lengths,
+        token_budget,
         reserve_sequences: optional(&raw, "--reserve-sequences", 0)?,
     })
+}
+
+fn maca_schedule(lengths: &[usize], token_budget: usize) -> Result<Vec<usize>> {
+    if token_budget == 0 {
+        bail!("MaCa token budget must be positive");
+    }
+    if lengths
+        .iter()
+        .any(|&length| length == 0 || length > token_budget)
+    {
+        bail!("every MaCa length must be in 1..={token_budget}");
+    }
+    let cycle: usize = lengths.iter().sum();
+    let rounds = token_budget / cycle;
+    let mut schedule = Vec::with_capacity(rounds * lengths.len() + lengths.len());
+    for _ in 0..rounds {
+        schedule.extend_from_slice(lengths);
+    }
+    let mut remaining = token_budget - rounds * cycle;
+    for &length in lengths.iter().rev() {
+        while length <= remaining {
+            schedule.push(length);
+            remaining -= length;
+        }
+    }
+    if remaining != 0 {
+        bail!("token budget {token_budget} cannot be represented exactly by MaCa lengths {lengths:?} (remainder {remaining})");
+    }
+    if schedule.is_empty() {
+        bail!("MaCa schedule is empty");
+    }
+    Ok(schedule)
 }
 
 fn render_record(tok: &QwenTokenizer, record: &Value, path: &Path, line: usize) -> Result<String> {
@@ -326,18 +397,19 @@ fn sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn audit(path: &Path, nsamples: usize, seqlen: usize, names: &[String]) -> Result<Vec<usize>> {
+fn audit(path: &Path, schedule: &[usize], names: &[String]) -> Result<Vec<usize>> {
     let raw = std::fs::read_to_string(path)?;
     let mut totals = vec![0usize; names.len()];
     let mut records = 0usize;
-    for (line_index, line) in raw.lines().take(nsamples).enumerate() {
+    for (line_index, line) in raw.lines().take(schedule.len()).enumerate() {
         let record: Value = serde_json::from_str(line)?;
         let ids = record["input_ids"]
             .as_array()
             .with_context(|| format!("{}:{}: missing input_ids", path.display(), line_index + 1))?;
-        if ids.len() != seqlen {
+        let expected = schedule[line_index];
+        if ids.len() != expected {
             bail!(
-                "{}:{}: sample has {} tokens, expected {seqlen}",
+                "{}:{}: sample has {} tokens, expected {expected}",
                 path.display(),
                 line_index + 1,
                 ids.len()
@@ -356,13 +428,16 @@ fn audit(path: &Path, nsamples: usize, seqlen: usize, names: &[String]) -> Resul
             totals[index] += count;
             sample_total += count;
         }
-        if sample_total != seqlen {
-            bail!("sample {line_index} category total {sample_total}, expected {seqlen}");
+        if sample_total != expected {
+            bail!("sample {line_index} category total {sample_total}, expected {expected}");
         }
         records += 1;
     }
-    if records != nsamples {
-        bail!("corpus contains only {records} consumed samples, expected {nsamples}");
+    if records != schedule.len() {
+        bail!(
+            "corpus contains only {records} consumed samples, expected {}",
+            schedule.len()
+        );
     }
     Ok(totals)
 }
@@ -384,6 +459,21 @@ fn main() -> Result<()> {
     if args.nsamples == 0 || args.seqlen == 0 {
         bail!("--nsamples and --seqlen must be positive");
     }
+    let default_budget = args
+        .nsamples
+        .checked_mul(args.seqlen)
+        .context("token budget overflow")?;
+    let schedule = match &args.maca_lengths {
+        Some(lengths) => maca_schedule(lengths, args.token_budget.unwrap_or(default_budget))?,
+        None => {
+            if args.token_budget.is_some() {
+                bail!("--token-budget requires --maca-lengths");
+            }
+            vec![args.seqlen; args.nsamples]
+        }
+    };
+    let max_seqlen = *schedule.iter().max().context("empty schedule")?;
+    let consumed_tokens: usize = schedule.iter().sum();
     let tok = QwenTokenizer::from_file(&args.model_dir.join("tokenizer.json").to_string_lossy())?;
     let separator = tok.encode("\n\n", false)?.first().copied().unwrap_or(198);
     let mut sources = Vec::new();
@@ -407,10 +497,6 @@ fn main() -> Result<()> {
             metadata_tokens: BTreeMap::new(),
         });
     }
-    let consumed_tokens = args
-        .nsamples
-        .checked_mul(args.seqlen)
-        .context("token budget overflow")?;
     let mut quotas: Vec<usize> = sources
         .iter()
         .map(|source| (source.target * consumed_tokens as f64).round() as usize)
@@ -423,9 +509,9 @@ fn main() -> Result<()> {
     }
     let mut writer = BufWriter::new(File::create(&incomplete)?);
     let mut remaining = quotas.clone();
-    for sample_index in 0..args.nsamples {
+    for (sample_index, &sample_len) in schedule.iter().enumerate() {
         let mut sample = BuiltSample::default();
-        while sample.ids.len() < args.seqlen {
+        while sample.ids.len() < sample_len {
             let source_index = remaining
                 .iter()
                 .enumerate()
@@ -433,7 +519,7 @@ fn main() -> Result<()> {
                 .max_by_key(|(_, count)| **count)
                 .map(|(index, _)| index)
                 .context("category quotas exhausted before sample was full")?;
-            let amount = remaining[source_index].min(args.seqlen - sample.ids.len());
+            let amount = remaining[source_index].min(sample_len - sample.ids.len());
             append_category(&mut sample, &mut sources[source_index], amount)?;
             remaining[source_index] -= amount;
         }
@@ -458,13 +544,18 @@ fn main() -> Result<()> {
             .map(|(index, _)| index)
             .context("no reserve source")?;
         let mut sample = BuiltSample::default();
-        append_category(&mut sample, &mut sources[source_index], args.seqlen)?;
-        write_sample(&mut writer, &tok, args.nsamples + reserve_index, sample)?;
+        let reserve_len = args
+            .maca_lengths
+            .as_ref()
+            .map(|lengths| lengths[reserve_index % lengths.len()])
+            .unwrap_or(args.seqlen);
+        append_category(&mut sample, &mut sources[source_index], reserve_len)?;
+        write_sample(&mut writer, &tok, schedule.len() + reserve_index, sample)?;
     }
     writer.flush()?;
     drop(writer);
     let names: Vec<String> = sources.iter().map(|source| source.name.clone()).collect();
-    let audited = audit(&incomplete, args.nsamples, args.seqlen, &names)?;
+    let audited = audit(&incomplete, &schedule, &names)?;
     std::fs::rename(&incomplete, &args.output)?;
     let digest = sha256(&args.output)?;
     let categories: Vec<Value> = sources
@@ -491,25 +582,34 @@ fn main() -> Result<()> {
         .filter_map(|source| source_manifest(&source.path))
         .collect();
     let manifest_path = PathBuf::from(format!("{}.manifest.json", args.output.display()));
+    let mut length_histogram = BTreeMap::<String, usize>::new();
+    for &length in &schedule {
+        *length_histogram.entry(length.to_string()).or_default() += 1;
+    }
     let manifest = json!({
-        "format": "veloGB10-calibration-corpus-v2",
+        "format": if args.maca_lengths.is_some() { "veloGB10-calibration-corpus-v3-maca" } else { "veloGB10-calibration-corpus-v2" },
         "sample_format": "pretokenized input_ids; one JSONL line per state-reset boundary",
         "model_dir": args.model_dir,
         "output": args.output,
         "sha256": digest,
-        "nsamples": args.nsamples,
-        "seqlen": args.seqlen,
+        "nsamples": schedule.len(),
+        "seqlen": max_seqlen,
+        "nominal_seqlen": args.seqlen,
+        "maca_lengths": args.maca_lengths,
+        "length_histogram": length_histogram,
+        "hessian_sequence_normalization": if args.maca_lengths.is_some() { "1/sequence_length" } else { "none" },
         "reserve_sequences": args.reserve_sequences,
         "consumed_tokens": consumed_tokens,
-        "records": args.nsamples + args.reserve_sequences,
+        "records": schedule.len() + args.reserve_sequences,
         "categories": categories,
         "source_manifests": source_manifests,
     });
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     println!("[compose] wrote {} ({digest})", args.output.display());
     println!(
-        "[compose] exact consumed prefix: {} × {} = {consumed_tokens} tokens",
-        args.nsamples, args.seqlen
+        "[compose] exact consumed prefix: {} sequences / lengths {:?} = {consumed_tokens} tokens",
+        schedule.len(),
+        length_histogram
     );
     for (source, count) in sources.iter().zip(audited) {
         println!(
@@ -523,4 +623,27 @@ fn main() -> Result<()> {
     }
     println!("[compose] manifest: {}", manifest_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maca_schedule_has_exact_budget_and_all_scales() {
+        let lengths = [256, 512, 1024, 2048, 4096];
+        let schedule = maca_schedule(&lengths, 512 * 2048).unwrap();
+        assert_eq!(schedule.iter().sum::<usize>(), 512 * 2048);
+        for length in lengths {
+            assert!(schedule.contains(&length));
+        }
+        let min = schedule.iter().filter(|&&length| length == 256).count();
+        let max = schedule.iter().filter(|&&length| length == 4096).count();
+        assert!(min.abs_diff(max) <= 1);
+    }
+
+    #[test]
+    fn maca_schedule_rejects_unrepresentable_budget() {
+        assert!(maca_schedule(&[256, 512], 257).is_err());
+    }
 }

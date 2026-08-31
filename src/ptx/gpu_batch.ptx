@@ -73,6 +73,8 @@
 // _ZZ23gptq_scale_stats_bf16_bE2sd has been demoted
 // _ZZ23gptq_scale_stats_bf16_bE2se has been demoted
 // _ZZ28gptq_static_scales_hessian_bE3h16 has been demoted
+// _ZZ15calib_profile_bE14calib_prof_sum has been demoted
+// _ZZ15calib_profile_bE16calib_prof_sumsq has been demoted
 .shared .align 4 .b8 _ZZ13mma_fp4_pairsPA4_fiiPKjPKhPK13__nv_bfloat16xxiiiiE6wstage[6144];
 // _ZZ19tp_gate_copy_signalP10tp_dev_ctxPKjjE9s_gate_to has been demoted
 // _ZZ21gemm_dsv4_fp8_bsb_tmaP13__nv_bfloat16PKhS2_S2_S2_iiiPfE2sh has been demoted
@@ -103,7 +105,7 @@
 
 	ld.param.u64 	%rd1, [kernel_build_id_param_0];
 	cvta.to.global.u64 	%rd2, %rd1;
-	mov.b64 	%rd3, 6242162060306913876;
+	mov.b64 	%rd3, -9180541349382084862;
 	st.global.u64 	[%rd2], %rd3;
 	ret;
 
@@ -211232,6 +211234,128 @@ $L__BB198_32:
 	add.s16 	%rs36, %rs36, 1;
 	@%p42 bra 	$L__BB198_3;
 $L__BB198_33:
+	ret;
+
+}
+	// .globl	calib_profile_b
+.visible .entry calib_profile_b(
+	.param .u64 .ptr .align 1 calib_profile_b_param_0,
+	.param .u64 .ptr .align 1 calib_profile_b_param_1,
+	.param .u64 .ptr .align 1 calib_profile_b_param_2,
+	.param .u32 calib_profile_b_param_3,
+	.param .u32 calib_profile_b_param_4,
+	.param .u32 calib_profile_b_param_5,
+	.param .u32 calib_profile_b_param_6
+)
+{
+	.reg .pred 	%p<9>;
+	.reg .b16 	%rs<2>;
+	.reg .b32 	%r<31>;
+	.reg .b32 	%f<6>;
+	.reg .b64 	%rd<15>;
+	.reg .b64 	%fd<27>;
+	// demoted variable
+	.shared .align 8 .b8 _ZZ15calib_profile_bE14calib_prof_sum[2048];
+	// demoted variable
+	.shared .align 8 .b8 _ZZ15calib_profile_bE16calib_prof_sumsq[2048];
+	ld.param.u64 	%rd4, [calib_profile_b_param_0];
+	ld.param.u64 	%rd5, [calib_profile_b_param_1];
+	ld.param.u64 	%rd6, [calib_profile_b_param_2];
+	ld.param.u32 	%r11, [calib_profile_b_param_3];
+	ld.param.u32 	%r12, [calib_profile_b_param_4];
+	ld.param.u32 	%r13, [calib_profile_b_param_5];
+	ld.param.u32 	%r14, [calib_profile_b_param_6];
+	mov.u32 	%r1, %ctaid.x;
+	setp.ge.s32 	%p1, %r1, %r11;
+	@%p1 bra 	$L__BB199_10;
+	mov.u32 	%r2, %tid.x;
+	setp.ge.s32 	%p2, %r2, %r12;
+	mov.f64 	%fd25, 0d0000000000000000;
+	mov.f64 	%fd26, %fd25;
+	@%p2 bra 	$L__BB199_4;
+	cvt.u64.u32 	%rd1, %r11;
+	cvt.u64.u32 	%rd2, %r1;
+	mov.u32 	%r3, %ntid.x;
+	cvta.to.global.u64 	%rd3, %rd6;
+	mov.f64 	%fd26, 0d0000000000000000;
+	mov.u32 	%r29, %r2;
+	mov.f64 	%fd25, %fd26;
+$L__BB199_3:
+	cvt.s64.s32 	%rd7, %r29;
+	mad.lo.s64 	%rd8, %rd7, %rd1, %rd2;
+	shl.b64 	%rd9, %rd8, 1;
+	add.s64 	%rd10, %rd3, %rd9;
+	ld.global.u16 	%rs1, [%rd10];
+	// begin inline asm
+	{ cvt.f32.bf16 %f1, %rs1;}
+
+	// end inline asm
+	cvt.f64.f32 	%fd9, %f1;
+	add.f64 	%fd25, %fd25, %fd9;
+	fma.rn.f64 	%fd26, %fd9, %fd9, %fd26;
+	add.s32 	%r29, %r29, %r3;
+	setp.lt.s32 	%p3, %r29, %r12;
+	@%p3 bra 	$L__BB199_3;
+$L__BB199_4:
+	shl.b32 	%r15, %r2, 3;
+	mov.u32 	%r16, _ZZ15calib_profile_bE14calib_prof_sum;
+	add.s32 	%r6, %r16, %r15;
+	st.shared.f64 	[%r6], %fd25;
+	mov.u32 	%r17, _ZZ15calib_profile_bE16calib_prof_sumsq;
+	add.s32 	%r7, %r17, %r15;
+	st.shared.f64 	[%r7], %fd26;
+	bar.sync 	0;
+	mov.u32 	%r30, %ntid.x;
+	setp.lt.u32 	%p4, %r30, 2;
+	@%p4 bra 	$L__BB199_8;
+$L__BB199_5:
+	shr.u32 	%r10, %r30, 1;
+	setp.ge.u32 	%p5, %r2, %r10;
+	@%p5 bra 	$L__BB199_7;
+	shl.b32 	%r18, %r10, 3;
+	add.s32 	%r19, %r6, %r18;
+	ld.shared.f64 	%fd10, [%r19];
+	ld.shared.f64 	%fd11, [%r6];
+	add.f64 	%fd12, %fd10, %fd11;
+	st.shared.f64 	[%r6], %fd12;
+	add.s32 	%r20, %r7, %r18;
+	ld.shared.f64 	%fd13, [%r20];
+	ld.shared.f64 	%fd14, [%r7];
+	add.f64 	%fd15, %fd13, %fd14;
+	st.shared.f64 	[%r7], %fd15;
+$L__BB199_7:
+	bar.sync 	0;
+	setp.gt.u32 	%p6, %r30, 3;
+	mov.u32 	%r30, %r10;
+	@%p6 bra 	$L__BB199_5;
+$L__BB199_8:
+	setp.ne.s32 	%p7, %r2, 0;
+	@%p7 bra 	$L__BB199_10;
+	cvta.to.global.u64 	%rd11, %rd4;
+	ld.shared.f64 	%fd16, [_ZZ15calib_profile_bE14calib_prof_sum];
+	atom.global.add.f64 	%fd17, [%rd11], %fd16;
+	ld.shared.f64 	%fd18, [_ZZ15calib_profile_bE16calib_prof_sumsq];
+	atom.global.add.f64 	%fd19, [%rd11+8], %fd18;
+	xor.b32  	%r21, %r14, %r1;
+	mul.lo.s32 	%r22, %r21, -1640531527;
+	shr.u32 	%r23, %r22, 16;
+	xor.b32  	%r24, %r23, %r22;
+	mul.lo.s32 	%r25, %r24, -2048144789;
+	shr.u32 	%r26, %r25, 13;
+	xor.b32  	%r27, %r26, %r25;
+	rem.u32 	%r28, %r27, %r13;
+	cvta.to.global.u64 	%rd12, %rd5;
+	mul.wide.s32 	%rd13, %r28, 4;
+	add.s64 	%rd14, %rd12, %rd13;
+	ld.shared.f64 	%fd20, [_ZZ15calib_profile_bE14calib_prof_sum];
+	cvt.rn.f64.s32 	%fd21, %r12;
+	div.rn.f64 	%fd22, %fd20, %fd21;
+	cvt.rn.f32.f64 	%f2, %fd22;
+	neg.f32 	%f3, %f2;
+	setp.lt.s32 	%p8, %r25, 0;
+	selp.f32 	%f4, %f3, %f2, %p8;
+	atom.global.add.f32 	%f5, [%rd14], %f4;
+$L__BB199_10:
 	ret;
 
 }

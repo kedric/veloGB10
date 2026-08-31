@@ -13,6 +13,8 @@ Defaults:
   NSAMPLES=512
   SEQLEN=2048
   RESERVE_SEQUENCES=0
+  MACA_LENGTHS=  # e.g. 256,512,1024,2048,4096
+  TOKEN_BUDGET=  # default NSAMPLES * SEQLEN
   SEED=20260830
   BOOTSTRAP=1   # download/clone and checksum missing raw sources
   LONG_NSAMPLES=64
@@ -47,6 +49,8 @@ source_root=${3:-$HOME/models/calibration-sources}
 nsamples=${NSAMPLES:-512}
 seqlen=${SEQLEN:-2048}
 reserve_sequences=${RESERVE_SEQUENCES:-0}
+maca_lengths=${MACA_LENGTHS:-}
+token_budget=${TOKEN_BUDGET:-}
 seed=${SEED:-20260830}
 bootstrap=${BOOTSTRAP:-1}
 long_nsamples=${LONG_NSAMPLES:-64}
@@ -96,7 +100,7 @@ python3 "$script_dir/prepare_calibration_sources.py" "$@"
 cd "$repo_dir"
 cargo build --release --bin calib_compose
 
-"$repo_dir/target/release/calib_compose" \
+set -- "$repo_dir/target/release/calib_compose" \
     --model-dir "$model_dir" \
     --output "$output_jsonl" \
     --nsamples "$nsamples" \
@@ -108,6 +112,13 @@ cargo build --release --bin calib_compose
     --source "tools_structured=20:2048:$staging_dir/tools_structured.jsonl" \
     --source "math_reasoning=10:2048:$staging_dir/math_reasoning.jsonl" \
     --source "prompt_injection=5:768:$staging_dir/prompt_injection.jsonl"
+if [ -n "$maca_lengths" ]; then
+    set -- "$@" --maca-lengths "$maca_lengths"
+fi
+if [ -n "$token_budget" ]; then
+    set -- "$@" --token-budget "$token_budget"
+fi
+"$@"
 
 "$repo_dir/target/release/calib_compose" \
     --model-dir "$model_dir" \

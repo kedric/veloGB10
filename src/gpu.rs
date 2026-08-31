@@ -3184,68 +3184,87 @@ impl GpuModel {
         // hy_v3's MTP block is `model.layers.<num_layers>.*` (80): eh_proj (=fc), enorm/hnorm
         // (=pre_fc norms), final_layernorm (=mtp.norm), and a full decoder layer underneath —
         // one-to-one with GpuMtpLayer (P6).
-        let (draft_head, draft_ids) = if draft_top == 0 && std::env::var("RUST_INFER_DRAFT_VOCAB_FILE").is_err() {
-            (None, Vec::new())
-        } else {
-            let rows = draft_rows;
-
-            let w = if let Some((qw, sc, inv_gs, _m, k)) = draft_parts_q4.as_ref() {
-                let (sq, ss) = crate::quant::subset_rows_nvfp4(qw, sc, *k, &rows);
-                let (wt, st) = crate::quant::repack_nvfp4_mma(&sq, &ss, rows.len(), *k);
-                let gsv = vec![*inv_gs; rows.len() / 16];
-                if mxfp4_mode {
-                    // The draft head is part of the native chain: it needs the lossless OMMA
-                    // repack too (the pipeline does not see it — it is a row subset), and its W
-                    // must carry the OMMA layout as PRIMARY storage (the native prefill dequant
-                    // reads qweight/scales as OMMA). Small (170 MB), so no economy math.
-                    let (aimg, sfa) = crate::mxfp4::repack_nvfp4_omma(&wt, &st, rows.len(), *k);
-                    let qweight = dev.htod_sync_copy(&aimg).unwrap();
-                    let scales = dev.htod_sync_copy(&sfa).unwrap();
-                    omma_map.insert(*qweight.device_ptr() as u64,
-                                    crate::mxfp4::OmmaEntry::Ptr(*qweight.device_ptr() as u64,
-                                                                 *scales.device_ptr() as u64));
-                    Some(W::Nvfp4 { qweight,
-                                    scales,
-                                    gs:      dev.htod_sync_copy(&gsv).unwrap(),
-                                    m: rows.len(), k: *k })
-                } else {
-                    Some(W::Nvfp4 { qweight: dev.htod_sync_copy(&wt).unwrap(),
-                                    scales:  dev.htod_sync_copy(&st).unwrap(),
-                                    gs:      dev.htod_sync_copy(&gsv).unwrap(),
-                                    m: rows.len(), k: *k })
-                }
-            } else if let Some((qw, rs, _m, k)) = draft_parts_q8.as_ref() {
-                let (sq, srs) = crate::quant::subset_rows_fp8(qw, rs, *k, &rows);
-                let wt = crate::quant::repack_fp8_mma(&sq, rows.len(), *k);
-                Some(W::Fp8 { data: dev.htod_sync_copy(&wt).unwrap(),
-                              row_scale: dev.htod_sync_copy(&srs).unwrap(),
-                              m: rows.len(), k: *k })
-            } else if is_hy3 && gpu_bf16.contains_key(&head_name) {
-                // hy_v3: the head is bf16 (recipe `-lmhead`) — subset its rows into a bf16 draft
-                // head. One host round-trip at load (~1 GB) for a permanent halving of the draft
-                // head's per-token read. Rows are independent, so the subset is exact.
-                let host = dev.dtoh_sync_copy(gpu_bf16.get(&head_name).unwrap()).unwrap();
-                let k = host.len() / cfg.vocab_size;
-                let mut sub: Vec<half::bf16> = Vec::with_capacity(rows.len() * k);
-                for &r in &rows {
-                    sub.extend_from_slice(&host[r as usize * k..(r as usize + 1) * k]);
-                }
-                Some(W::Bf16(dev.htod_sync_copy(&sub).unwrap()))
+        let (draft_head, draft_ids) =
+            if draft_top == 0 && std::env::var("RUST_INFER_DRAFT_VOCAB_FILE").is_err() {
+                (None, Vec::new())
             } else {
-                None    // bf16 model: not the serving path, skip FR-Spec rather than duplicate 15 GB
-            };
-            match w {
-                Some(w) => {
-                    println!("  draft head: {} of {} tokens ({:.0}% of the vocabulary) -- the draft \
+                let rows = draft_rows;
+
+                let w = if let Some((qw, sc, inv_gs, _m, k)) = draft_parts_q4.as_ref() {
+                    let (sq, ss) = crate::quant::subset_rows_nvfp4(qw, sc, *k, &rows);
+                    let (wt, st) = crate::quant::repack_nvfp4_mma(&sq, &ss, rows.len(), *k);
+                    let gsv = vec![*inv_gs; rows.len() / 16];
+                    if mxfp4_mode {
+                        // The draft head is part of the native chain: it needs the lossless OMMA
+                        // repack too (the pipeline does not see it — it is a row subset), and its W
+                        // must carry the OMMA layout as PRIMARY storage (the native prefill dequant
+                        // reads qweight/scales as OMMA). Small (170 MB), so no economy math.
+                        let (aimg, sfa) = crate::mxfp4::repack_nvfp4_omma(&wt, &st, rows.len(), *k);
+                        let qweight = dev.htod_sync_copy(&aimg).unwrap();
+                        let scales = dev.htod_sync_copy(&sfa).unwrap();
+                        omma_map.insert(
+                            *qweight.device_ptr() as u64,
+                            crate::mxfp4::OmmaEntry::Ptr(
+                                *qweight.device_ptr() as u64,
+                                *scales.device_ptr() as u64,
+                            ),
+                        );
+                        Some(W::Nvfp4 {
+                            qweight,
+                            scales,
+                            gs: dev.htod_sync_copy(&gsv).unwrap(),
+                            m: rows.len(),
+                            k: *k,
+                        })
+                    } else {
+                        Some(W::Nvfp4 {
+                            qweight: dev.htod_sync_copy(&wt).unwrap(),
+                            scales: dev.htod_sync_copy(&st).unwrap(),
+                            gs: dev.htod_sync_copy(&gsv).unwrap(),
+                            m: rows.len(),
+                            k: *k,
+                        })
+                    }
+                } else if let Some((qw, rs, _m, k)) = draft_parts_q8.as_ref() {
+                    let (sq, srs) = crate::quant::subset_rows_fp8(qw, rs, *k, &rows);
+                    let wt = crate::quant::repack_fp8_mma(&sq, rows.len(), *k);
+                    Some(W::Fp8 {
+                        data: dev.htod_sync_copy(&wt).unwrap(),
+                        row_scale: dev.htod_sync_copy(&srs).unwrap(),
+                        m: rows.len(),
+                        k: *k,
+                    })
+                } else if is_hy3 && gpu_bf16.contains_key(&head_name) {
+                    // hy_v3: the head is bf16 (recipe `-lmhead`) — subset its rows into a bf16 draft
+                    // head. One host round-trip at load (~1 GB) for a permanent halving of the draft
+                    // head's per-token read. Rows are independent, so the subset is exact.
+                    let host = dev
+                        .dtoh_sync_copy(gpu_bf16.get(&head_name).unwrap())
+                        .unwrap();
+                    let k = host.len() / cfg.vocab_size;
+                    let mut sub: Vec<half::bf16> = Vec::with_capacity(rows.len() * k);
+                    for &r in &rows {
+                        sub.extend_from_slice(&host[r as usize * k..(r as usize + 1) * k]);
+                    }
+                    Some(W::Bf16(dev.htod_sync_copy(&sub).unwrap()))
+                } else {
+                    None // bf16 model: not the serving path, skip FR-Spec rather than duplicate 15 GB
+                };
+                match w {
+                    Some(w) => {
+                        println!(
+                        "  draft head: {} of {} tokens ({:.0}% of the vocabulary) -- the draft \
                               chain reads {:.0}% of the LM head's bytes",
-                             rows.len(), cfg.vocab_size,
+                        rows.len(),
+                        cfg.vocab_size,
                              100.0 * rows.len() as f32 / cfg.vocab_size as f32,
-                             100.0 * rows.len() as f32 / cfg.vocab_size as f32);
-                    (Some(w), rows)
+                        100.0 * rows.len() as f32 / cfg.vocab_size as f32
+                    );
+                        (Some(w), rows)
+                    }
+                    None => (None, Vec::new()),
                 }
-                None => (None, Vec::new()),
-            }
-        };
+            };
         let t_draft = t_draft0.elapsed();
         mem_probe("post-draft");
         // 3) The pipeline: workers assemble host-side (fuse -> repack -> optional host shard) and
@@ -4158,16 +4177,52 @@ impl GpuModel {
             "ids_advance_b","penalty_ring_push_b","penalty_window_b","seed_advance_b",
             "tp_bench_fill","tp_bench_validate","tp_bench_stall",
             "gdn_rollback_b",
-            "hc_expand_b","hc_norm_b","silu_div_b","hc_mix_b","hc_inject_b","rmsnorm_gated_sig_b",
-            "ple_hash_b","ple_ring_commit_b","ple_gather_rows_b","ple_dequant_rows_b","ple_gate_b",
-            "ple_dconv_decode_b","ple_dconv_prefill_b","ple_dconv_state_b","ple_slot_copy_b","hc_add_bcast_b",
-            "qsa_key_write_b","qsa_score_b","qsa_block_keys_b","qsa_score_prefill_b","qsa_topk_b",
-            "gqa_attn_sel_splitk","gqa_attn_sel_splitk_k8v4","gqa_attn_sel_prefill","gqa_attn_sel_prefill2","qsa_compact_b","qsa_score_combine_b",
-            "gptq_bf16_to_f32_b","gptq_absmax_b","igs_hist_b","gptq_absmax_f32_b","gptq_hadamard16_b","gptq_sweep_b","gptq_gather_rows_b",
-            "gptq_silu_mul_gu_b","gptq_rotate_act_b","gptq_scale_stats_f32_b","gptq_scale_stats_bf16_b",
-            "gptq_static_scales_b","gptq_static_scales_hessian_b",
-            "gptq_permute_w_b","gptq_permute_h_b","gptq_sweep_static_b",
-            "kernel_build_id"];
+            "hc_expand_b",
+            "hc_norm_b",
+            "silu_div_b",
+            "hc_mix_b",
+            "hc_inject_b",
+            "rmsnorm_gated_sig_b",
+            "ple_hash_b",
+            "ple_ring_commit_b",
+            "ple_gather_rows_b",
+            "ple_dequant_rows_b",
+            "ple_gate_b",
+            "ple_dconv_decode_b",
+            "ple_dconv_prefill_b",
+            "ple_dconv_state_b",
+            "ple_slot_copy_b",
+            "hc_add_bcast_b",
+            "qsa_key_write_b",
+            "qsa_score_b",
+            "qsa_block_keys_b",
+            "qsa_score_prefill_b",
+            "qsa_topk_b",
+            "gqa_attn_sel_splitk",
+            "gqa_attn_sel_splitk_k8v4",
+            "gqa_attn_sel_prefill",
+            "gqa_attn_sel_prefill2",
+            "qsa_compact_b",
+            "qsa_score_combine_b",
+            "gptq_bf16_to_f32_b",
+            "calib_profile_b",
+            "gptq_absmax_b",
+            "igs_hist_b",
+            "gptq_absmax_f32_b",
+            "gptq_hadamard16_b",
+            "gptq_sweep_b",
+            "gptq_gather_rows_b",
+            "gptq_silu_mul_gu_b",
+            "gptq_rotate_act_b",
+            "gptq_scale_stats_f32_b",
+            "gptq_scale_stats_bf16_b",
+            "gptq_static_scales_b",
+            "gptq_static_scales_hessian_b",
+            "gptq_permute_w_b",
+            "gptq_permute_h_b",
+            "gptq_sweep_static_b",
+            "kernel_build_id",
+        ];
         dev.load_ptx(bptx, module, &bfnames)?;
         Self::assert_kernel_build_id(dev, module)?;
         let mut bk = HashMap::new();
@@ -5650,6 +5705,7 @@ impl GpuModel {
                 (ids_ptr, wts_ptr, d(&logits), ne as i32, k as i32, batch as i32));
             pool.release_bf16(logits, ne * batch);
         }
+        self.gptq_profile_moe(ids_ptr, batch, k, ne);
 
         // 2. Grouped expert MLP over the stacked fused weights → out [h, batch].
         // --gptq: per-expert Hessians of the bf16 experts' inputs (a no-op unless armed).
@@ -10357,6 +10413,7 @@ impl GpuModel {
             blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
                 (d(&normed), d(&residual), d(&layer.input_ln), h as i32, n as i32, fbits(cfg.rms_eps)));
             }
+            self.gptq_profile_layer(li, &normed, h, n);
             let mixer = match layer.layer_type {
                 LayerType::LinearAttention => {
                     let la = layer.la.as_ref().unwrap();
@@ -19982,6 +20039,15 @@ pub struct GptqHess { pub k: usize, pub h: S, pub n: usize,
     /// Persistent MR amax scratch (capacity grows to the largest external activation batch).
     rot_scratch: Option<B> }
 
+#[derive(Clone, serde::Serialize)]
+pub struct CalibLayerProfile {
+    pub layer: usize,
+    pub mean: f64,
+    pub std: f64,
+    pub rms: f64,
+    pub sketch: Vec<f32>,
+}
+
 /// The armed taps of one calibration pass: bf16 GEMM weights by device pointer (`gemm_act`'s
 /// `W::Bf16` arm), plus the per-expert accumulators of the layer's bf16 routed experts
 /// (`moe_batch`, gate_up inputs at K = hidden, down inputs at K = moe_intermediate).
@@ -19998,6 +20064,17 @@ pub struct GptqTap {
     pub moe_all_x: Option<B>,
     pub moe_all_n: usize,
     pub moe_all_cap: usize,
+    /// Contiguous ranges copied into `moe_all_x`, with the MaCa weight of the source sequence.
+    pub moe_all_segments: Vec<(usize, usize, f32)>,
+    /// Hessian weight for the current sequence (1 for legacy GPTQ, 1/L for MaCa).
+    pub sample_weight: f32,
+    /// Profile-only fields used by `--calib-profile`; inert during GPTQ.
+    pub profile_enabled: bool,
+    pub profile_layers: Vec<usize>,
+    pub profile_sketch_dim: usize,
+    pub profile_activations: Vec<CalibLayerProfile>,
+    pub profile_expert_counts: std::collections::BTreeMap<usize, Vec<u64>>,
+    pub profile_current_layer: Option<usize>,
     /// Calibration-only pass: the layer's output is discarded, so the (slow, scalar) bf16 routed
     /// experts kernel is skipped once the taps have what they need — the MoE output is zeroed.
     pub skip_experts: bool,
@@ -20007,14 +20084,134 @@ impl GpuModel {
     pub fn gptq_hess_new(&self, k: usize) -> GptqHess {
         let mut h = self.dev.alloc_zeros::<f32>(k * k).unwrap();
         self.dev.memset_zeros(&mut h).unwrap();
-        GptqHess { k, h, n: 0, amax: self.dev.htod_sync_copy(&[0u32]).unwrap(), rot_scratch: None }
+        GptqHess {
+            k,
+            h,
+            n: 0,
+            amax: self.dev.htod_sync_copy(&[0u32]).unwrap(),
+            rot_scratch: None,
+        }
     }
-    pub fn gptq_arm(&self, tap: GptqTap) { *self.gptq_tap.lock().unwrap() = Some(tap); }
-    pub fn gptq_disarm(&self) -> Option<GptqTap> { self.gptq_tap.lock().unwrap().take() }
-    pub fn gptq_layer_mut(&mut self, li: usize) -> &mut GpuLayer { &mut self.layers[li] }
-    pub fn gptq_layer(&self, li: usize) -> &GpuLayer { &self.layers[li] }
-    pub fn gptq_dev(&self) -> &Arc<CudaDevice> { &self.dev }
+    pub fn gptq_arm(&self, tap: GptqTap) {
+        *self.gptq_tap.lock().unwrap() = Some(tap);
+    }
+    pub fn gptq_disarm(&self) -> Option<GptqTap> {
+        self.gptq_tap.lock().unwrap().take()
+    }
+    pub fn gptq_set_sample_weight(&self, weight: f32) {
+        assert!(
+            weight.is_finite() && weight > 0.0,
+            "invalid GPTQ sample weight {weight}"
+        );
+        if let Some(tap) = self.gptq_tap.lock().unwrap().as_mut() {
+            tap.sample_weight = weight;
+        }
+    }
+    pub fn gptq_profile_layer(&self, layer: usize, x: &B, k: usize, n: usize) {
+        let (enabled, selected, dim) = {
+            let mut guard = self.gptq_tap.lock().unwrap();
+            let Some(tap) = guard.as_mut() else { return };
+            if !tap.profile_enabled {
+                return;
+            }
+            tap.profile_current_layer = Some(layer);
+            (
+                true,
+                tap.profile_layers.contains(&layer),
+                tap.profile_sketch_dim,
+            )
+        };
+        if !enabled || !selected {
+            return;
+        }
+        assert!(
+            dim > 0 && dim <= 256,
+            "calibration sketch dimension must be 1..256"
+        );
+        let stats = self.dev.alloc_zeros::<f64>(2).unwrap();
+        let sketch = self.dev.alloc_zeros::<f32>(dim).unwrap();
+        blaunch!(
+            self,
+            "calib_profile_b",
+            (k as u32, 1, 1),
+            (256, 1, 1),
+            (2 * 256 * 8) as u32,
+            (
+                d(&stats),
+                d(&sketch),
+                d(x),
+                k as i32,
+                n as i32,
+                dim as i32,
+                (0x6a09e667u32 ^ layer as u32)
+            )
+        );
+        self.sync_stream();
+        let st = self.dev.dtoh_sync_copy(&stats).unwrap();
+        let mut sk = self.dev.dtoh_sync_copy(&sketch).unwrap();
+        let count = (k * n) as f64;
+        let mean = st[0] / count;
+        let variance = (st[1] / count - mean * mean).max(0.0);
+        let norm = (k as f32).sqrt().max(1.0);
+        for value in &mut sk {
+            *value /= norm;
+        }
+        self.gptq_tap
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .profile_activations
+            .push(CalibLayerProfile {
+                layer,
+                mean,
+                std: variance.sqrt(),
+                rms: (st[1] / count).max(0.0).sqrt(),
+                sketch: sk,
+            });
+    }
 
+    fn gptq_profile_moe(&self, ids_ptr: u64, batch: usize, topk: usize, ne: usize) {
+        let layer = {
+            let guard = self.gptq_tap.lock().unwrap();
+            let Some(tap) = guard.as_ref() else { return };
+            if !tap.profile_enabled {
+                return;
+            }
+            let Some(layer) = tap.profile_current_layer else {
+                return;
+            };
+            layer
+        };
+        self.sync_stream();
+        let mut ids = vec![0i32; topk * batch];
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_sync(&mut ids, ids_ptr)
+                .expect("calib profile ids dtoh");
+        }
+        let mut counts = vec![0u64; ne];
+        for id in ids {
+            if id >= 0 && (id as usize) < ne {
+                counts[id as usize] += 1;
+            }
+        }
+        self.gptq_tap
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .profile_expert_counts
+            .insert(layer, counts);
+    }
+    pub fn gptq_layer_mut(&mut self, li: usize) -> &mut GpuLayer {
+        &mut self.layers[li]
+    }
+    pub fn gptq_layer(&self, li: usize) -> &GpuLayer {
+        &self.layers[li]
+    }
+    pub fn gptq_dev(&self) -> &Arc<CudaDevice> {
+        &self.dev
+    }
     /// Accumulate the LM-head Hessian from the complete final-normalized hidden stream. Serving
     /// computes logits only for the last prompt token, so a normal GEMM tap would see one vector
     /// per sample instead of `seqlen` vectors. `normed` is reusable [h, n] scratch.
@@ -20022,30 +20219,67 @@ impl GpuModel {
     /// The Hessian is accumulated in the original basis; when MR is requested only the amax path
     /// is rotated in-place, because `gptq_h32` rotates H later while W4A4 needs its activation scale
     /// measured in the actually served (Hadamard) basis.
-    pub fn gptq_lmhead_hess_accum(&self, acc: &mut GptqHess, residual: &B, normed: &B, n: usize, rotate_amax: bool) {
+    pub fn gptq_lmhead_hess_accum(
+        &self,
+        acc: &mut GptqHess,
+        residual: &B,
+        normed: &B,
+        n: usize,
+        rotate_amax: bool,
+        sample_weight: f32,
+    ) {
         let h = self.cfg.hidden_size;
         assert_eq!(acc.k, h);
         assert!(residual.len() >= h * n && normed.len() >= h * n);
-        blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), (4096) as u32,
-            (d(normed), d(residual), d(&self.final_norm), h as i32, n as i32, fbits(self.cfg.rms_eps)));
-        self.gptq_hess_accum(d(&acc.h), h, d(normed), n);
-        if rotate_amax { self.rot_inplace(normed, h * n); }
-        blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0,
-            (d(&acc.amax), d(normed), (h * n) as i64));
+        blaunch!(
+            self,
+            "rmsnorm_b",
+            (n as u32, 1, 1),
+            (1024, 1, 1),
+            (4096) as u32,
+            (
+                d(normed),
+                d(residual),
+                d(&self.final_norm),
+                h as i32,
+                n as i32,
+                fbits(self.cfg.rms_eps)
+            )
+        );
+        self.gptq_hess_accum(d(&acc.h), h, d(normed), n, sample_weight);
+        if rotate_amax {
+            self.rot_inplace(normed, h * n);
+        }
+        blaunch!(
+            self,
+            "gptq_absmax_b",
+            grid(h * n),
+            (256, 1, 1),
+            0,
+            (d(&acc.amax), d(normed), (h * n) as i64)
+        );
         acc.n += n;
     }
 
     /// H += X·Xᵀ for X = bf16 [k, n] (feature-contiguous columns), f32 accumulate.
-    fn gptq_hess_accum(&self, h_ptr: u64, k: usize, x_ptr: u64, n: usize) {
-        use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t};
-        let (one, onef) = (1.0f32, 1.0f32);
+    fn gptq_hess_accum(&self, h_ptr: u64, k: usize, x_ptr: u64, n: usize, scale: f32) {
+        use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cudaDataType};
+        let onef = 1.0f32;
         unsafe {
-            cudarc::cublas::result::gemm_ex(*self.blas.handle(),
-                OP::CUBLAS_OP_N, OP::CUBLAS_OP_T,
-                k as i32, k as i32, n as i32,
-                &one as *const f32 as *const _,
-                x_ptr as *const _, cudaDataType::CUDA_R_16BF, k as i32,
-                x_ptr as *const _, cudaDataType::CUDA_R_16BF, k as i32,
+            cudarc::cublas::result::gemm_ex(
+                *self.blas.handle(),
+                OP::CUBLAS_OP_N,
+                OP::CUBLAS_OP_T,
+                k as i32,
+                k as i32,
+                n as i32,
+                &scale as *const f32 as *const _,
+                x_ptr as *const _,
+                cudaDataType::CUDA_R_16BF,
+                k as i32,
+                x_ptr as *const _,
+                cudaDataType::CUDA_R_16BF,
+                k as i32,
                 &onef as *const f32 as *const _,
                 h_ptr as *mut _, cudaDataType::CUDA_R_32F, k as i32,
                 cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT).expect("gptq hessian gemm");
@@ -20059,7 +20293,7 @@ impl GpuModel {
     pub fn gptq_hess_accum_external(&self, acc: &mut GptqHess, x: &B, n: usize,
                                     rotate_amax: bool) {
         assert_eq!(x.len(), acc.k * n, "external GPTQ activation shape");
-        self.gptq_hess_accum(d(&acc.h), acc.k, d(x), n);
+        self.gptq_hess_accum(d(&acc.h), acc.k, d(x), n, 1.0);
         let ap = d(&acc.amax);
         if rotate_amax {
             let need = acc.k * n;
@@ -20086,11 +20320,23 @@ impl GpuModel {
         let Some(tap) = g.as_mut() else { return; };
         let Some(acc) = tap.by_ptr.get_mut(&w_ptr) else { return; };
         assert_eq!(acc.k, k, "gptq tap: K mismatch on weight {w_ptr:#x}");
-        let (hp, kk, ap) = (d(&acc.h), acc.k, d(&acc.amax));
+        let (hp, kk, ap, weight) = (
+            d(&acc.h),
+            acc.k,
+            d(&acc.amax),
+            tap.sample_weight.max(f32::MIN_POSITIVE),
+        );
         acc.n += n;
         drop(g);
-        self.gptq_hess_accum(hp, kk, x_ptr, n);
-        blaunch!(self, "gptq_absmax_b", grid(kk * n), (256,1,1), 0, (ap, x_ptr, (kk * n) as i64));
+        self.gptq_hess_accum(hp, kk, x_ptr, n, weight);
+        blaunch!(
+            self,
+            "gptq_absmax_b",
+            grid(kk * n),
+            (256, 1, 1),
+            0,
+            (ap, x_ptr, (kk * n) as i64)
+        );
     }
 
     /// `moe_batch` tap: gather each expert's routed tokens, accumulate the gate_up-input Hessian
@@ -20101,14 +20347,40 @@ impl GpuModel {
         use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t};
         {
             // layer-wide all-token Hessian + the token subsample for the fallbacks
-            let (all_ptr, sub) = { let g = self.gptq_tap.lock().unwrap(); let t = g.as_ref().unwrap();
-                (t.moe_all.as_ref().map(|a| d(&a.h)), t.moe_all_x.as_ref().map(|b| (d(b), t.moe_all_n, t.moe_all_cap))) };
-            if let Some(hp) = all_ptr { self.gptq_hess_accum(hp, h, d(x), batch); let mut g = self.gptq_tap.lock().unwrap(); g.as_mut().unwrap().moe_all.as_mut().unwrap().n += batch; }
-            if let Some((xp, n0, cap)) = sub { if n0 < cap {
-                let take = (cap - n0).min(batch);
-                unsafe { cudarc::driver::result::memcpy_dtod_async(xp + (n0 * h * 2) as u64, d(x), take * h * 2, self.stream.stream).unwrap(); }
-                self.gptq_tap.lock().unwrap().as_mut().unwrap().moe_all_n += take;
-            } }
+            let (all_ptr, sub, weight) = {
+                let g = self.gptq_tap.lock().unwrap();
+                let t = g.as_ref().unwrap();
+                (
+                    t.moe_all.as_ref().map(|a| d(&a.h)),
+                    t.moe_all_x
+                        .as_ref()
+                        .map(|b| (d(b), t.moe_all_n, t.moe_all_cap)),
+                    t.sample_weight.max(f32::MIN_POSITIVE),
+                )
+            };
+            if let Some(hp) = all_ptr {
+                self.gptq_hess_accum(hp, h, d(x), batch, weight);
+                let mut g = self.gptq_tap.lock().unwrap();
+                g.as_mut().unwrap().moe_all.as_mut().unwrap().n += batch;
+            }
+            if let Some((xp, n0, cap)) = sub {
+                if n0 < cap {
+                    let take = (cap - n0).min(batch);
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            xp + (n0 * h * 2) as u64,
+                            d(x),
+                            take * h * 2,
+                            self.stream.stream,
+                        )
+                        .unwrap();
+                    }
+                    let mut g = self.gptq_tap.lock().unwrap();
+                    let t = g.as_mut().unwrap();
+                    t.moe_all_segments.push((n0, take, weight));
+                    t.moe_all_n += take;
+                }
+            }
         }
         self.sync_stream();
         let mut ids = vec![0i32; k * batch];
@@ -20126,11 +20398,34 @@ impl GpuModel {
             let n = list.len();
             if n == 0 { continue; }
             let idx = self.dev.htod_sync_copy(list).unwrap();
-            blaunch!(self, "gptq_gather_rows_b", grid(n * h), (256,1,1), 0, (d(&xg), d(x), d(&idx), n as i32, h as i32));
-            let (hgu, hdn, agu, adn) = { let g = self.gptq_tap.lock().unwrap(); let t = g.as_ref().unwrap();
-                (d(&t.moe_gu[e].h), d(&t.moe_dn[e].h), d(&t.moe_gu[e].amax), d(&t.moe_dn[e].amax)) };
-            self.gptq_hess_accum(hgu, h, d(&xg), n);
-            blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0, (agu, d(&xg), (h * n) as i64));
+            blaunch!(
+                self,
+                "gptq_gather_rows_b",
+                grid(n * h),
+                (256, 1, 1),
+                0,
+                (d(&xg), d(x), d(&idx), n as i32, h as i32)
+            );
+            let (hgu, hdn, agu, adn, weight) = {
+                let g = self.gptq_tap.lock().unwrap();
+                let t = g.as_ref().unwrap();
+                (
+                    d(&t.moe_gu[e].h),
+                    d(&t.moe_dn[e].h),
+                    d(&t.moe_gu[e].amax),
+                    d(&t.moe_dn[e].amax),
+                    t.sample_weight.max(f32::MIN_POSITIVE),
+                )
+            };
+            self.gptq_hess_accum(hgu, h, d(&xg), n, weight);
+            blaunch!(
+                self,
+                "gptq_absmax_b",
+                grid(h * n),
+                (256, 1, 1),
+                0,
+                (agu, d(&xg), (h * n) as i64)
+            );
             // gate|up = Wgu_e · x : Wgu_e row-major [2mi, h] == column-major [h, 2mi] → opT
             unsafe {
                 cudarc::cublas::result::gemm_ex(*self.blas.handle(),
@@ -20140,13 +20435,37 @@ impl GpuModel {
                     (d(gu) + (e * 2 * mi * h * 2) as u64) as *const _, cudaDataType::CUDA_R_16BF, h as i32,
                     d(&xg) as *const _, cudaDataType::CUDA_R_16BF, h as i32,
                     &zero as *const f32 as *const _,
-                    d(&gu32) as *mut _, cudaDataType::CUDA_R_32F, (2 * mi) as i32,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT).expect("gptq expert gate_up gemm");
+                    d(&gu32) as *mut _,
+                    cudaDataType::CUDA_R_32F,
+                    (2 * mi) as i32,
+                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .expect("gptq expert gate_up gemm");
             }
-            blaunch!(self, "gptq_silu_mul_gu_b", grid(mi * n), (256,1,1), 0, (d(&act), d(&gu32), mi as i32, n as i32));
-            self.gptq_hess_accum(hdn, mi, d(&act), n);
-            blaunch!(self, "gptq_absmax_b", grid(mi * n), (256,1,1), 0, (adn, d(&act), (mi * n) as i64));
-            { let mut g = self.gptq_tap.lock().unwrap(); let t = g.as_mut().unwrap(); t.moe_gu[e].n += n; t.moe_dn[e].n += n; }
+            blaunch!(
+                self,
+                "gptq_silu_mul_gu_b",
+                grid(mi * n),
+                (256, 1, 1),
+                0,
+                (d(&act), d(&gu32), mi as i32, n as i32)
+            );
+            self.gptq_hess_accum(hdn, mi, d(&act), n, weight);
+            blaunch!(
+                self,
+                "gptq_absmax_b",
+                grid(mi * n),
+                (256, 1, 1),
+                0,
+                (adn, d(&act), (mi * n) as i64)
+            );
+            {
+                let mut g = self.gptq_tap.lock().unwrap();
+                let t = g.as_mut().unwrap();
+                t.moe_gu[e].n += n;
+                t.moe_dn[e].n += n;
+            }
             self.sync_stream();   // idx/xg reuse across iterations
         }
     }
@@ -20457,30 +20776,69 @@ impl GpuModel {
 impl GpuModel {
     /// Down-projection input Hessian of expert `e` over the token subsample `xs` [h, n]:
     /// act = silu(gate)·up through the expert's bf16 gate_up, H = act·actᵀ (K = mi).
-    pub fn gptq_down_hess_from(&self, gu: &B, e: usize, xs: &B, n: usize, h: usize, mi: usize) -> GptqHess {
-        use cudarc::cublas::sys::{cudaDataType, cublasComputeType_t, cublasGemmAlgo_t};
+    pub fn gptq_down_hess_from(
+        &self,
+        gu: &B,
+        e: usize,
+        xs: &B,
+        n: usize,
+        h: usize,
+        mi: usize,
+        segments: &[(usize, usize, f32)],
+    ) -> GptqHess {
+        use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cudaDataType};
         let hess = self.gptq_hess_new(mi);
         let (one, zero) = (1.0f32, 0.0f32);
         const CH: usize = 2048;
         let gu32 = self.dev.alloc_zeros::<f32>(2 * mi * CH).unwrap();
         let act = self.dev.alloc_zeros::<half::bf16>(mi * CH).unwrap();
-        let mut t0 = 0;
-        while t0 < n {
-            let nn = (n - t0).min(CH);
-            unsafe {
-                cudarc::cublas::result::gemm_ex(*self.blas.handle(),
-                    OP::CUBLAS_OP_T, OP::CUBLAS_OP_N,
-                    (2 * mi) as i32, nn as i32, h as i32,
-                    &one as *const f32 as *const _,
-                    (d(gu) + (e * 2 * mi * h * 2) as u64) as *const _, cudaDataType::CUDA_R_16BF, h as i32,
-                    (d(xs) + (t0 * h * 2) as u64) as *const _, cudaDataType::CUDA_R_16BF, h as i32,
-                    &zero as *const f32 as *const _,
-                    d(&gu32) as *mut _, cudaDataType::CUDA_R_32F, (2 * mi) as i32,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT).expect("gptq fallback gate_up gemm");
+        let owned_segments;
+        let segments = if segments.is_empty() {
+            owned_segments = vec![(0, n, 1.0)];
+            owned_segments.as_slice()
+        } else {
+            segments
+        };
+        for &(seg_start, seg_len, weight) in segments {
+            let mut rel = 0;
+            while rel < seg_len {
+                let t0 = seg_start + rel;
+                let nn = (seg_len - rel).min(CH);
+                unsafe {
+                    cudarc::cublas::result::gemm_ex(
+                        *self.blas.handle(),
+                        OP::CUBLAS_OP_T,
+                        OP::CUBLAS_OP_N,
+                        (2 * mi) as i32,
+                        nn as i32,
+                        h as i32,
+                        &one as *const f32 as *const _,
+                        (d(gu) + (e * 2 * mi * h * 2) as u64) as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        h as i32,
+                        (d(xs) + (t0 * h * 2) as u64) as *const _,
+                        cudaDataType::CUDA_R_16BF,
+                        h as i32,
+                        &zero as *const f32 as *const _,
+                        d(&gu32) as *mut _,
+                        cudaDataType::CUDA_R_32F,
+                        (2 * mi) as i32,
+                        cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    )
+                    .expect("gptq fallback gate_up gemm");
+                }
+                blaunch!(
+                    self,
+                    "gptq_silu_mul_gu_b",
+                    grid(mi * nn),
+                    (256, 1, 1),
+                    0,
+                    (d(&act), d(&gu32), mi as i32, nn as i32)
+                );
+                self.gptq_hess_accum(d(&hess.h), mi, d(&act), nn, weight);
+                rel += nn;
             }
-            blaunch!(self, "gptq_silu_mul_gu_b", grid(mi * nn), (256,1,1), 0, (d(&act), d(&gu32), mi as i32, nn as i32));
-            self.gptq_hess_accum(d(&hess.h), mi, d(&act), nn);
-            t0 += nn;
         }
         self.sync_stream();
         GptqHess { k: mi, h: hess.h, n, amax: hess.amax, rot_scratch: hess.rot_scratch }
@@ -20506,13 +20864,44 @@ impl GpuModel {
     pub fn gptq_num_layers(&self) -> usize { self.layers.len() }
     /// `--gptq lmhead`: fold one sample's LM-head input (the final mixer applied to the residual
     /// stream `resid` [n, rw]) into `hess` (K = hidden) and its |x| max.
-    pub fn gptq_lm_head_hess_accum(&self, pool: &mut Pool, resid: &B, n: usize, hess: &GptqHess) {
+    pub fn gptq_lm_head_hess_accum(
+        &self,
+        pool: &mut Pool,
+        resid: &B,
+        n: usize,
+        hess: &GptqHess,
+        sample_weight: f32,
+    ) {
         let h = self.cfg.hidden_size;
         let out = pool.get_bf16(h * n);
-        if let Some(m) = self.hc_mixer.as_ref() { self.hc_pre(pool, &out, None, d(resid), m, n); }
-        else { blaunch!(self, "rmsnorm_b", (n as u32,1,1), (1024,1,1), 4096u32, (d(&out), d(resid), d(&self.final_norm), h as i32, n as i32, fbits(self.cfg.rms_eps))); }
-        self.gptq_hess_accum(d(&hess.h), h, d(&out), n);
-        blaunch!(self, "gptq_absmax_b", grid(h * n), (256,1,1), 0, (d(&hess.amax), d(&out), (h * n) as i64));
+        if let Some(m) = self.hc_mixer.as_ref() {
+            self.hc_pre(pool, &out, None, d(resid), m, n);
+        } else {
+            blaunch!(
+                self,
+                "rmsnorm_b",
+                (n as u32, 1, 1),
+                (1024, 1, 1),
+                4096u32,
+                (
+                    d(&out),
+                    d(resid),
+                    d(&self.final_norm),
+                    h as i32,
+                    n as i32,
+                    fbits(self.cfg.rms_eps)
+                )
+            );
+        }
+        self.gptq_hess_accum(d(&hess.h), h, d(&out), n, sample_weight);
+        blaunch!(
+            self,
+            "gptq_absmax_b",
+            grid(h * n),
+            (256, 1, 1),
+            0,
+            (d(&hess.amax), d(&out), (h * n) as i64)
+        );
         self.sync_stream();
         pool.release_bf16(out, h * n);
     }

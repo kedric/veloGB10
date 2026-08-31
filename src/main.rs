@@ -303,6 +303,15 @@ fn print_help() {
     println!("                           (--draft-dir <bf16-drafter> --model-dir <target-nvfp4>");
     println!("                            --out <dir> --calib <jsonl> --nsamples 512 --seqlen 2048");
     println!("                            --damp .01 --clip 7 --rotate --df2-context-vectors 16)");
+    println!(
+        "  --calib-profile         Profile candidate JSONL for COLA/ACDM + MoE expert balancing"
+    );
+    println!(
+        "                           (--model-dir <artifact> --calib <jsonl> --out <profiles.jsonl>"
+    );
+    println!("                            --nsamples N --seqlen MAX --profile-layers auto|0,8,... --profile-sketch-dim 16)");
+    println!("  --maca                  Accept variable-length pre-tokenized calibration rows and normalize");
+    println!("                           every sequence's Hessian contribution by 1 / sequence_length");
     println!("  --capture-layers         Dump per-layer hidden states for raw token ids (--ids <f> --out <f>)");
     println!();
     println!("════════════════════════════════════════════════════════════════════════════════");
@@ -384,6 +393,40 @@ fn main() {
     }
 
     // Batched benchmark mode
+    if args.iter().any(|a| a == "--calib-profile") {
+        let model = parse_arg(&args, "--model-dir")
+            .expect("--calib-profile requires --model-dir <artifact>");
+        let calib = parse_arg(&args, "--calib").expect("--calib-profile requires --calib <jsonl>");
+        let out =
+            parse_arg(&args, "--out").expect("--calib-profile requires --out <profiles.jsonl>");
+        let ns = parse_arg(&args, "--nsamples")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2048);
+        let sl = parse_arg(&args, "--seqlen")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let layers: Vec<usize> = parse_arg(&args, "--profile-layers")
+            .unwrap_or("auto")
+            .split(',')
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        let dim = parse_arg(&args, "--profile-sketch-dim")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        if let Err(error) = gb10_inference::gptq::profile_calibration(
+            std::path::Path::new(model),
+            std::path::Path::new(calib),
+            std::path::Path::new(out),
+            ns,
+            sl,
+            &layers,
+            dim,
+        ) {
+            eprintln!("ERROR: --calib-profile failed: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--calib-igs") {
         // --calib-igs --model-dir <artifact> [--out <dir> = artifact] --calib <txt|jsonl>
         //   [--nsamples 128] [--seqlen 1024] [--igs-method headroom|max]
@@ -430,7 +473,11 @@ fn main() {
             damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
             nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
             rotate: args.iter().any(|a| a == "--rotate"),
-            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            maca: args.iter().any(|a| a == "--maca"),
+            scale_iters: parse_arg(&args, "--scale-iters")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+                .min(16),
             static_act_order: !args.iter().any(|a| a == "--no-act-order"),
             local_hessian: args.iter().any(|a| a == "--local-hessian"),
             gptq_groups: vec![gb10_inference::quant::Group::LmHead],
@@ -456,7 +503,11 @@ fn main() {
             damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
             nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
             rotate: args.iter().any(|a| a == "--rotate"),
-            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            maca: args.iter().any(|a| a == "--maca"),
+            scale_iters: parse_arg(&args, "--scale-iters")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+                .min(16),
             static_act_order: !args.iter().any(|a| a == "--no-act-order"),
             local_hessian: args.iter().any(|a| a == "--local-hessian"),
             gptq_groups: vec![], nvfp4_groups: vec![], fp8_groups: vec![],
@@ -485,7 +536,11 @@ fn main() {
             damp: parse_arg(&args, "--damp").and_then(|s| s.parse().ok()).unwrap_or(0.01),
             nclip: parse_arg(&args, "--clip").and_then(|s| s.parse().ok()).unwrap_or(7).clamp(1, 7),
             rotate: args.iter().any(|a| a == "--rotate"),
-            scale_iters: parse_arg(&args, "--scale-iters").and_then(|s| s.parse().ok()).unwrap_or(4).min(16),
+            maca: args.iter().any(|a| a == "--maca"),
+            scale_iters: parse_arg(&args, "--scale-iters")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+                .min(16),
             static_act_order: !args.iter().any(|a| a == "--no-act-order"),
             local_hessian: args.iter().any(|a| a == "--local-hessian"),
             gptq_groups: gb10_inference::gptq::parse_groups(parse_arg(&args, "--gptq-groups").unwrap_or("expert,attn,mlp")).expect("--gptq-groups"),

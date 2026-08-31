@@ -422,7 +422,8 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 | `--max-tokens <N>` | 8192 | Generation cap when a request omits `max_tokens` |
 | `--max-seq-len <N>` | 4096 | **The context size.** KV cache is allocated to exactly this; prompts longer are rejected, over-long generations clamped. Clamped to the model's `max_position_embeddings` (256K this family). KV ≈ 64 KB/token/lane on 27B (hybrid GDN keeps this small); above ~12K, CUDA graphs are skipped (measured zero cost) |
 | `--vision-cpu` | off | Force the CPU vision tower (reference path) instead of the GPU tower. Diagnostic/escape hatch |
-| `--gptq --model-dir <bf16> --base <artifact> --out <dir> --calib <jsonl>` | — | Calibrated GPTQ→NVFP4 re-quantization, one layer at a time on one GB10 (Qwen3.5 dense and Qwen3.8-Flash-Next MoE; see QWEN_FLASH_NEXT_SETUP.md §1b) |
+| `--gptq --model-dir <bf16> --base <artifact> --out <dir> --calib <jsonl> [--maca]` | — | Calibrated GPTQ→NVFP4 re-quantization, one layer at a time on one GB10. `--maca` enables variable context lengths with per-sequence Hessian normalization. See `docs/MACA_COLA_ACDM_MOE_CALIBRATION.md` |
+| `--calib-profile --model-dir <artifact> --calib <jsonl> --out <profiles.jsonl>` | — | Collect activation sketches and exact MoE routing counts for COLA/ACDM/expert-aware corpus selection |
 | `--ple-offload <ssd\|none>` | none | Qwen3.8-Flash-Next only: keep the 31 GB PLE n-gram table on the SSD and read the rows each forward needs (bit-identical to resident; decode graphs off) |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |

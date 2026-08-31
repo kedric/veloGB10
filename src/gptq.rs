@@ -197,10 +197,19 @@ impl Writer {
 // ---------------------------------------------------------------- options
 #[derive(Clone)]
 pub struct GptqOpts {
-    pub nsamples: usize, pub seqlen: usize, pub damp: f32, pub nclip: usize, pub rotate: bool,
-    pub scale_iters: usize, pub static_act_order: bool, pub local_hessian: bool,
-    pub gptq_groups: Vec<Group>, pub nvfp4_groups: Vec<Group>,   // GPTQ'd / RTN'd; everything else bf16
-    pub fp8_groups: Vec<Group>,                                     // row-scaled FP8 (E4M3): the speed/accuracy middle ground
+    pub nsamples: usize,
+    pub seqlen: usize,
+    pub damp: f32,
+    pub nclip: usize,
+    pub rotate: bool,
+    /// Matryoshka Calibration: variable-length rows with equal Hessian mass per sequence.
+    pub maca: bool,
+    pub scale_iters: usize,
+    pub static_act_order: bool,
+    pub local_hessian: bool,
+    pub gptq_groups: Vec<Group>,
+    pub nvfp4_groups: Vec<Group>, // GPTQ'd / RTN'd; everything else bf16
+    pub fp8_groups: Vec<Group>,   // row-scaled FP8 (E4M3): the speed/accuracy middle ground
 }
 
 fn validate_opts(opts: &GptqOpts) -> Result<()> {
@@ -214,10 +223,15 @@ fn validate_opts(opts: &GptqOpts) -> Result<()> {
 struct Rec { qw: Vec<u8>, sc: Vec<u8>, m: usize, k: usize, gs: f32, igs: Option<f32> }
 
 fn write_df2_checkpoint(path: &Path, recs: &[(String, &Rec)]) -> Result<()> {
-    let meta: Vec<serde_json::Value> = recs.iter().map(|(name, r)| serde_json::json!({
-        "name": name, "m": r.m, "k": r.k, "gs": r.gs, "igs": r.igs,
-        "qw": r.qw.len(), "sc": r.sc.len()
-    })).collect();
+    let meta: Vec<serde_json::Value> = recs
+        .iter()
+        .map(|(name, r)| {
+            serde_json::json!({
+            "name": name, "m": r.m, "k": r.k, "gs": r.gs, "igs": r.igs,
+            "qw": r.qw.len(), "sc": r.sc.len()
+                })
+        })
+        .collect();
     let hdr = serde_json::to_vec(&meta)?;
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;
@@ -392,7 +406,24 @@ fn rtn_2d(w: &[bf16], m: usize, k: usize) -> Rec {
 }
 
 // ---------------------------------------------------------------- calibration data
-pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usize, vocab: usize) -> Result<Vec<Vec<u32>>> {
+pub fn calib_tokens(
+    model_dir: &Path,
+    calib: &Path,
+    nsamples: usize,
+    seqlen: usize,
+    vocab: usize,
+) -> Result<Vec<Vec<u32>>> {
+    calib_tokens_mode(model_dir, calib, nsamples, seqlen, vocab, false)
+}
+
+fn calib_tokens_mode(
+    model_dir: &Path,
+    calib: &Path,
+    nsamples: usize,
+    seqlen: usize,
+    vocab: usize,
+    variable_lengths: bool,
+) -> Result<Vec<Vec<u32>>> {
     if calib.to_string_lossy() == "random" {
         // Smoke-test / synthetic-model mode: seeded random token ids.
         let mut st = 0x9E3779B97F4A7C15u64;
@@ -415,10 +446,31 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
                 break;
             };
             saw_pretokenized = true;
-            let ids = ids.as_array().ok_or_else(|| anyhow!("{}:{}: input_ids is not an array", calib.display(), line_no + 1))?;
-            anyhow::ensure!(ids.len() == seqlen,
-                "{}:{}: input_ids has {} tokens, expected seqlen={seqlen}", calib.display(), line_no + 1, ids.len());
-            let mut sample = Vec::with_capacity(seqlen);
+            let ids = ids.as_array().ok_or_else(|| {
+                anyhow!(
+                    "{}:{}: input_ids is not an array",
+                    calib.display(),
+                    line_no + 1
+                )
+            })?;
+            if variable_lengths {
+                anyhow::ensure!(
+                    !ids.is_empty() && ids.len() <= seqlen,
+                    "{}:{}: input_ids has {} tokens, expected 1..={seqlen} for MaCa",
+                    calib.display(),
+                    line_no + 1,
+                    ids.len()
+                );
+            } else {
+                anyhow::ensure!(
+                    ids.len() == seqlen,
+                    "{}:{}: input_ids has {} tokens, expected seqlen={seqlen}",
+                    calib.display(),
+                    line_no + 1,
+                    ids.len()
+                );
+            }
+            let mut sample = Vec::with_capacity(ids.len());
             for (column, id) in ids.iter().enumerate() {
                 let id = id.as_u64().ok_or_else(|| anyhow!("{}:{}: input_ids[{column}] is not an unsigned integer", calib.display(), line_no + 1))?;
                 anyhow::ensure!(id < vocab as u64,
@@ -429,9 +481,19 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
             if samples.len() == nsamples { break; }
         }
         if saw_pretokenized {
-            anyhow::ensure!(samples.len() == nsamples,
-                "pre-tokenized calibration corpus contains {} complete samples, asked {nsamples}", samples.len());
-            println!("[gptq] loaded {nsamples} pre-tokenized, sample-aligned calibration rows");
+            anyhow::ensure!(
+                samples.len() == nsamples,
+                "pre-tokenized calibration corpus contains {} complete samples, asked {nsamples}",
+                samples.len()
+            );
+            println!(
+                "[gptq] loaded {nsamples} pre-tokenized, sample-aligned calibration rows{}",
+                if variable_lengths {
+                    " (variable length)"
+                } else {
+                    ""
+                }
+            );
             return Ok(samples);
         }
     }
@@ -463,6 +525,136 @@ pub fn calib_tokens(model_dir: &Path, calib: &Path, nsamples: usize, seqlen: usi
     anyhow::ensure!(samples.len() >= nsamples.min(1), "calibration text too short for one sample of {seqlen} tokens");
     if samples.len() < nsamples { println!("[gptq] calibration text gave {} samples (asked {nsamples})", samples.len()); }
     Ok(samples)
+}
+
+/// Profile a candidate corpus once, producing compact per-layer activation features for
+/// COLA/ACDM plus exact per-layer expert route counts for MoE balancing. The output is keyed by
+/// candidate row index so selection can copy the original JSONL records byte-for-byte.
+pub fn profile_calibration(
+    model_dir: &Path,
+    calib: &Path,
+    out: &Path,
+    nsamples: usize,
+    max_seqlen: usize,
+    layers: &[usize],
+    sketch_dim: usize,
+) -> Result<()> {
+    anyhow::ensure!(!out.exists(), "refusing to overwrite {}", out.display());
+    anyhow::ensure!(
+        nsamples > 0 && max_seqlen > 0,
+        "profile sample count and max sequence length must be positive"
+    );
+    anyhow::ensure!(
+        (1..=256).contains(&sketch_dim),
+        "--profile-sketch-dim must be 1..256"
+    );
+    if std::env::var("GB10_PLE_OFFLOAD").is_err() {
+        std::env::set_var("GB10_PLE_OFFLOAD", "ssd");
+    }
+    anyhow::ensure!(
+        std::env::var_os("GB10_W4A4_PREFILL").is_none(),
+        "--calib-profile requires unquantized activations; unset GB10_W4A4_PREFILL"
+    );
+    let t0 = std::time::Instant::now();
+    let (gpu, cfg) = GpuModel::load_from_dir(&model_dir.to_string_lossy())?;
+    let profile_layers: Vec<usize> = if layers.is_empty() {
+        let points = cfg.num_layers.min(8).max(1);
+        let mut auto: Vec<usize> = (0..points)
+            .map(|index| index * (cfg.num_layers - 1) / points.saturating_sub(1).max(1))
+            .collect();
+        auto.sort_unstable();
+        auto.dedup();
+        auto
+    } else {
+        layers.to_vec()
+    };
+    anyhow::ensure!(
+        profile_layers.iter().all(|&layer| layer < cfg.num_layers),
+        "profile layers {profile_layers:?} exceed model depth {}",
+        cfg.num_layers
+    );
+    let samples = calib_tokens_mode(model_dir, calib, nsamples, max_seqlen, cfg.vocab_size, true)?;
+    let mut pool = Pool::new(gpu.gptq_dev().clone());
+    let mut state = gpu.new_batch_state(1, 1, max_seqlen);
+    let incomplete = PathBuf::from(format!("{}.incomplete", out.display()));
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&incomplete)?);
+    for (index, tokens) in samples.iter().enumerate() {
+        let tap = GptqTap {
+            profile_enabled: true,
+            profile_layers: profile_layers.clone(),
+            profile_sketch_dim: sketch_dim,
+            sample_weight: 1.0,
+            ..Default::default()
+        };
+        gpu.gptq_arm(tap);
+        gpu.zero_slot_state(&mut state, 0, max_seqlen);
+        let (_, residual) = gpu.prefill_batch_range(
+            &mut pool,
+            tokens,
+            &mut state,
+            0,
+            max_seqlen,
+            0,
+            0,
+            cfg.num_layers,
+            None,
+        );
+        drop(residual);
+        let tap = gpu
+            .gptq_disarm()
+            .context("calibration profile tap disappeared")?;
+        let experts: Vec<serde_json::Value> = tap
+            .profile_expert_counts
+            .into_iter()
+            .map(|(layer, counts)| serde_json::json!({ "layer": layer, "counts": counts }))
+            .collect();
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "format": "veloGB10-calibration-profile-v1",
+                "sample_index": index,
+                "sequence_length": tokens.len(),
+                "activations": tap.profile_activations,
+                "experts": experts,
+            }),
+        )?;
+        writer.write_all(b"\n")?;
+        if (index + 1) % 16 == 0 || index + 1 == samples.len() {
+            gpu.gptq_sync();
+            println!(
+                "[calib-profile] {}/{} candidates ({:.1} min)",
+                index + 1,
+                samples.len(),
+                t0.elapsed().as_secs_f32() / 60.0
+            );
+        }
+    }
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&incomplete, out)?;
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+    let manifest = serde_json::json!({
+        "format": "veloGB10-calibration-profile-manifest-v1",
+        "model_dir": std::fs::canonicalize(model_dir)?,
+        "candidate_corpus": std::fs::canonicalize(calib)?,
+        "output": out,
+        "samples": samples.len(),
+        "total_tokens": total_tokens,
+        "max_seqlen": max_seqlen,
+        "activation_layers": profile_layers,
+        "sketch": { "type": "signed_count_sketch_of_mean_pooled_channels", "dimension": sketch_dim },
+        "expert_counts": if cfg.is_moe { "all_moe_layers_topk_routes" } else { "dense_model" },
+    });
+    std::fs::write(
+        format!("{}.manifest.json", out.display()),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    println!(
+        "[calib-profile] wrote {} profiles / {total_tokens} tokens -> {}",
+        samples.len(),
+        out.display()
+    );
+    Ok(())
 }
 
 struct VisionCalibSample {
@@ -556,16 +748,39 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     let basr = ShardReader::open(base)?;
     let (mut gpu, cfg) = GpuModel::load_from_dir(&base.to_string_lossy())?;
     gpu.gptq_reset_rotation();
-    anyhow::ensure!(matches!(cfg.family, crate::qwen::Family::Qwen35 | crate::qwen::Family::Qwen4Exp),
-        "--gptq is implemented for qwen3_5 dense and qwen4_exp, got {:?}", cfg.family);
-    let samples = calib_tokens(base, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
+    anyhow::ensure!(
+        matches!(
+            cfg.family,
+            crate::qwen::Family::Qwen35 | crate::qwen::Family::Qwen4Exp
+        ),
+        "--gptq is implemented for qwen3_5 dense and qwen4_exp, got {:?}",
+        cfg.family
+    );
+    let samples = calib_tokens_mode(
+        base,
+        calib,
+        opts.nsamples,
+        opts.seqlen,
+        cfg.vocab_size,
+        opts.maca,
+    )?;
     let ns = samples.len();
-    println!("[gptq] {} samples × {} tokens; groups GPTQ {:?}, RTN {:?}, rotate {}, damp {}, clip ratios {}, scale iters {}, act-order {}",
-             ns, opts.seqlen, opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+    let mut length_hist = std::collections::BTreeMap::<usize, usize>::new();
+    for sample in &samples {
+        *length_hist.entry(sample.len()).or_default() += 1;
+    }
+    println!("[gptq] {} samples / {} tokens / lengths {:?}; groups GPTQ {:?}, RTN {:?}, rotate {}, damp {}, clip ratios {}, scale iters {}, act-order {}, MaCa {}",
+             ns, total_tokens, length_hist, opts.gptq_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(),
              opts.nvfp4_groups.iter().map(|g| quant::group_name(*g)).collect::<Vec<_>>(), opts.rotate, opts.damp, opts.nclip,
-             opts.scale_iters, if opts.static_act_order { "static" } else { "none" });
-    println!("[gptq] local-Hessian FP8 scale sweep: {}", opts.local_hessian);
-    for li in 0..gpu.gptq_num_layers() { gpu.gptq_drop_layer_weights(li); }
+             opts.scale_iters, if opts.static_act_order { "static" } else { "none" }, opts.maca);
+    println!(
+        "[gptq] local-Hessian FP8 scale sweep: {}",
+        opts.local_hessian
+    );
+    for li in 0..gpu.gptq_num_layers() {
+        gpu.gptq_drop_layer_weights(li);
+    }
     gpu.gptq_sync();
     println!("[gptq] base layer weights dropped (rebuilt per layer from the source); MemAvailable {:.1} GB", mem_available_gb());
     let mut pool = Pool::new(gpu.gptq_dev().clone());
@@ -667,6 +882,11 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         tap.skip_experts = true;
         gpu.gptq_arm(tap);
         for s in 0..ns {
+            gpu.gptq_set_sample_weight(if opts.maca {
+                1.0 / samples[s].len() as f32
+            } else {
+                1.0
+            });
             gpu.zero_slot_state(&mut state, 0, seqlen);
             let inc = hidden[s].as_ref().map(|b| gpu.gptq_clone_b(b));
             let (_, outb) = gpu.prefill_batch_range(&mut pool, &samples[s], &mut state, 0, seqlen, 0, li, li + 1, inc);
@@ -710,7 +930,15 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
                         n_fallback += 1;
                         if is_gu { None } else {
                             let xs = tap.moe_all_x.as_ref().unwrap();
-                            Some(gpu.gptq_down_hess_from(gu_b.unwrap(), e, xs, tap.moe_all_n, h, mi))
+                            Some(gpu.gptq_down_hess_from(
+                                gu_b.unwrap(),
+                                e,
+                                xs,
+                                tap.moe_all_n,
+                                h,
+                                mi,
+                                &tap.moe_all_segments,
+                            ))
                         }
                     } else { None };
                     let hess: &S = if hs[e].n < thr && is_gu { &tap.moe_all.as_ref().unwrap().h } else { fallback.as_ref().map(|f| &f.h).unwrap_or(&hs[e].h) };
@@ -798,11 +1026,25 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         if let Some((ptr, rows)) = gpu.gptq_lm_head_bf16() {
             let t0 = std::time::Instant::now();
             let hess = gpu.gptq_hess_new(h);
-            for s in 0..ns { gpu.gptq_lm_head_hess_accum(&mut pool, hidden[s].as_ref().unwrap(), seqlen, &hess); }
+            for s in 0..ns {
+                let len = samples[s].len();
+                let weight = if opts.maca { 1.0 / len as f32 } else { 1.0 };
+                gpu.gptq_lm_head_hess_accum(
+                    &mut pool,
+                    hidden[s].as_ref().unwrap(),
+                    len,
+                    &hess,
+                    weight,
+                );
+            }
             let x_amax = gpu.gptq_amax(&hess);
-            lm_rec = Some(gptq_2d(&gpu, &mut cs, ptr, rows, h, &hess.h, &opts, None, x_amax)?);
-            println!("[gptq] lm_head [{rows}, {h}] GPTQ over {} tokens (activation amax {x_amax:.3}) in {:.1}s", ns * seqlen, t0.elapsed().as_secs_f32());
-        } else { println!("[gptq] warning: lm_head is not served in bf16 (tied / missing) — left as the source has it"); }
+            lm_rec = Some(gptq_2d(
+                &gpu, &mut cs, ptr, rows, h, &hess.h, &opts, None, x_amax,
+            )?);
+            println!("[gptq] lm_head [{rows}, {h}] GPTQ over {total_tokens} tokens (activation amax {x_amax:.3}) in {:.1}s", t0.elapsed().as_secs_f32());
+        } else {
+            println!("[gptq] warning: lm_head is not served in bf16 (tied / missing) — left as the source has it");
+        }
     }
     drop(hidden);
     // 7. non-layer tensors: source verbatim (embed, final norm, mixer, vision, lm_head) with the
@@ -840,8 +1082,12 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         std::fs::copy(&ple_side, out.join("ple_ngram_nvfp4.json"))?;
         if std::fs::hard_link(base.join(&ple_file), out.join(&ple_file)).is_err() { std::fs::copy(base.join(&ple_file), out.join(&ple_file))?; }
     }
-    let mut cj: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
-    cj["quantization_config"]["gptq"] = serde_json::json!({ "nsamples": ns, "seqlen": seqlen, "damp": opts.damp, "clip_ratios": opts.nclip,
+    let mut cj: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
+    cj["quantization_config"]["gptq"] = serde_json::json!({ "nsamples": ns, "seqlen": seqlen,
+        "total_tokens": total_tokens, "length_histogram": length_hist, "maca": opts.maca,
+        "hessian_sequence_normalization": if opts.maca { "1/sequence_length" } else { "none" },
+        "damp": opts.damp, "clip_ratios": opts.nclip,
         "global_scale_optimization": { "type": "alternating_least_squares", "iterations": opts.scale_iters },
         "local_scale_optimization": if opts.local_hessian { "local_hessian_fp8_sweep" } else { "clip_mse" },
         "activation_order": if opts.static_act_order { "static" } else { "none" },
@@ -865,6 +1111,10 @@ pub fn dflash2(source: &Path, target: &Path, out: &Path, calib: &Path,
                opts: GptqOpts, context_vectors: usize) -> Result<()> {
     use crate::dflash2::{BLOCK as DB, HEAD_DIM, HIDDEN, INTER, N_LAYERS, NUM_HEADS, NUM_KV_HEADS};
     validate_opts(&opts)?;
+    anyhow::ensure!(
+        !opts.maca,
+        "--gptq-dflash2 does not yet support --maca variable-length captures"
+    );
     use crate::dflash2::capture::Df2PrimeSink;
     use crate::dflash2::round::Df2Round;
 
@@ -1075,10 +1325,24 @@ pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOp
     let src = ShardReader::open(source)?;
     let basr = ShardReader::open(base)?;
     let (gpu, cfg) = GpuModel::load_from_dir(&base.to_string_lossy())?;
-    anyhow::ensure!(matches!(cfg.family, crate::qwen::Family::Qwen35) && !cfg.is_moe,
-        "--gptq-lmhead currently requires a qwen3_5 dense artifact, got {:?} (is_moe={})", cfg.family, cfg.is_moe);
-    anyhow::ensure!(opts.rotate, "--gptq-lmhead requires --rotate for an MR-GPTQ head");
-    let samples = calib_tokens(base, calib, opts.nsamples, opts.seqlen, cfg.vocab_size)?;
+    anyhow::ensure!(
+        matches!(cfg.family, crate::qwen::Family::Qwen35) && !cfg.is_moe,
+        "--gptq-lmhead currently requires a qwen3_5 dense artifact, got {:?} (is_moe={})",
+        cfg.family,
+        cfg.is_moe
+    );
+    anyhow::ensure!(
+        opts.rotate,
+        "--gptq-lmhead requires --rotate for an MR-GPTQ head"
+    );
+    let samples = calib_tokens_mode(
+        base,
+        calib,
+        opts.nsamples,
+        opts.seqlen,
+        cfg.vocab_size,
+        opts.maca,
+    )?;
     let ns = samples.len();
     let h = cfg.hidden_size;
     let mut hess = gpu.gptq_hess_new(h);
@@ -1089,16 +1353,42 @@ pub fn lmhead(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOp
              ns, opts.seqlen, h, h, opts.damp, opts.nclip, opts.rotate);
     for (s, toks) in samples.iter().enumerate() {
         gpu.zero_slot_state(&mut state, 0, opts.seqlen);
-        let (_, residual) = gpu.prefill_batch_range(&mut pool, toks, &mut state, 0, opts.seqlen, 0, 0, cfg.num_layers, None);
-        gpu.gptq_lmhead_hess_accum(&mut hess, &residual, &normed, toks.len(), opts.rotate);
+        let (_, residual) = gpu.prefill_batch_range(
+            &mut pool,
+            toks,
+            &mut state,
+            0,
+            opts.seqlen,
+            0,
+            0,
+            cfg.num_layers,
+            None,
+        );
+        let weight = if opts.maca {
+            1.0 / toks.len() as f32
+        } else {
+            1.0
+        };
+        gpu.gptq_lmhead_hess_accum(
+            &mut hess,
+            &residual,
+            &normed,
+            toks.len(),
+            opts.rotate,
+            weight,
+        );
         pool.release_bf16(residual, h * toks.len());
         if (s + 1) % 16 == 0 || s + 1 == ns {
             gpu.gptq_sync();
             println!("[gptq-lmhead] Hessian {}/{} samples ({:.1} min)", s + 1, ns, t_all.elapsed().as_secs_f32() / 60.0);
         }
     }
-    anyhow::ensure!(hess.n == ns * opts.seqlen,
-        "lm_head Hessian coverage mismatch: {} vectors, expected {}", hess.n, ns * opts.seqlen);
+    let total_tokens: usize = samples.iter().map(Vec::len).sum();
+    anyhow::ensure!(
+        hess.n == total_tokens,
+        "lm_head Hessian coverage mismatch: {} vectors, expected {total_tokens}",
+        hess.n
+    );
     let x_amax = gpu.gptq_amax(&hess);
     let (shape, head) = src.read_bf16("lm_head.weight")?;
     anyhow::ensure!(shape == vec![cfg.vocab_size, h], "lm_head shape {:?}, expected [{}, {}]", shape, cfg.vocab_size, h);
@@ -1423,7 +1713,9 @@ pub fn calib_igs(
             n_unfed += 1;
         }
         let nonzero_blocks: u64 = stats.bins.iter().sum();
-        stem_stats.insert(stem.clone(), serde_json::json!({
+        stem_stats.insert(
+            stem.clone(),
+            serde_json::json!({
             "histogram": stats.bins,
             "running_max": stats.running_max,
             "zero_blocks": stats.zero_blocks,
@@ -1436,7 +1728,8 @@ pub fn calib_igs(
             "input_global_scale": diag.as_ref().map(|d| d.input_global_scale),
             "has_headroom": diag.as_ref().map(|d| d.has_headroom),
             "range_exceeds_e4m3": diag.as_ref().map(|d| d.range_exceeds_e4m3),
-        }));
+            }),
+        );
     }
 
     let stats_doc = serde_json::json!({
@@ -1593,6 +1886,33 @@ mod tests {
             "{\"input_ids\":[1,2,3,4],\"text\":\"ignored\"}\n{\"input_ids\":[5,6,7,8],\"text\":\"ignored too\"}\n").unwrap();
         let samples = calib_tokens(Path::new("/tokenizer-is-deliberately-absent"), &path, 2, 4, 16).unwrap();
         assert_eq!(samples, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn maca_accepts_variable_rows_but_fixed_loader_rejects_them() {
+        let path =
+            std::env::temp_dir().join(format!("gptq-maca-test-{}.jsonl", std::process::id()));
+        std::fs::write(&path,
+            "{\"input_ids\":[1,2],\"text\":\"short\"}\n{\"input_ids\":[3,4,5,6],\"text\":\"long\"}\n").unwrap();
+        assert!(calib_tokens(
+            Path::new("/tokenizer-is-deliberately-absent"),
+            &path,
+            2,
+            4,
+            16
+        )
+        .is_err());
+        let samples = calib_tokens_mode(
+            Path::new("/tokenizer-is-deliberately-absent"),
+            &path,
+            2,
+            4,
+            16,
+            true,
+        )
+        .unwrap();
+        assert_eq!(samples, vec![vec![1, 2], vec![3, 4, 5, 6]]);
         std::fs::remove_file(path).unwrap();
     }
 

@@ -11815,3 +11815,35 @@ extern "C" __global__ void gptq_sweep_static_b(float* W, unsigned char* qw,
         for (int k2 = j; k2 < bs; k2++) w[c0 + k2] -= err * urow[c0 + k2];
     }
 }
+
+// Compact activation profile for COLA/ACDM. One block owns one feature channel and reduces all
+// sequence positions. stats = global sum/sum-of-squares; sketch is a deterministic CountSketch of
+// the mean-pooled channel vector (a sparse random projection without materializing [K,N] on host).
+extern "C" __global__ void calib_profile_b(double* stats, float* sketch,
+                                             const __nv_bfloat16* x, int K, int N,
+                                             int sketch_dim, unsigned int seed) {
+    int c = blockIdx.x;
+    if (c >= K) return;
+    double sum = 0.0, sumsq = 0.0;
+    for (int t = threadIdx.x; t < N; t += blockDim.x) {
+        float v = __bfloat162float(x[(long long)t * K + c]);
+        sum += (double)v; sumsq += (double)v * (double)v;
+    }
+    __shared__ double calib_prof_sum[256];
+    __shared__ double calib_prof_sumsq[256];
+    double* rs = calib_prof_sum; double* rq = calib_prof_sumsq;
+    rs[threadIdx.x] = sum; rq[threadIdx.x] = sumsq;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) { rs[threadIdx.x] += rs[threadIdx.x + off]; rq[threadIdx.x] += rq[threadIdx.x + off]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&stats[0], rs[0]); atomicAdd(&stats[1], rq[0]);
+        unsigned int z = ((unsigned int)c ^ seed) * 0x9e3779b9u;
+        z ^= z >> 16; z *= 0x85ebca6bu; z ^= z >> 13;
+        int bucket = (int)(z % (unsigned int)sketch_dim);
+        float sign = (z & 0x80000000u) ? -1.0f : 1.0f;
+        atomicAdd(&sketch[bucket], sign * (float)(rs[0] / (double)N));
+    }
+}

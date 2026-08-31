@@ -4,6 +4,9 @@ This is the canonical recipe used for the validated `Qwen3.8-27B-MR-GPTQ-NVFP4-v
 It produces W4 MR-GPTQ weights, W4A4 prefill for the transformer trunk, and deliberately keeps
 the main, MTP, and DFlash2 output-head activations in A16.
 
+For the newer variable-length MaCa pipeline with activation-aware COLA/ACDM selection and MoE
+expert balancing, use [`MACA_COLA_ACDM_MOE_CALIBRATION.md`](MACA_COLA_ACDM_MOE_CALIBRATION.md).
+
 The generator builds the corpus from pinned, verified raw sources and never overwrites an existing
 output. Its main output contains one exact, pre-tokenized sample per JSONL record; GPTQ consumes
 `input_ids` directly, so the manifest token percentages are the percentages used by calibration.
