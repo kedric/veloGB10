@@ -2285,8 +2285,22 @@ impl GpuModel {
         let mut t_repack = std::time::Duration::ZERO;    // repack_*_mma (call-site wall time, assembly phase)
         let mut t_hshard = std::time::Duration::ZERO;    // host-side TP shard of repacked weights
         let mut t_up_post = std::time::Duration::ZERO;   // htod uploads inside `gwn`
+        // The one user-facing message for a broken/stale/wrong-format checkpoint (owner directive
+        // 2026-08-27): name the path, classify, and say what to do — instead of a panic/OOM/core-dump
+        // from garbage metadata. Called at every graceful-exit site in this function.
+        let load_error = |classification: &str, cause: &str| -> anyhow::Error {
+            anyhow::anyhow!(
+                "Error loading model from {}: {}\n\
+                 \x20 The model checkpoint appears to be {}.\n\
+                 \x20 Fix: re-download the FULL set cleanly (all shards + the index + config), verify with\n\
+                 \x20 sha256sum that the shards match the source, and confirm the directory is the engine's\n\
+                 \x20 CONVERTED NVFP4 model (not a raw or differently-quantized checkpoint). See the README.",
+                model_dir, cause, classification)
+        };
         let config_path = format!("{}/config.json", model_dir.trim_end_matches('/'));
-        let cfg = crate::qwen::Config::from_config_json(&config_path)?;
+        let cfg = crate::qwen::Config::from_config_json(&config_path)
+            .map_err(|e| load_error("corrupted",
+                &format!("config.json is missing or does not parse: {e}")))?;
         // The attention kernels take hd at launch but size per-lane register slices for hd/32 <= 16
         // (SK_DPL_MAX in gpu_batch.cu: qwen3.5 256, hy_v3 128, DeepSeek 512). Fail loudly on anything
         // outside that envelope rather than corrupting attention silently.
@@ -2359,20 +2373,47 @@ impl GpuModel {
         let dir = std::path::Path::new(model_dir);
         let index_path = dir.join("model.safetensors.index.json");
         let safetensors_files: Vec<std::path::PathBuf> = if index_path.exists() {
-            let index_raw = std::fs::read_to_string(&index_path)?;
-            let index: serde_json::Value = serde_json::from_str(&index_raw)?;
-            index["weight_map"].as_object().unwrap().values()
-                .filter_map(|v| v.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .map(|s| dir.join(s))
-                .collect()
+            let index_raw = std::fs::read_to_string(&index_path)
+                .map_err(|e| load_error("corrupted",
+                    &format!("model.safetensors.index.json is unreadable: {e}")))?;
+            let index: serde_json::Value = serde_json::from_str(&index_raw)
+                .map_err(|e| load_error("corrupted",
+                    &format!("model.safetensors.index.json does not parse as JSON: {e}")))?;
+            let wm = index["weight_map"].as_object().ok_or_else(|| {
+                load_error("wrong-format",
+                    "model.safetensors.index.json has no \"weight_map\" object — not a safetensors sharded-model index")
+            })?;
+            let mut files: std::collections::BTreeSet<std::path::PathBuf> = std::collections::BTreeSet::new();
+            for (_, v) in wm {
+                if let Some(s) = v.as_str() {
+                    let p = dir.join(s);
+                    if !p.exists() {
+                        // A stale/mismatched index: some shards present, others missing.
+                        return Err(load_error("stale",
+                            &format!("the index references shard \"{s}\" which is not present on disk — \
+                                      partial or stale download (which shards are missing is what matters)")));
+                    }
+                    files.insert(p);
+                }
+            }
+            if files.is_empty() {
+                return Err(load_error("corrupted",
+                    "the index declares no shards — empty or partial download"));
+            }
+            files.into_iter().collect()
         } else {
-            std::fs::read_dir(dir)?.filter_map(|e| {
-                let e = e.ok()?;
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.ends_with(".safetensors") { Some(e.path()) } else { None }
-            }).collect()
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .map_err(|e| load_error("corrupted", &format!("cannot read the model directory: {e}")))?
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.ends_with(".safetensors") { Some(e.path()) } else { None }
+                }).collect();
+            if files.is_empty() {
+                return Err(load_error("corrupted",
+                    "no .safetensors shards found in the directory — empty or partial download"));
+            }
+            files
         };
 
         // Process shards ONE AT A TIME — load, upload to GPU, drop raw bytes.
@@ -2487,7 +2528,16 @@ impl GpuModel {
             let mut f = std::fs::File::open(path)?;
             let mut lenb = [0u8; 8];
             f.read_exact(&mut lenb)?;
-            let mut hdr = vec![0u8; u64::from_le_bytes(lenb) as usize];
+            let hlen = u64::from_le_bytes(lenb);
+            // GARBAGE-HEADER GUARD: a corrupt/truncated/shadowed shard can put a ~2^61 value in the
+            // 8-byte length prefix, and `vec![0u8; hlen]` is exactly the "memory allocation of
+            // 2336927755350992246 bytes failed" OOM. Bound before allocating. A real safetensors
+            // header is far smaller than 256 MiB.
+            if hlen == 0 || hlen > (1 << 28) {
+                return Err(anyhow::anyhow!(
+                    "corrupt safetensors header length {hlen} (a truncated or wrong-format shard)"));
+            }
+            let mut hdr = vec![0u8; hlen as usize];
             f.read_exact(&mut hdr)?;
             Ok(serde_json::from_slice(&hdr)?)
         }
@@ -2499,31 +2549,65 @@ impl GpuModel {
         let mut q4_bytes = 0usize;
         let mut q8_bytes = 0usize;
         let mut bf16_bytes = 0usize;
+        // Wrong-format detection: if the shards hold tensors but NONE match the engine's recognized
+        // scheme (packed NVFP4 / FP8 / bf16 weight names), the directory is a raw/different layout —
+        // say so explicitly instead of a downstream missing-tensor panic.
+        let mut total_tensors = 0usize;
+        let mut recognized = 0usize;
         for sf_path in &safetensors_files {
-            let hdr = shard_header(sf_path)?;
+            let hdr = shard_header(sf_path).map_err(|e| load_error("corrupted",
+                &format!("shard {} has a corrupt/truncated header: {e}", sf_path.display())))?;
             let obj = hdr.as_object().ok_or_else(|| {
-                anyhow::anyhow!("bad safetensors header {}", sf_path.display()) })?;
+                load_error("corrupted", &format!(
+                    "shard {} header is not a JSON object — corrupt or wrong-format file", sf_path.display()))
+            })?;
             for (name, meta) in obj {
                 if name == "__metadata__" { continue; }
+                total_tensors += 1;
                 let dtype = meta.get("dtype").and_then(|d| d.as_str()).unwrap_or("");
                 let shape: Vec<u64> = meta.get("shape").and_then(|s| s.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
+                // GARBAGE-SHAPE GUARD: a corrupt tensor metadata can declare a 0 or a ~2^61 shape;
+                // the downstream `m*k*elems` allocation is the OOM. Reject before allocating.
+                let mut elems: u64 = 1;
+                let mut bad_shape = shape.iter().any(|&d| d == 0);
+                if !bad_shape {
+                    for &d in &shape {
+                        elems = elems.saturating_mul(d);
+                        if elems > (1 << 40) { bad_shape = true; break; }
+                    }
+                }
+                if bad_shape {
+                    return Err(load_error("corrupted", &format!(
+                        "tensor \"{name}\" in {} declares a corrupt shape {shape:?} (zero or implausibly large dims)",
+                        sf_path.display())));
+                }
                 let (m, k) = (shape.first().copied().unwrap_or(0) as usize,
                               shape.get(1).copied().unwrap_or(0) as usize);
                 if name.ends_with(".weight_packed") {
                     // packed [M, K/2] + E4M3 scales [M, K/16]
                     variants.insert(format!("{}.weight", name.trim_end_matches(".weight_packed")), 1);
                     n_dq4 += 1;
+                    recognized += 1;
                     q4_bytes += m * k + m * (k / 8);
                 } else if name.ends_with(".weight") && dtype == "F8_E4M3" {
                     variants.insert(name.clone(), 2);
                     n_dq8 += 1;
+                    recognized += 1;
                     q8_bytes += m * k + m * 4;
                 } else if name.ends_with(".weight") && (dtype == "BF16" || dtype == "F16") {
                     variants.insert(name.clone(), 3);
+                    recognized += 1;
                     bf16_bytes += m * k * 2;
                 }
             }
+        }
+        // Wrong-format: shards present but no recognized weight scheme at all.
+        if total_tensors > 0 && recognized == 0 {
+            return Err(load_error("wrong-format",
+                "this checkpoint is not the converted NVFP4 format the engine expects — the shards \
+                 contain tensors but none match the engine's converted layout (no *_weight_packed / \
+                 FP8 / bf16 weight scheme); it is a raw HF or differently-quantized checkpoint"));
         }
         // Reserved LM-head/embed parts for the FR-Spec draft head: the head's own assembly job
         // consumes them from host_q4/host_q8, so the draft build (post-loop) reads these copies.
@@ -10296,6 +10380,12 @@ impl GpuModel {
         if spans.is_empty() { return; }
         let w_lo = pos_start;
         let w_hi = pos_start + window_len;
+        // `embeds` is the CONCATENATION of every image's merged embeddings, in `spans` order. The
+        // within-span row offset `emb_row0` is relative to THIS image's own block, so the source
+        // address must be `emb_off + emb_row0`, not `emb_row0` (which is only correct for the FIRST
+        // image — image 2+ would splice image 1's embeddings at its own span, the cross-image
+        // contamination). `emb_off` tracks each image's global row offset across spans.
+        let mut emb_off = 0usize;
         for span in spans {
             let a = span.start.max(w_lo);
             let b = (span.start + span.num_tokens).min(w_hi);
@@ -10306,12 +10396,13 @@ impl GpuModel {
                 let dst = *residual.device_ptr() as cudarc::driver::sys::CUdeviceptr
                     + (res_row0 * h * 2) as u64;
                 let src = *embeds.device_ptr() as cudarc::driver::sys::CUdeviceptr
-                    + (emb_row0 * h * 2) as u64;
+                    + ((emb_off + emb_row0) * h * 2) as u64;
                 unsafe {
                     cudarc::driver::result::memcpy_dtod_async(
                         dst, src, nrows * h * 2, self.stream.stream).unwrap();
                 }
             }
+            emb_off += span.num_tokens;
         }
     }
 

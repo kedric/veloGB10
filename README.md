@@ -267,9 +267,10 @@ Two properties are treated as non-negotiable and are enforced by gates, not by h
 
 - **OpenAI-compatible server** — streaming, tool calling (schema-aware argument coercion, with a
   single canonical serializer across streaming and non-streaming), seedable sampling, continuous
-  batching, prefix caching.
-- **Vision** — image input on a GPU vision tower (`--vision-cpu` for the CPU reference path);
-  PNG/JPEG/WebP/GIF.
+  batching, prefix caching, and OpenAI `reasoning_effort` levels (`none/low/medium/high/xhigh/max`).
+- **Vision** — image input on a GPU vision tower across the Qwen3.5/3.8 VL family
+  (`--vision-cpu` for the CPU reference path); PNG/JPEG/WebP/GIF. The tower bootstraps
+  opportunistically: a non-vision or incompatible model serves text-only, never a startup crash.
 - **MTP speculative decoding** — native multi-token prediction heads with an auto-depth policy
   that measures its own cost/acceptance trade-off live and re-picks depth (or disables itself)
   per workload. No configuration required.
@@ -425,6 +426,8 @@ Complete surface of `gb10_inference` (same content as `--help`). Square brackets
 | `--gptq --model-dir <bf16> --base <artifact> --out <dir> --calib <jsonl> [--maca]` | — | Calibrated GPTQ→NVFP4 re-quantization, one layer at a time on one GB10. `--maca` enables variable context lengths with per-sequence Hessian normalization. See `docs/MACA_COLA_ACDM_MOE_CALIBRATION.md` and the [public reproducible corpus recipe](docs/PUBLIC_CALIBRATION_DATASETS.md). |
 | `--calib-profile --model-dir <artifact> --calib <jsonl> --out <profiles.jsonl>` | — | Collect activation sketches and exact MoE routing counts for COLA/ACDM/expert-aware corpus selection |
 | `--ple-offload <ssd\|none>` | none | Qwen3.8-Flash-Next only: keep the 31 GB PLE n-gram table on the SSD and read the rows each forward needs (bit-identical to resident; decode graphs off) |
+| `--reasoning-effort <e>` | template default | Reasoning level in the chat template (`none`/`no_think`/`low`/`medium`/`high`/`xhigh`/`max`); per-request `reasoning_effort` overrides |
+| `--output-prompts [n]` | off | Log each chat request human-readable (params, messages, rendered prompt); optional render cap `n` |
 | `--mtp <auto\|on\|off>` | auto | MTP speculative decoding. `auto` measures whether it pays and self-tunes depth from live acceptance; greedy verify is bitwise-lossless, temp>0 distribution-exact. `on`/`off` force it (benchmarking) |
 | `--mtp-depth <N>` | auto | Pin draft depth instead of auto-picking (benchmarking) |
 | `--ngram-draft <N>` | 0 | EXPERIMENTAL prompt-lookup drafting, n-gram order N (0 = off) |

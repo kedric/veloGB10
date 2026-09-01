@@ -47,11 +47,28 @@ generic language where they aren't individually notable.
   now marked rotated at load too (a router-GPTQ artifact routed on unrotated logits and answered
   EOS to everything); `--gptq-refmt` copies config.json instead of hard-linking (it edited the
   input artifact); output directories are guarded.
-- **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
-  read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
+- **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`TowerDims::out_hidden`
+  read from `vision_config` and validated against the checkpoint); image embeddings spliced before
+  the hyper-connection expansion.
   `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).
 - Limits: no TP for this family; QSA supports bf16 and k8v4 KV caches (q4/tq remain unsupported);
   image tokens use 1-D positions (no MRoPE — as on Qwen3.5).
+
+## v0.5.1 — Vision robustness, reasoning-effort, graceful-load fixes
+
+- **Vision generalization + boot fix.** The GPU vision tower now bootstraps opportunistically: a
+  non-vision or geometry-incompatible model serves text-only instead of crashing at startup (fixes a
+  v0.5.0 boot crash on non-27B packs). Vision is generalized across the Qwen3.5/3.8 VL family, so
+  all vision-tower models serve images.
+- **OpenAI `reasoning_effort`.** Full level table (`none/low/medium/high/xhigh/max`) with
+  per-family normalization, plus `--reasoning-effort`; the `high` mapping no longer silently drops
+  thinking (regression fix).
+- **Tool-call + reasoning-mode fix.** Tool-call markup is held back in reasoning mode too, fixing a
+  first-call double-emit leak.
+- **Graceful model-load exit.** Corrupted / stale / wrong-format checkpoints exit with a clear
+  actionable message instead of a panic/OOM/core-dump.
+- **`--output-prompts [n]`** — human-readable chat-request logging; `--vision-cpu` now listed in
+  `--help`. Minor bug fixes and optimizations.
 
 ## v0.5.0 — Vision support
 

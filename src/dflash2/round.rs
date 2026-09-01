@@ -466,6 +466,15 @@ impl Df2Round {
         Self::load_tp(dir, head, embed, max_c, None)
     }
 
+    /// S9F+ (2026-08-29): load with an explicit artifact sha256 pin override.
+    /// `None` = the published REAL_SHA256; `Some("off")` = no sha check (inventory/shape/
+    /// dtype guard still runs); `Some(hex)` = pin to that hash. Used by the serve path so a
+    /// retrained selector artifact (new sha) loads without weakening the default.
+    pub fn load_pinned(dir: &str, head: Option<BorrowedW>, embed: Option<BorrowedW>, max_c: usize,
+                       sha_pin: Option<&str>) -> Result<Self> {
+        Self::load_tp_pinned(dir, head, embed, max_c, None, sha_pin)
+    }
+
     /// P2 — the TP load: `load` plus an all-reduce context (`GpuModel::df2_ar_ctx`, Some only
     /// at world > 2 with `--df2-round-shard on`). When `ar` is Some the BIG per-layer weights
     /// are sliced at load (the proven trunk shard-at-load pattern) and the round carries two
@@ -488,9 +497,20 @@ impl Df2Round {
     /// consumer, same discipline as `upload_chunk`'s m-padding).
     pub fn load_tp(dir: &str, head: Option<BorrowedW>, embed: Option<BorrowedW>, max_c: usize,
                    ar: Option<Df2ArCtx>) -> Result<Self> {
+        Self::load_tp_pinned(dir, head, embed, max_c, ar, None)
+    }
+
+    /// `load_tp` with an explicit artifact sha256 pin override (see `load_pinned`).
+    pub fn load_tp_pinned(dir: &str, head: Option<BorrowedW>, embed: Option<BorrowedW>, max_c: usize,
+                          ar: Option<Df2ArCtx>, sha_pin: Option<&str>) -> Result<Self> {
+        let pin: Option<&str> = match sha_pin {
+            Some("off") => None,
+            Some(hex) => Some(hex),
+            None => Some(crate::dflash2::REAL_SHA256),
+        };
         let mixed = std::path::Path::new(dir).join("model.safetensors.index.json").exists();
         let art = if mixed { crate::dflash2::load::load_runtime(dir)? }
-                  else { crate::dflash2::load::load(dir, Some(crate::dflash2::REAL_SHA256))? };
+                  else { crate::dflash2::load::load(dir, pin)? };
         let w = &art.weights;
         let cfg = crate::dflash2::oracle::Dflash2Config::default();
         let max_pos = max_c + BLOCK + 1;

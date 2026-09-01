@@ -79,6 +79,16 @@ fn print_help() {
     println!("    --default-frequency-penalty <F>   Frequency penalty                                [0.0]");
     println!("    (temperature / top_p / top_k / seed are per-REQUEST only â defaults 0.7 / 0.8 / 20)");
     println!();
+    println!("  VISION  (optional capability â never a boot blocker)");
+    println!("    The image tower is loaded ONLY when the pack declares a COMPATIBLE `model.visual`");
+    println!("    tower (config.json vision_config -> TowerDims). A pack with NO vision tower, an");
+    println!("    absent/incompatible model.visual set, or a geometry that cannot be served");
+    println!("    SOFT-FAILS to text-only (a [vision] log line, never a boot panic); image traffic");
+    println!("    on such a pack -> clean BAD_REQUEST. The 27B VL tower and ANY valid Qwen-family");
+    println!("    tower still load + serve images.");
+    println!("    --vision-cpu            Force the CPU vision reference tower for image requests");
+    println!("                            (disables the GPU fast path; diagnostic escape hatch)");
+    println!();
     println!("  EXAMPLES");
     println!("    {prog} --server --model-dir /models/3.6-27b-nvfp4-full \\");
     println!("        --port 9000 --max-seq-len 32768 --max-batch 2 --prefix-cache on");
@@ -323,6 +333,8 @@ fn print_help() {
     println!("                           TurboQuant GB10_KV_TQ=1; k8v4 = int8-K + q4-V GB10_KV_K8V4=1;");
     println!("                           =0 restores bf16/q4 byte-for-byte)");
     println!("  --reasoning-effort <e>   reasoning level in the chat template (no_think|low|high|medium|xhigh)");
+    println!("  --output-prompts [n]     server: log each chat request human-readable (params, messages,");
+    println!("                           rendered prompt, first n chars; default n=6000, absent = off)");
     println!("                           (default: model's own template default — xhigh for Qwen, low for hy_v3)");
     println!("  --no-decode-graphs       Disable decode CUDA graphs    (GB10_NO_DECODE_GRAPHS)");
     println!("  --no-gqpack              Per-head q4 attention fallback  (GB10_NO_GQPACK)");
@@ -373,6 +385,25 @@ fn print_help() {
     println!("(greedy => argmax verify, bitwise lossless; temp>0 => speculative rejection");
     println!("sampling, distribution-exact). --mtp=on|off and --mtp-depth exist for benches.");
     println!();
+}
+
+/// Load the serving GPU model. On any load error, print the graceful user-facing message (path +
+/// cause + fix — see `GpuModel::load_from_dir_impl`) and exit cleanly with code 1, instead of a
+/// `.expect` panic or an OOM/core-dump from garbage checkpoint metadata (owner directive 2026-08-27).
+fn load_model_gpu(dir: &str, tp_rank: Option<i32>, world: i32)
+    -> (gb10_inference::gpu::GpuModel, gb10_inference::qwen::Config)
+{
+    let res = match tp_rank {
+        Some(r) => gb10_inference::gpu::GpuModel::load_from_dir_tp(dir, r, world),
+        None => gb10_inference::gpu::GpuModel::load_from_dir(dir),
+    };
+    match res {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -661,7 +692,7 @@ fn main() {
     // What IS the roofline? Every other number is measured against it.
     if args.iter().any(|a| a == "--probe-bandwidth") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-bandwidth requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_bandwidth();
         return;
     }
@@ -669,7 +700,7 @@ fn main() {
     if args.iter().any(|a| a == "--probe-bandwidth-sustained") {
         let dir = parse_arg(&args, "--model-dir").expect("requires --model-dir <DIR>");
         let secs: u64 = parse_arg(&args, "--seconds").and_then(|s| s.parse().ok()).unwrap_or(180);
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_bandwidth_sustained(secs);
         return;
     }
@@ -775,7 +806,7 @@ fn main() {
     }
     if args.iter().any(|a| a == "--probe-binv") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-binv requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         if !gpu.probe_binv() { std::process::exit(1); }
         return;
     }
@@ -789,9 +820,9 @@ fn main() {
         let world: i32 = parse_arg(&args, "--world").and_then(|s| s.parse().ok()).unwrap_or(1);
         assert!(world == 1 || (world > 0 && world & (world - 1) == 0), "--world must be 1 or a power of two");
         let (mut gpu, _) = if world > 1 {
-            gb10_inference::gpu::GpuModel::load_from_dir_tp(&dir, rank, world).expect("gpu load")
+            load_model_gpu(&dir, Some(rank), world)
         } else {
-            gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load")
+            load_model_gpu(&dir, None, 1)
         };
         gpu.prepare_tp_weight_layout(rank, world);
         gpu.dump_rank_weights();
@@ -847,7 +878,7 @@ fn main() {
     // buffers; weights unused). 27B dims: H=5120, I=17408, Q=24x256, KV=4x256.
     if args.iter().any(|a| a == "--probe-tp-gemv") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-tp-gemv requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         println!("=== TP=2 half-width GEMV probe (gemm_mma_fp4_b, N=1) — 27B linears, FULL vs TP=2-half ===");
         println!("  roofline reference: ~245 GB/s sustained (probe-bandwidth for the live number)");
         println!("--- FFN gate/up (column-parallel: M 17408 -> 8704) ---");
@@ -870,7 +901,7 @@ fn main() {
     //   --probe-splitk --shapes 5120x17408,4096x13312
     if args.iter().any(|a| a == "--probe-splitk") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-splitk requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         let rounds = parse_arg(&args, "--rounds").and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
         let shapes: Vec<(usize, usize, String)> = if let Some(sh) = parse_arg(&args, "--shapes") {
             sh.split(',').map(|s| {
@@ -901,7 +932,7 @@ fn main() {
     //   ./gb10_inference --probe-moe-gemm [--shapes MxK,MxK --rounds N]
     if args.iter().any(|a| a == "--probe-moe-gemm") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-moe-gemm requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         let rounds = parse_arg(&args, "--rounds").and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
         let shapes: Vec<(usize, usize, String)> = if let Some(sh) = parse_arg(&args, "--shapes") {
             sh.split(',').map(|s| {
@@ -923,7 +954,7 @@ fn main() {
     //   ./gb10_inference --bench-decode-ctx --model-dir <DIR> [--ctx N] [--runs N]
     if args.iter().any(|a| a == "--bench-decode-ctx") {
         let dir = parse_arg(&args, "--model-dir").expect("--bench-decode-ctx requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         let ctx: usize = parse_arg(&args, "--ctx").and_then(|v| v.parse().ok()).unwrap_or(2048);
         let runs: usize = parse_arg(&args, "--runs").and_then(|v| v.parse().ok()).unwrap_or(3);
         let kv_stride = (ctx + 64).next_power_of_two().max(2048);
@@ -939,7 +970,7 @@ fn main() {
     //   ./gb10_inference --probe-mxfp4 --model-dir /path/to/27b-nvfp4-full
     if args.iter().any(|a| a == "--probe-mxfp4") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4 requires --model-dir <DIR>");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_mxfp4();
         return;
     }
@@ -952,7 +983,7 @@ fn main() {
     if args.iter().any(|a| a == "--probe-mxfp4-fused") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4-fused requires --model-dir <DIR>");
         std::env::set_var("GB10_MXFP4", "1");   // native mode at load (OMMA modules resident)
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         gpu.probe_mxfp4_fused();
         return;
     }
@@ -966,7 +997,7 @@ fn main() {
         // The xchain capture hooks cannot run inside the verify-graph stream capture (sync/dtoh
         // during capture invalidates it) — probes force the EAGER verify path.
         std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
             .expect("tokenizer");
         let prompt_text = parse_arg(&args, "--prompt").unwrap_or(
@@ -1000,7 +1031,7 @@ fn main() {
     if let Some(path) = parse_arg(&args, "--probe-mxfp4-xchain2") {
         let dir = parse_arg(&args, "--model-dir").expect("--probe-mxfp4-xchain2 requires --model-dir <DIR>");
         std::env::set_var("GB10_NO_VERIFY_GRAPH", "1");   // eager verify: capture hooks vs verify-graph capture are incompatible
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+        let (gpu, _) = load_model_gpu(dir, None, 1);
         let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", dir.trim_end_matches('/')))
             .expect("tokenizer");
         let prompt_text = parse_arg(&args, "--prompt").unwrap_or(
@@ -1242,6 +1273,17 @@ fn main() {
     // (`--requant-q2fake` is the legacy alias, kept so old scripts don't die.)
     if args.iter().any(|a| a == "--requant-sim" || a == "--requant-q2fake") {
         run_requant_sim(&args);
+        return;
+    }
+
+    // SQ campaign: STQ1_0/ternary-2bit/3-bit values-only probe bake over an NVFP4 artifact
+    // (dequant -> SQ round-trip -> requant NVFP4; engine serves the result unmodified).
+    // Rust-only per the standing directive; imatrix comes in as DATA (safetensors of per-channel
+    // importance).   --stq-bake --model-dir <packed-dir> --out <dir> --arm a|b [--imatrix <file>]
+    //                 [--classes gateup,down,attn] [--shard-start N] [--shard-end N] [--limit N]
+    //                 [--check]
+    if args.iter().any(|a| a == "--stq-bake") {
+        run_stq_bake(&args);
         return;
     }
 
@@ -1660,7 +1702,7 @@ fn run_bench_prefill(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--bench-prefill requires --model-dir");
     let seq_len: usize = parse_arg(args, "--seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let reps: usize = parse_arg(args, "--reps").and_then(|s| s.parse().ok()).unwrap_or(5);
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(dir, None, 1);
     // synthetic prompt of seq_len tokens (content irrelevant to prefill cost)
     let prompt: Vec<u32> = (0..seq_len).map(|i| ((i * 2654435761usize) % 30000 + 5) as u32).collect();
     let max_seq_len = (seq_len + 128).next_power_of_two();
@@ -1681,7 +1723,7 @@ fn run_probe_ppsplit(args: &[String]) {
     let dir = parse_arg(args, "--model-dir").expect("--probe-ppsplit requires --model-dir");
     let seq_len: usize = parse_arg(args, "--seq-len").and_then(|s| s.parse().ok()).unwrap_or(4096);
     let split: usize = parse_arg(args, "--split").and_then(|s| s.parse().ok()).unwrap_or(32);
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(dir, None, 1);
     let prompt: Vec<u32> = (0..seq_len).map(|i| ((i * 2654435761usize) % 30000 + 5) as u32).collect();
     let max_seq_len = (seq_len + 128).next_power_of_two();
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -1856,7 +1898,7 @@ fn run_bench_batch(args: &[String]) {
     println!("Batched benchmark: M={} seqs, prompt={} tokens, decode={} tokens", m, prompt.len(), max_new);
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -1895,7 +1937,7 @@ fn run_bench_tree(args: &[String]) {
     let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(dir, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     // 1 KV lane + (2 + MAX_VERIFY) GDN state slots: slot 0 the lane, 1 the MTP snapshot, 2.. the
     // per-column tree checkpoints the parent reload reads.
@@ -1960,7 +2002,7 @@ fn run_bench_lanes(args: &[String]) {
     let max_seq_len: usize = parse_arg(args, "--max-seq-len").and_then(|s| s.parse().ok()).unwrap_or(8192);
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(dir, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     // Slots: 0,1 the two lanes; 2,3 their post-prefill GDN snapshots. 2 KV slots.
     let mut state = gpu.new_batch_state(2, 4, max_seq_len);
@@ -2010,7 +2052,7 @@ fn run_bench_accept(args: &[String]) {
 
     let tokenizer = QwenTokenizer::from_file(&tok_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(dir, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     let mut state = gpu.new_batch_state(1, 2 + depth, max_seq_len);
     gpu.dev().synchronize().unwrap();
@@ -2280,7 +2322,7 @@ fn run_bench_tau(args: &[String]) {
 
     println!("B8/G2 tau harness: model={dir} depth={depth} reps={reps} domains={:?} ctxs={:?}", domains, ctxs);
     println!("parity thresholds (PLAN/08): tau>3.55 (DSpark-BF16 ~ MTP g=3) | >2.78 (FP8 drafter) | >1.78 (BF16 vs no-spec) | >1.39 (FP8 vs no-spec)");
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(&dir, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     let n_slots = 2 + depth.saturating_sub(1).max(1);
 
@@ -2726,7 +2768,7 @@ fn run_replay_df2_bisect(args: &[String]) {
     }
 
     // ---- the engine's rebuilt round (ring from taps.bin via prime_window) ----
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk, None, 1);
     let (head_p, embed_p) = gpu.df2_borrow().expect("head/embed (bf16 or nvfp4)");
     let max_c = (pos + block + 64).max(1024);
     let mut round = Df2Round::load(&draft_dir, Some(head_p), Some(embed_p), max_c)
@@ -3699,15 +3741,22 @@ fn load_df2_round(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize)
                std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>)> {
     // The head (and the single-node paths) resolve --draft-dir from the CLI; the TP node uses
     // the shipped config's dir (load_df2_round_dir) — never its own argv.
-    let draft_dir = required_dir_arg(&std::env::args().collect::<Vec<_>>(), "--draft-dir",
+    let args = std::env::args().collect::<Vec<_>>();
+    let draft_dir = required_dir_arg(&args, "--draft-dir",
                                      "the DFlash2 draft artifact (spec-source is a DFlash2 source)");
-    load_df2_round_dir(gpu, max_c, &draft_dir)
+    // --sha256 <hex|off> overrides the published artifact pin (retrained selectors carry a new
+    // hash; "off" disables the sha check — the inventory/shape/dtype guard still runs).
+    let sha_pin = parse_arg(&args, "--sha256");
+    load_df2_round_dir(gpu, max_c, &draft_dir, sha_pin)
 }
 
 /// S9F (the TP-DF2 leg): `load_df2_round` with an EXPLICIT draft dir — the node's path (the
 /// head's resolved dir ships on the config; the artifact bytes must be identical on every rank
-/// or the round drafts diverge and the verify all-reduces desync).
-fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, draft_dir: &str)
+/// or the round drafts diverge and the verify all-reduces desync). `sha_pin` = the artifact
+/// sha256 pin override: None = published REAL_SHA256, Some("off") = no sha check, Some(hex) =
+/// pin to that hash (the `--sha256` flag; rides TpConfig so head and node agree).
+fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, draft_dir: &str,
+                      sha_pin: Option<&str>)
     -> Option<(gb10_inference::dflash2::round::Df2Round,
                std::sync::Arc<gb10_inference::dflash2::capture::Df2TapSink>,
                std::sync::Arc<gb10_inference::dflash2::capture::Df2PrimeSink>)> {
@@ -3774,8 +3823,8 @@ fn load_df2_round_dir(gpu: &mut gb10_inference::gpu::GpuModel, max_c: usize, dra
             (false, _) => None,
         }
     };
-    let mut round = match gb10_inference::dflash2::round::Df2Round::load_tp(
-        draft_dir, Some(head), Some(embed), max_c, ar) {
+    let mut round = match gb10_inference::dflash2::round::Df2Round::load_tp_pinned(
+        draft_dir, Some(head), Some(embed), max_c, ar, sha_pin) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[df2] WARN: DFlash2 round load FAILED ({e:#}) — absent/failed artifact is \
@@ -3918,7 +3967,7 @@ fn run_probe_df2_lossless(args: &[String]) {
     let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", trunk_dir.trim_end_matches('/')))
         .expect("tokenizer");
     let eos = tokenizer.stop_token_ids(config_eos(trunk_dir.trim_end_matches('/')));
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let df2 = load_df2_round(&mut gpu, max_seq_len);
     let (round, sink, prime) = match df2 {
         Some(x) => x,
@@ -4049,7 +4098,7 @@ fn run_bench_df2_sample(args: &[String]) {
         .expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
 
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let df2 = load_df2_round(&mut gpu, max_seq_len);
     let (mut round, sink, prime) = match df2 {
         Some(x) => x,
@@ -4133,7 +4182,7 @@ fn run_bench_df2_sample_realq(args: &[String]) {
         .expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
 
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let df2 = load_df2_round(&mut gpu, max_seq_len);
     let (mut round, sink, prime) = match df2 {
         Some(x) => x,
@@ -4263,7 +4312,7 @@ fn run_bench_df2_matrix(args: &[String]) {
     let tokenizer = QwenTokenizer::from_file(&format!("{}/tokenizer.json", trunk_dir.trim_end_matches('/')))
         .expect("tokenizer");
     let eos = tokenizer.stop_token_ids(config_eos(trunk_dir.trim_end_matches('/')));
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let (round, sink, prime) = if gb10_inference::batch::is_df2_src(spec_source) {
         match load_df2_round(&mut gpu, max_seq_len) {
             Some(x) => (Some(x.0), Some(x.1), Some(x.2)),
@@ -4502,7 +4551,7 @@ fn run_probe_df2_tapcap(args: &[String]) {
     let ids = tokenizer.encode(prompt_text, true).expect("encode chat1");
     println!("[tapcap] prompt plen={} ids={:?}", ids.len(), &ids[..ids.len().min(6)]);
 
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let sink = std::sync::Arc::new(Df2TapSink::new(gpu.dev()));
     gpu.set_df2_capture(sink.clone());
     assert!(gpu.df2_capture_armed(), "tap capture not armed");
@@ -4544,7 +4593,7 @@ fn run_probe_df2_prime(args: &[String]) {
         println!("  [{:6}] {name}", if ok { "PASS" } else { "FAIL" });
         if !ok { all_pass.set(false); }
     };
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let (head_p, embed_p) = gpu.df2_borrow_ptrs().expect("nvfp4 head/embed");
     let mut round = Df2Round::load(&draft_dir, Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(head_p)), Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(embed_p)), max_c).expect("round load");
     let sink = std::sync::Arc::new(Df2TapSink::new(gpu.dev()));
@@ -4757,7 +4806,7 @@ fn run_probe_df2_graph(args: &[String]) {
         println!("  [{:6}] {name}", if ok { "PASS" } else { "FAIL" });
         if !ok { all_pass.set(false); }
     };
-    let (mut gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut gpu, _) = load_model_gpu(&trunk_dir, None, 1);
     let (head_p, embed_p) = gpu.df2_borrow_ptrs().expect("nvfp4 head/embed");
     let mut round = Df2Round::load(&draft_dir, Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(head_p)), Some(gb10_inference::dflash2::round::BorrowedW::Nvfp4(embed_p)), max_c).expect("round load");
     let sink = std::sync::Arc::new(Df2TapSink::new(gpu.dev()));
@@ -4905,7 +4954,7 @@ fn run_probe_df2_round(args: &[String], draft_dir: &str) {
     // ---- Part 0: loads --------------------------------------------------------
     println!("== loads ==");
     let t0 = std::time::Instant::now();
-    let (mut trunk, _) = gb10_inference::gpu::GpuModel::load_from_dir(&trunk_dir).expect("trunk load");
+    let (mut trunk, _) = load_model_gpu(&trunk_dir, None, 1);
     println!("  trunk loaded in {:.1}s", t0.elapsed().as_secs_f32());
     let (head_p, embed_p) = trunk.df2_borrow_ptrs()
         .expect("trunk lm_head/embed are NVFP4 (mma-repacked) — the borrowed-head contract");
@@ -5838,7 +5887,7 @@ fn run_bench_verify(args: &[String]) {
     println!("MTP verify lossless probe: prompt={} tokens, offset={}, depth={}", prompt.len(), offset, depth);
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -5938,7 +5987,7 @@ fn run_probe_state(args: &[String]) {
     println!("GDN state-divergence probe: prompt={} tokens", prompt.len());
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -5979,7 +6028,7 @@ fn run_probe_verify_m8(args: &[String]) {
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
     println!("verify-M8 bucket probe: prompt={} tokens, widths 1..={max_n}, buckets {{2,4,6,8}}", prompt.len());
 
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(&dir, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     // 2 + max_n state slots: verify lane, decode lane, per-column GDN checkpoints.
     let mut state = gpu.new_batch_state(2 + max_n, 2 + max_n, max_seq_len);
@@ -6018,7 +6067,7 @@ fn run_probe_reject(args: &[String]) {
     println!("Reject-path probe: prompt={} tokens", prompt.len());
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -6332,6 +6381,11 @@ fn mem_budget_report(model_dir: &str, cfg: &gb10_inference::qwen::Config,
         eprintln!("  PLE n-gram table       ~{} GB ({})", fmt(ple_bytes / gf),
                   if ple_bytes > 0.0 { "device-resident; --ple-offload ssd keeps it on disk" } else { "SSD-resident, read per forward" });
     }
+    if total == 0 {
+        eprintln!("  *** WARNING: no .safetensors shards found in {} — the directory may be empty, a",
+                  std::path::Path::new(model_dir).display());
+        eprintln!("  *** partial/stale download, or the wrong format (see the load error below).");
+    }
     eprintln!("  KV cache (~{slots} slots)  ~{} GB", fmt(kv / gf));
     eprintln!("  calibration transient  ~{} GB (startup only, freed)", fmt(calib / gf));
     if quantized { eprintln!("  packed-KV mirror (<=32K) ~{} GB", fmt(mirror / gf)); }
@@ -6480,7 +6534,8 @@ fn node_serve_tp(dir: &std::path::Path, head_ip: std::net::IpAddr, mut stream: s
                            matching the head's MTP fallback via the CalibTable outcome");
             }
             let draft_dir = tpc.df2_draft_dir.clone();
-            match load_df2_round_dir(&mut gpu, tpc.max_seq_len, &draft_dir) {
+            match load_df2_round_dir(&mut gpu, tpc.max_seq_len, &draft_dir,
+                                     tpc.df2_sha_pin.as_deref()) {
                 Some(x) => {
                     println!("NODE — DFlash2 round RESIDENT (spec-source={}, draft-dir={}) — SPMD with the head",
                              node_src.cli_name(), draft_dir);
@@ -7027,7 +7082,7 @@ fn tp_serve(model_dir: &str, ctx: anyhow::Result<gb10_inference::tp::TpContext>,
 fn run_probe_gemm(args: &[String]) {
     let model_dir = parse_arg(args, "--model-dir").map(|s| s.to_string());
     let gpu: gb10_inference::gpu::GpuModel = if let Some(dir) = model_dir {
-        let (g, _) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+        let (g, _) = load_model_gpu(&dir, None, 1);
         g
     } else {
         eprintln!("--probe-gemm requires --model-dir <DIR>");
@@ -10328,7 +10383,7 @@ fn run_probe_dsv4_tp_sim(args: &[String]) {
 /// Usage: --sweep-gemm --model-dir 9b   (sweeps the GDN in_proj_qkv shape, the dominant diverger)
 fn run_sweep_gemm(args: &[String]) {
     let model_dir = parse_arg(args, "--model-dir").expect("--sweep-gemm requires --model-dir <DIR>");
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(model_dir).expect("gpu load");
+    let (gpu, _) = load_model_gpu(model_dir, None, 1);
     let cfg = gpu.cfg().clone();
     let conv_dim = cfg.key_dim() * 2 + cfg.value_dim();
     // Sweep the in_proj_qkv shape (the one that diverged 0.5 on 9B).
@@ -10932,6 +10987,348 @@ fn run_requant_sim(args: &[String]) {
              t0.elapsed().as_secs_f32());
 }
 
+/// SQ campaign probe bake: dequant NVFP4 -> STQ/ternary2/3bit round-trip -> requant NVFP4,
+/// values-only (format/shards/names unchanged, served by the current binary). Mirrors
+/// run_requant_sim's shape (shard resume, triple handling, aux-file copy).
+///   --stq-bake --model-dir <packed-dir> --out <dir> --arm a|b [--imatrix <file>]
+///              [--classes gateup,down,attn] [--shard-start N] [--shard-end N] [--limit N]
+///              [--check]  (check = fitter unit gate: LS-vs-amax SSD on real rows, no bake)
+fn run_stq_bake(args: &[String]) {
+    use safetensors::{SafeTensors, Dtype, tensor::TensorView};
+    use gb10_inference::quant;
+
+    if args.iter().any(|a| a == "--check") {
+        stq_check_mode(args);
+        return;
+    }
+    if args.iter().any(|a| a == "--verify") {
+        stq_verify_mode(args);
+        return;
+    }
+    let ind_s = parse_arg(args, "--model-dir").expect("--stq-bake requires --model-dir <packed-dir>");
+    let out_s = parse_arg(args, "--out").expect("--stq-bake requires --out <dir>");
+    let arm = parse_arg(args, "--arm").unwrap_or("a");
+    assert!(arm == "a" || arm == "b" || arm == "c" || arm == "d" || arm == "e", "--arm must be a-e");
+    let classes: Vec<&str> = parse_arg(args, "--classes").unwrap_or("gateup,down,attn")
+        .split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let shard_start: usize = parse_arg(args, "--shard-start").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let shard_end: usize = parse_arg(args, "--shard-end").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let limit: usize = parse_arg(args, "--limit").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let ind = std::path::Path::new(ind_s);
+    let outd = std::path::Path::new(out_s);
+    std::fs::create_dir_all(outd).expect("create --out dir");
+
+    // imatrix: DATA input (per-input-channel importance, key = tensor stem, f32 [K]).
+    let imatrix: Option<std::collections::HashMap<String, Vec<f32>>> = parse_arg(args, "--imatrix").map(|p| {
+        let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("read imatrix {p}: {e}"));
+        let st = SafeTensors::deserialize(&raw).expect("parse imatrix");
+        let mut m = std::collections::HashMap::new();
+        for (n, v) in st.tensors() {
+            assert_eq!(v.dtype(), Dtype::F32, "imatrix tensor {n} not f32");
+            let bytes = v.data();
+            m.insert(n, bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect());
+        }
+        println!("stq-bake: imatrix {} loaded ({} tensors)", p, m.len());
+        m
+    });
+    if imatrix.is_none() {
+        println!("stq-bake: WARNING no --imatrix — falling back to unweighted objective (diagnostic only)");
+    }
+
+    let kind_for = |class: &str| -> quant::StqKind {
+        match (arm, class) {
+            ("a", "gateup") => quant::StqKind::Stq1_0,
+            ("a", "down") => quant::StqKind::Ls3Bit,
+            ("a", "attn") => quant::StqKind::Ternary2,
+            ("b", "gateup") => quant::StqKind::Ternary2,
+            ("b", "down") => quant::StqKind::Ls3Bit,
+            ("b", "attn") => quant::StqKind::Ls3Bit,
+            // ISO-informed recipes (2026-08-30): ternary2 on gate/up costs +1.6% PPL; ls3bit on
+            // attn is FATAL (GQA k/v integrity); ls3bit on down adds real damage. Arm c protects
+            // down (NVFP4 untouched via --classes gateup,attn); arm d is the 1.31-bpw stretch.
+            ("c", "gateup") => quant::StqKind::Ternary2,
+            ("c", "attn") => quant::StqKind::Ternary2,
+            ("d", "gateup") => quant::StqKind::Stq1_0,
+            ("d", "attn") => quant::StqKind::Ternary2,
+            // arm e: the 3-bit point of the gate/up bytes-vs-damage curve.
+            ("e", "gateup") => quant::StqKind::Ls3Bit,
+            ("e", "attn") => quant::StqKind::Ternary2,
+            _ => unreachable!("arm {arm} has no {class} mapping"),
+        }
+    };
+    // Targets: TRUNK language layers only — never mtp.* (draft), never model.visual.*, never GDN.
+    // (Artifact names carry the full `model.language_model.layers.N.` prefix.)
+    let classify = |n: &str| -> Option<&'static str> {
+        if !n.ends_with(".weight_packed") || n.starts_with("mtp.")
+            || !n.starts_with("model.language_model.layers.") {
+            return None;
+        }
+        let class = if n.contains(".mlp.gate_proj.") || n.contains(".mlp.up_proj.") {
+            "gateup"
+        } else if n.contains(".mlp.down_proj.") {
+            "down"
+        } else if n.contains(".self_attn.") {
+            "attn"
+        } else {
+            return None;
+        };
+        if classes.contains(&class) { Some(class) } else { None }
+    };
+    let is_target = |n: &str| -> bool { classify(n).is_some() };
+
+    let recipe = format!(
+        "stq-probe(arm-{arm}): gate/up={:?} down={:?} attn={:?} over nvfp4 — quality simulation, not a serving recipe",
+        kind_for("gateup").name(),
+        if matches!((arm, "down"), ("c", _) | ("d", _) | ("e", _)) { "nvfp4-untouched" } else { kind_for("down").name() },
+        kind_for("attn").name());
+    let meta = std::collections::HashMap::from([
+        ("format".to_string(), "pt".to_string()),
+        ("quant_recipe".to_string(), recipe.clone()),
+    ]);
+    println!("stq-bake: {} -> {} arm {arm} classes {:?} [{recipe}]", ind_s, out_s, classes);
+
+    let index_path = ind.join("model.safetensors.index.json");
+    let shards: Vec<std::path::PathBuf> = if index_path.exists() {
+        let raw = std::fs::read_to_string(&index_path).expect("read index");
+        let idx: serde_json::Value = serde_json::from_str(&raw).expect("parse index");
+        idx["weight_map"].as_object().unwrap().values().filter_map(|v| v.as_str())
+            .collect::<std::collections::BTreeSet<_>>().into_iter().map(|s| ind.join(s)).collect()
+    } else { vec![ind.join("model.safetensors")] };
+
+    struct Out { name: String, dtype: Dtype, shape: Vec<usize>, data: Vec<u8> }
+    #[derive(Default)]
+    struct Stats { n: usize, sum: f64, max: f64 }
+    let mut stats: std::collections::BTreeMap<&'static str, Stats> = Default::default();
+    let (mut n_req, mut n_unweighted, mut n_skip_shards) = (0usize, 0usize, 0usize);
+    let t0 = std::time::Instant::now();
+
+    for (si, sf) in shards.iter().enumerate() {
+        let shard_no = si + 1;
+        if shard_no < shard_start || shard_no > shard_end { continue; }
+        let fname = sf.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if outd.join(&fname).exists() {
+            println!("  shard {shard_no}/{}: {fname} present, skipping", shards.len());
+            n_skip_shards += 1;
+            continue;
+        }
+        let t_shard = std::time::Instant::now();
+        println!("  shard {shard_no}/{}: {fname}", shards.len());
+        let raw = std::fs::read(sf).expect("read shard");
+        let st = SafeTensors::deserialize(&raw).expect("parse shard");
+        let tvec: Vec<(String, TensorView)> = st.tensors();
+        let mut outs: Vec<Out> = Vec::with_capacity(tvec.len());
+        for (n, v) in &tvec {
+            let stem = &n[..n.rfind(".weight").unwrap_or(n.len())];
+            if let Some(class) = classify(n) {
+                if n_req >= limit { // --limit smoke mode: copy the rest verbatim
+                    outs.push(Out { name: n.clone(), dtype: v.dtype(), shape: v.shape().to_vec(), data: v.data().to_vec() });
+                    continue;
+                }
+                let get = |suffix: &str| -> &TensorView {
+                    let full = format!("{stem}.weight{suffix}");
+                    &tvec.iter().find(|(tn, _)| *tn == full)
+                        .unwrap_or_else(|| panic!("{full} missing in {fname} (triple split across shards?)")).1
+                };
+                let (pv, sv, gv) = (get("_packed"), get("_scale"), get("_global_scale"));
+                let (m, kh) = (pv.shape()[0], pv.shape()[1]);
+                let k = kh * 2;
+                let q = quant::Nvfp4Tensor {
+                    qweight: pv.data().to_vec(),
+                    scales: sv.data().to_vec(),
+                    global_scale: f32::from_le_bytes(gv.data()[..4].try_into().unwrap()),
+                    m, k,
+                };
+                let orig = quant::dequantize_nvfp4_f32(&q);
+                let imat_key = format!("{stem}.weight");
+                let qw: Option<&[f32]> = match &imatrix {
+                    Some(map) => match map.get(&imat_key) {
+                        Some(vq) if vq.len() == k => Some(vq),
+                        Some(vq) => panic!("imatrix {imat_key}: len {} != K {k}", vq.len()),
+                        None => { n_unweighted += 1; None }
+                    },
+                    None => None,
+                };
+                let mut w = orig.clone();
+                quant::fake_quant_stq(&mut w, m, k, qw, kind_for(class));
+                let ssd: f64 = orig.iter().zip(w.iter()).map(|(&a, &b)| { let e = a - b; (e * e) as f64 }).sum();
+                let x2: f64 = orig.iter().map(|&a| (a * a) as f64).sum();
+                let rel_l2 = (ssd / x2.max(f64::MIN_POSITIVE)).sqrt();
+                let stq_stat = stats.entry(class).or_default();
+                stq_stat.n += 1; stq_stat.sum += rel_l2; stq_stat.max = stq_stat.max.max(rel_l2);
+                let wbf: Vec<half::bf16> = w.iter().map(|&x| half::bf16::from_f32(x)).collect();
+                let q2 = quant::quantize_nvfp4(&wbf, m, k);
+                outs.push(Out { name: n.clone(), dtype: Dtype::U8, shape: vec![m, kh], data: q2.qweight });
+                outs.push(Out { name: format!("{stem}.weight_scale"), dtype: Dtype::F8_E4M3,
+                                shape: vec![m, k / quant::BLOCK], data: q2.scales });
+                outs.push(Out { name: format!("{stem}.weight_global_scale"), dtype: Dtype::F32,
+                                shape: vec![1], data: q2.global_scale.to_le_bytes().to_vec() });
+                n_req += 1;
+                println!("    {} {} [{m}x{k}] rel-L2 {rel_l2:.4}", kind_for(class).name(), stem, );
+            } else if n.ends_with("_scale") {
+                // Scale siblings ride out with their packed triple — never copy them alone.
+                let packed_name = format!("{stem}.weight_packed");
+                if is_target(&packed_name) && tvec.iter().any(|(tn, _)| *tn == packed_name) {
+                    continue;
+                }
+                outs.push(Out { name: n.clone(), dtype: v.dtype(), shape: v.shape().to_vec(), data: v.data().to_vec() });
+            } else {
+                outs.push(Out { name: n.clone(), dtype: v.dtype(), shape: v.shape().to_vec(), data: v.data().to_vec() });
+            }
+        }
+        let views: Vec<(String, TensorView)> = outs.iter()
+            .map(|o| (o.name.clone(), TensorView::new(o.dtype, o.shape.clone(), &o.data).expect("view"))).collect();
+        safetensors::serialize_to_file(views, Some(meta.clone()), &outd.join(&fname)).expect("write shard");
+        let hwm = std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.trim().to_string()))
+            .unwrap_or_else(|| "VmHWM n/a".into());
+        println!("    wrote {fname} ({} tensors, {:.1}s, {hwm})", outs.len(), t_shard.elapsed().as_secs_f32());
+    }
+    for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
+              "chat_template.jinja", "merges.txt", "vocab.json", "preprocessor_config.json",
+              "model.safetensors.index.json"] {
+        let src = ind.join(f);
+        if src.exists() && !outd.join(f).exists() { let _ = std::fs::copy(&src, outd.join(f)); }
+    }
+    println!("stq-bake per-class rel-L2 (STQ round-trip vs dequantized NVFP4, pre-requant):");
+    for (class, st) in &stats {
+        println!("  {class:8} n={:4} mean={:.4} max={:.4}", st.n, st.sum / st.n as f64, st.max);
+    }
+    println!("stq-bake done: {n_req} tensors, {n_unweighted} without imatrix, {n_skip_shards} shards skipped, {:.1}s",
+             t0.elapsed().as_secs_f32());
+}
+
+/// `--stq-bake --check --model-dir <dir>` — the fitter unit gate, no bake: on real gate_proj rows,
+/// the LS+imatrix encoder must beat the reference (amax + argmin|x|) encoder by a wide margin
+/// (AngelSlim measured −89.7% weighted SSD from the LS scale alone — expect ≳5× here).
+fn stq_check_mode(args: &[String]) {
+    use safetensors::{SafeTensors, tensor::TensorView};
+    use gb10_inference::quant;
+    let ind_s = parse_arg(args, "--model-dir").expect("--check requires --model-dir <packed-dir>");
+    let ind = std::path::Path::new(ind_s);
+    let index_path = ind.join("model.safetensors.index.json");
+    let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path).expect("read index")).expect("parse index");
+    // sample across the depth of the network: layers {0, 16, 32, 48, 63} gate_proj
+    let mut picks: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for layer in [0usize, 16, 32, 48, 63] {
+        let name = format!("model.language_model.layers.{layer}.mlp.gate_proj.weight_packed");
+        if let Some(f) = idx["weight_map"][&name].as_str() { picks.push((name, ind.join(f))); }
+    }
+    assert!(!picks.is_empty(), "no gate_proj tensors found in index");
+    let rows_per_tensor = 4usize;
+    let (mut ssd_ref, mut ssd_ls, mut nblk) = (0.0f64, 0.0f64, 0usize);
+    for (name, path) in &picks {
+        let raw = std::fs::read(path).expect("read shard");
+        let st = SafeTensors::deserialize(&raw).expect("parse shard");
+        let stem = name.trim_end_matches("_packed");
+        let get = |suffix: &str| -> TensorView {
+            let full = format!("{stem}{suffix}");
+            st.tensor(&full).unwrap_or_else(|_| panic!("{full} missing"))
+        };
+        let (pv, sv, gv) = (get("_packed"), get("_scale"), get("_global_scale"));
+        let (m, kh) = (pv.shape()[0], pv.shape()[1]);
+        let k = kh * 2;
+        let q = quant::Nvfp4Tensor {
+            qweight: pv.data().to_vec(), scales: sv.data().to_vec(),
+            global_scale: f32::from_le_bytes(gv.data()[..4].try_into().unwrap()), m, k,
+        };
+        let w = quant::dequantize_nvfp4_f32(&q);
+        let stride = (m / rows_per_tensor).max(1);
+        let mut y_ref = vec![0.0f32; quant::STQ_BLOCK];
+        let mut y_ls = vec![0.0f32; quant::STQ_BLOCK];
+        for r in (0..m).step_by(stride) {
+            for b in 0..k / quant::STQ_BLOCK {
+                let x = &w[r * k + b * quant::STQ_BLOCK..][..quant::STQ_BLOCK];
+                quant::stq1_0_block_reference(x, &mut y_ref);
+                quant::stq1_0_block(x, None, &mut y_ls);
+                ssd_ref += quant::stq_weighted_ssd(x, &y_ref, None);
+                ssd_ls += quant::stq_weighted_ssd(x, &y_ls, None);
+                nblk += 1;
+            }
+        }
+        println!("  {stem} [{m}x{k}] sampled {rows_per_tensor} rows");
+    }
+    let ratio = ssd_ref / ssd_ls.max(f64::MIN_POSITIVE);
+    println!("check: {nblk} blocks, weighted SSD ref(amax)={ssd_ref:.4e} ls={ssd_ls:.4e} improvement x{ratio:.1}");
+    if ratio >= 5.0 {
+        println!("check: PASS (LS encoder dominates the reference, as the AngelSlim claim implies)");
+    } else {
+        println!("check: FAIL — LS encoder not dominating; do not bake until this passes");
+        std::process::exit(1);
+    }
+}
+
+/// `--stq-bake --verify --model-dir <a> --model-dir-b <b>` — post-hoc fidelity check: dequantize
+/// every target triple in both artifacts and report rel-L2 of B vs A per class. Catches requant
+/// mis-encoding that pre-requant stats cannot see (the iso-b-attn explosion postmortem tool).
+fn stq_verify_mode(args: &[String]) {
+    use safetensors::{SafeTensors, tensor::TensorView};
+    use gb10_inference::quant;
+    let dir_a = std::path::Path::new(parse_arg(args, "--model-dir").expect("--verify requires --model-dir <a>"));
+    let dir_b = std::path::Path::new(parse_arg(args, "--model-dir-b").expect("--verify requires --model-dir-b <b>"));
+    let read_triples = |dir: &std::path::Path| -> Vec<(String, quant::Nvfp4Tensor)> {
+        let idx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("model.safetensors.index.json")).expect("index")).expect("parse index");
+        let mut out = Vec::new();
+        for fname in idx["weight_map"].as_object().unwrap().values()
+            .filter_map(|v| v.as_str()).collect::<std::collections::BTreeSet<_>>() {
+            let raw = std::fs::read(dir.join(fname)).expect("read shard");
+            let st = SafeTensors::deserialize(&raw).expect("parse shard");
+            for (n, v) in st.tensors() {
+                if !n.ends_with(".weight_packed") { continue; }
+                let stem = &n[..n.rfind(".weight").unwrap()];
+                let get = |suffix: &str| -> Option<TensorView> {
+                    st.tensor(&format!("{stem}.weight{suffix}")).ok()
+                };
+                let (Some(pv), Some(sv), Some(gv)) = (get("_packed"), get("_scale"), get("_global_scale")) else { continue };
+                let (m, kh) = (pv.shape()[0], pv.shape()[1]);
+                out.push((stem.to_string(), quant::Nvfp4Tensor {
+                    qweight: pv.data().to_vec(), scales: sv.data().to_vec(),
+                    global_scale: f32::from_le_bytes(gv.data()[..4].try_into().unwrap()),
+                    m, k: kh * 2,
+                }));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    println!("verify: reading A = {}", dir_a.display());
+    let ta = read_triples(dir_a);
+    println!("verify: reading B = {}", dir_b.display());
+    let tb = read_triples(dir_b);
+    assert_eq!(ta.len(), tb.len(), "triple count mismatch");
+    let mut worst = Vec::new();
+    for ((na, qa), (nb, qb)) in ta.iter().zip(&tb) {
+        assert_eq!(na, nb, "tensor name mismatch {na} vs {nb}");
+        assert_eq!((qa.m, qa.k), (qb.m, qb.k), "{na}: shape mismatch");
+        let va = quant::dequantize_nvfp4_f32(qa);
+        let vb = quant::dequantize_nvfp4_f32(qb);
+        let ssd: f64 = va.iter().zip(vb.iter()).map(|(&x, &y)| { let e = x - y; (e * e) as f64 }).sum();
+        let x2: f64 = va.iter().map(|&x| (x * x) as f64).sum();
+        let rel = (ssd / x2.max(f64::MIN_POSITIVE)).sqrt();
+        let class = if na.contains("mlp.gate_proj") || na.contains("mlp.up_proj") { "gateup" }
+            else if na.contains("mlp.down_proj") { "down" }
+            else if na.contains("self_attn.q_proj") { "attn.q" }
+            else if na.contains("self_attn.k_proj") { "attn.k" }
+            else if na.contains("self_attn.v_proj") { "attn.v" }
+            else if na.contains("self_attn.o_proj") { "attn.o" }
+            else { "other" };
+        worst.push((rel, na.clone(), class));
+    }
+    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("verify: {} triples; top-15 divergent (B vs A rel-L2):", worst.len());
+    for (rel, n, c) in worst.iter().take(15) {
+        println!("  {rel:.4}  [{c:7}] {n}");
+    }
+    for class in ["gateup", "down", "attn.q", "attn.k", "attn.v", "attn.o"] {
+        let sel: Vec<f64> = worst.iter().filter(|(_, _, c)| *c == class).map(|(r, _, _)| *r).collect();
+        if !sel.is_empty() {
+            let mean = sel.iter().sum::<f64>() / sel.len() as f64;
+            let mx = sel.iter().cloned().fold(0.0f64, f64::max);
+            println!("  {class:7}: mean {mean:.4}  max {mx:.4}  n={}", sel.len());
+        }
+    }
+}
+
 fn mtp_calib_cache_path(model_path: &str) -> Option<std::path::PathBuf> {
     // <binary_dir>/mtp_calib/<model-basename>.json  — a subdir next to the running executable.
     let exe = std::env::current_exe().ok()?;
@@ -10997,7 +11394,7 @@ fn run_perplexity(args: &[String]) {
              toks.len(), text_path, window, max_windows);
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -11034,7 +11431,7 @@ fn run_probe_moe(args: &[String]) {
     let out_x = parse_arg(args, "--out-x").unwrap_or("/tmp/moe_x.txt").to_string();
     let out_y = parse_arg(args, "--out").unwrap_or("/tmp/moe_y.txt").to_string();
 
-    let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+    let (gpu, cfg) = load_model_gpu(&dir, None, 1);
     let h = cfg.hidden_size;
     // Input: --in-x <file> (whitespace floats, token-major [batch, h]) or the deterministic
     // reproducible default in [-0.5, 0.5], col-major [h, batch].
@@ -11565,7 +11962,7 @@ fn run_capture_layers(args: &[String]) {
     assert!(!ids.is_empty(), "empty --ids file");
     let n = ids.len();
 
-    let (gpu, cfg) = gb10_inference::gpu::GpuModel::load_from_dir(&dir).expect("gpu load");
+    let (gpu, cfg) = load_model_gpu(&dir, None, 1);
     let h = cfg.hidden_size;
     let nlayers = gpu.cfg().num_layers;
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
@@ -11610,7 +12007,7 @@ fn run_dump_argmax(args: &[String]) {
     let toks = tokenizer.encode(&text, false).expect("encode");
     eprintln!("dump-argmax: {} tokens from {}, window={}", toks.len(), text_path, window);
 
-    let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+    let (gpu, _) = load_model_gpu(&model_path, None, 1);
     let mut pool = gb10_inference::gpu::Pool::new(gpu.dev().clone());
     let mut state = gpu.new_batch_state(2, 2, max_seq_len);
 
@@ -11645,7 +12042,7 @@ fn run_profile_mtp(args: &[String]) {
     let tokenizer = QwenTokenizer::from_file(&tokenizer_path).expect("tokenizer");
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -11705,7 +12102,7 @@ fn run_bench_mtp_sample(args: &[String]) {
     let prompt = tokenizer.encode(prompt_text, true).expect("encode");
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -11793,7 +12190,7 @@ fn run_bench_mtp(args: &[String]) {
     println!("MTP end-to-end probe: prompt={} tokens, depth={}, max_new={}", prompt.len(), depth, max_new);
 
     let gpu = if std::path::Path::new(&model_path).is_dir() {
-        let (gpu, _) = gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load");
+        let (gpu, _) = load_model_gpu(&model_path, None, 1);
         gpu
     } else {
         let host = gb10_inference::qwen::Model::load(&model_path).expect("load model");
@@ -11987,6 +12384,10 @@ fn run_server(args: &[String]) {
             // path stops the app). The head's resolved dir ships on the config AND the artifact
             // bytes ride the sync (cluster.rs DraftManifest) into the node's blob cache.
             tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
+            // S9F+ (2026-08-29): ship the --sha256 artifact-pin override (None = published
+            // REAL_SHA256) so the node loads the same artifact under the same pin — a one-sided
+            // pin would be a round-load mismatch between ranks.
+            tpc.df2_sha_pin = parse_arg(args, "--sha256").map(str::to_string);
             // P2: the round-sharding toggle (CLI flag per AGENTS §7; rides TpConfig — no env
             // side channel). DEFAULT OFF until the Phase D quad truth flips it.
             tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
@@ -12019,9 +12420,25 @@ fn run_server(args: &[String]) {
         }
 
         if is_dir {
-            let cfg_pre = gb10_inference::qwen::Config::from_config_json(
+            // Config pre-read for the mem budget. A corrupt config.json is a load error, not a
+            // panic: surface the same graceful message and exit cleanly (owner directive 2026-08-27).
+            let cfg_pre = match gb10_inference::qwen::Config::from_config_json(
                 &format!("{}/config.json", model_path.trim_end_matches('/')))
-                .expect("config.json read for mem budget");
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error loading model from {}: config.json does not parse: {e:#}",
+                              model_path);
+                    eprintln!("  The model checkpoint appears to be corrupted.");
+                    eprintln!("  Fix: re-download the FULL set cleanly (all shards + the index + config), \
+                               verify with");
+                    eprintln!("  sha256sum that the shards match the source, and confirm the directory \
+                               is the engine's");
+                    eprintln!("  CONVERTED NVFP4 model (not a raw or differently-quantized checkpoint). \
+                               See the README.");
+                    std::process::exit(1);
+                }
+            };
             let km = if matches!(std::env::var("GB10_KV_TQ").ok().as_deref(), Some("1") | Some("3")) { gb10_inference::gpu::KVCacheMode::Tq }
                      else if std::env::var("GB10_KV_K8V4").ok().as_deref() == Some("1") { gb10_inference::gpu::KVCacheMode::K8v4 }
                      else if std::env::var("GB10_KV_QUANT").is_ok() { gb10_inference::gpu::KVCacheMode::Q4 }
@@ -12033,9 +12450,9 @@ fn run_server(args: &[String]) {
             if tp {
                 // TP=2 head = rank 0. hy_v3 shards host-side in the loader (full model > one node);
                 // qwen loads whole and shards at attach_tp, unchanged.
-                gb10_inference::gpu::GpuModel::load_from_dir_tp(&model_path, 0, tp_world.unwrap_or(2) as i32).expect("gpu load")
+                load_model_gpu(&model_path, Some(0), tp_world.unwrap_or(2) as i32)
             } else {
-                gb10_inference::gpu::GpuModel::load_from_dir(&model_path).expect("gpu load")
+                load_model_gpu(&model_path, None, 1)
             }
         } else {
             println!("Loading model from {} ...", model_path);
@@ -12201,6 +12618,9 @@ fn run_server(args: &[String]) {
                     tpc.spec_source = resolve_spec_source(args).cli_name().to_string();
                     // MANDATORY user-supplied path (same rule as the pre-TP fill above).
                     tpc.df2_draft_dir = resolve_df2_draft_dir(args).unwrap_or_default();
+                    // S9F+ (2026-08-29): ship the --sha256 artifact-pin override (same as the
+                    // pre-TP fill — the node must load the same artifact under the same pin).
+                    tpc.df2_sha_pin = parse_arg(args, "--sha256").map(str::to_string);
                     // P2: the round-sharding toggle (same resolution as the pre-TP fill above).
                     tpc.df2_round_shard = matches!(parse_arg(args, "--df2-round-shard").unwrap_or("on"),
                                                    "on" | "true" | "1" | "yes");
@@ -12273,8 +12693,10 @@ fn run_server(args: &[String]) {
         let df2 = if gb10_inference::batch::is_df2_src(spec_source) {
             // Mandatory only for an EXPLICIT DF2 --spec-source; the resolved default falls back
             // to MTP when no --draft-dir was supplied (resolve_df2_draft_dir -> None).
-            match resolve_df2_draft_dir(&std::env::args().collect::<Vec<_>>()) {
-                Some(d) => load_df2_round_dir(&mut gpu, max_seq_len, &d),
+            let args = std::env::args().collect::<Vec<_>>();
+            let sha_pin = parse_arg(&args, "--sha256");
+            match resolve_df2_draft_dir(&args) {
+                Some(d) => load_df2_round_dir(&mut gpu, max_seq_len, &d, sha_pin),
                 None => None,
             }
         } else { None };
@@ -12413,13 +12835,24 @@ fn run_server(args: &[String]) {
             }
         }
 
-        // The tower loader reads ONLY the shards holding `model.visual.*` (reading every shard of
-        // the 97 GB Qwen3.8-Flash-Next artifact into host memory is what exhausted the box on
-        // 2026-08-28). qwen4_exp uses the same tower as Qwen3.5 with a 2560-wide merger.
-        let vt0 = std::time::Instant::now();
-        let vision_tower = match gb10_inference::vision_tower::VisualTower::load(&model_path) {
-            Ok(t) => { println!("Vision tower loaded in {:.1}s (merger out {}).", vt0.elapsed().as_secs_f32(), t.out_hidden); Some(std::sync::Arc::new(t)) }
-            Err(e) => { println!("Vision: tower not loaded ({e}) — text-only server."); None }
+        // Vision tower load, geometry-driven. The whole Qwen3.5/3.8 VL family is supported:
+        // dimensions come from `config.json` `vision_config` (TowerDims) and the `nvfp4-*` dirs'
+        // packed MLP weights are dequantized at load. Any model that declares `vision_config`
+        // but fails the strict load gets a visible notice and serves text-only (image traffic →
+        // clean BAD_REQUEST, never a crash). Text-only models (no `vision_config`) load nothing.
+        let vision_tower = match gb10_inference::vision_tower::vision_geometry(&model_path) {
+            Ok(Some(_)) => match gb10_inference::vision_tower::VisualTower::load(&model_path) {
+                Ok(t) => Some(std::sync::Arc::new(t)),
+                Err(e) => {
+                    eprintln!("[vision] tower load failed ({e}); serving text-only (image requests are rejected)");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[vision] vision geometry probe failed ({e}); serving text-only");
+                None
+            }
         };
         let vision_cpu = parse_arg(args, "--vision-cpu").is_some();
         // GPU vision fast path: build on the shared device (same primary context as the serving model).
@@ -12456,6 +12889,11 @@ fn run_server(args: &[String]) {
                         std::process::exit(1);
                     }
                 }),
+            // --output-prompts [cap]: absent = off; bare flag = 6000-char rendered-prompt
+            // excerpt; explicit numeric arg overrides the cap.
+            output_prompts: args.iter().position(|a| a == "--output-prompts")
+                .map(|i| args.get(i + 1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(6000))
+                .unwrap_or(0),
             max_seq_len,
             decode_headroom,
             prefix_cache,
