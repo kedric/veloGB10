@@ -126,7 +126,7 @@ fetch_file \
 cargo build --manifest-path "$repo_dir/Cargo.toml" --release --bin calib_sources
 "$repo_dir/target/release/calib_sources" fetch-api --output-root "$source_root"
 verify_file "$source_root/aya/aya-six-languages.jsonl" \
-    "df144383a166ea6798a3217f02106b1aa673aebe204e700887b93b3e5a8dbf8e"
+    "f4b36c268ddd3b46fab0936511614d868f04679db07508361c640fe24840249f"
 verify_file "$source_root/openr1/openr1-math-reasoning.jsonl" \
     "adbcde6cdeb5ab80f8a5a8bd5c8cb852c14d939efeca4e34328a6acc411e7227"
 
