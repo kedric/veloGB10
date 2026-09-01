@@ -1007,7 +1007,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
     // served during the calibration exactly as they will be served — source bf16, or the
     // quantizer's own RTN / FP8 when their group asks for it — not as the base's RTN copies.
     {
-        let mut mk = |name: &str| -> Result<Option<W>> {
+        let mk = |name: &str| -> Result<Option<W>> {
             let Some(meta) = src.metas.get(name) else { return Ok(None) };
             if meta.dtype != "BF16" || meta.shape.len() != 2 { return Ok(None); }
             let (shape, v) = src.read_bf16(name)?;
@@ -1036,7 +1036,7 @@ pub fn run(source: &Path, base: &Path, out: &Path, calib: &Path, opts: GptqOpts)
         let mut tap = GptqTap::default();
         // name -> (the quantizer's bf16 copy, m, k, tap key = device pointer of the LAYER's copy)
         let mut bf: HashMap<String, (B, usize, usize, u64)> = HashMap::new();
-        let mut up = |gpu: &GpuModel, name: &str, tap: &mut GptqTap, bf: &mut HashMap<String, (B, usize, usize, u64)>| -> Result<W> {
+        let up = |gpu: &GpuModel, name: &str, tap: &mut GptqTap, bf: &mut HashMap<String, (B, usize, usize, u64)>| -> Result<W> {
             let (shape, v) = src.read_bf16(name)?;
             let (m, k) = if shape.len() == 3 { (shape[0] * shape[1], shape[2]) } else { (shape[0], shape[1]) };
             let b = gpu.gptq_upload_bf16(&v);

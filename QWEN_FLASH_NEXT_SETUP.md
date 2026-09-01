@@ -203,7 +203,9 @@ there and the engine keeps its dense kernels: **with `--max-seq-len <= 2051` not
 Flags / env: `--max-seq-len N` (KV + raw keys sized to N; the RoPE tables cap it at the model's
 262144); `GB10_Q4_DENSE_ATTN=1` forces dense attention at any length (A/B only — NOT the reference
 model past 2051); `GB10_QSA_DUMP=1` prints every selection list and score row (validation, syncs).
-The sparse kernels read a bf16 KV cache: `--kv-cache q4|tq|k8v4` is refused when the indexer is live.
+The sparse kernels support `--kv-cache bf16` and `--kv-cache k8v4`; `q4` and `tq` are refused when
+the indexer is live. The k8v4 path uses its packed selected-attention reader while preserving the
+bf16 raw-key cache used by the QSA indexer.
 
 ## 4. Probes
 

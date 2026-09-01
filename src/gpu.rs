@@ -4664,7 +4664,7 @@ impl GpuModel {
         // NVFP4 W4A4 prefill (src/w4a4.rs): enabled tensors above the verify width run the
         // block-scaled FP4 tensor-core GEMM on the standard tiled weights (no repack, no copy).
         if let W::Nvfp4 { qweight, .. } = w { self.igs_tap_x(*qweight.device_ptr() as u64, x, inn * batch); }
-        if let (Some(w4), W::Nvfp4 { qweight, scales, gs, m, k }) = (&self.w4a4, w) {
+        if let (Some(w4), W::Nvfp4 { qweight, m, k, .. }) = (&self.w4a4, w) {
             let ptr = *qweight.device_ptr() as u64;
             if allow_pf4 && w4.on(ptr) && batch > MAX_VERIFY && *k == inn && *m == outn && inn % 64 == 0
                 && x.len() >= batch * inn && out.len() >= batch * outn {

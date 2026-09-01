@@ -440,4 +440,3 @@ prompt_tokens + max_new_tokens + internal headroom <= max_seq_len
 If the server rejects a request with `context_length_exceeded`, lower `max_tokens` or increase
 `--max-seq-len`. Do not automatically allocate the entire nominal remaining context without
 preserving the headroom required by MTP and internal buffers.
-

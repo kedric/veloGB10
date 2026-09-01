@@ -50,8 +50,8 @@ generic language where they aren't individually notable.
 - **Vision** on this family: the Qwen3.5 tower with a 2560-wide merger (`VisualTower::out_hidden`
   read from the checkpoint); image embeddings spliced before the hyper-connection expansion.
   `VisualTower::load` now reads only the shards holding `model.visual.*` (every family).
-- Limits: no TP for this family; QSA needs a bf16 KV cache; image tokens use 1-D positions (no
-  MRoPE — as on Qwen3.5).
+- Limits: no TP for this family; QSA supports bf16 and k8v4 KV caches (q4/tq remain unsupported);
+  image tokens use 1-D positions (no MRoPE — as on Qwen3.5).
 
 ## v0.5.0 — Vision support
 
